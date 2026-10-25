@@ -2,15 +2,15 @@
 
 from contextlib import asynccontextmanager
 
-from fastapi import HTTPException, Request, status
+from fastapi import HTTPException, status
 
 from app.brokers import Broker, OrderError
-from app.core.broker_service import BrokerNotConnected
+from app.core.broker_service import BrokerNotConnected, BrokerService
 
 
-def broker_or_503(request: Request) -> Broker:
+def broker_or_503(service: BrokerService) -> Broker:
     try:
-        return request.app.state.brokers.require()
+        return service.require()
     except BrokerNotConnected as e:
         raise HTTPException(status.HTTP_503_SERVICE_UNAVAILABLE, str(e))
 

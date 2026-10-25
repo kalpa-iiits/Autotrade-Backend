@@ -106,7 +106,8 @@ class ZerodhaBroker(Broker):
         super().__init__()
         if not api_key or not access_token:
             raise MissingCredentials(
-                "Zerodha is not logged in: open /api/auth/zerodha/login (or set AUTOTRADE_ZERODHA_ACCESS_TOKEN)"
+                "Not logged in to Zerodha today: start the broker login for this account "
+                "(GET /api/accounts/{id}/broker-login) or paste an access token"
             )
         self.product = product
         self._kite = kite or KiteConnect(api_key=api_key, access_token=access_token)

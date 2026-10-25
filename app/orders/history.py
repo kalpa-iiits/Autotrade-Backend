@@ -17,46 +17,45 @@ def _to_order(r: OrderRecord) -> Order:
 
 
 async def list_history(
-    broker: str | None = None, symbol: str | None = None, limit: int = 100
+    account_id: int, symbol: str | None = None, limit: int = 100
 ) -> list[dict]:
-    query = select(OrderRecord).order_by(OrderRecord.updated_at.desc()).limit(limit)
-    if broker:
-        query = query.where(OrderRecord.broker == broker)
+    query = (select(OrderRecord).where(OrderRecord.account_id == account_id)
+             .order_by(OrderRecord.updated_at.desc()).limit(limit))
     if symbol:
         query = query.where(OrderRecord.symbol == symbol)
     async with db.session() as s:
         rows = await s.scalars(query)
-        return [{"broker": r.broker, **_to_order(r).model_dump(mode="json")} for r in rows]
+        return [{"account_id": r.account_id, "broker": r.broker, **_to_order(r).model_dump(mode="json")}
+                for r in rows]
 
 
-async def find_by_client_order_id(broker: str, client_order_id: str) -> Order | None:
+async def find_by_client_order_id(account_id: int, client_order_id: str) -> Order | None:
     """Latest recorded state of the order placed with this client order id, if any."""
     async with db.session() as s:
         row = await s.scalar(select(OrderRecord).where(
-            OrderRecord.broker == broker, OrderRecord.client_order_id == client_order_id,
+            OrderRecord.account_id == account_id, OrderRecord.client_order_id == client_order_id,
         ).limit(1))
     return _to_order(row) if row is not None else None
 
 
-async def recorded_states(broker: str, order_ids: list[str]) -> dict[str, tuple]:
+async def recorded_states(account_id: int, order_ids: list[str]) -> dict[str, tuple]:
     """order id -> (status, filled quantity, filled price) as recorded, for the given ids."""
     if not order_ids:
         return {}
     async with db.session() as s:
         rows = await s.execute(
             select(OrderRecord.id, OrderRecord.status, OrderRecord.filled_quantity, OrderRecord.filled_price)
-            .where(OrderRecord.broker == broker, OrderRecord.id.in_(order_ids))
+            .where(OrderRecord.account_id == account_id, OrderRecord.id.in_(order_ids))
         )
         return {oid: (status, filled, price) for oid, status, filled, price in rows}
 
 
-async def list_events(order_id: str, broker: str | None = None) -> list[dict]:
-    query = select(OrderEvent).where(OrderEvent.order_id == order_id).order_by(OrderEvent.id)
-    if broker:
-        query = query.where(OrderEvent.broker == broker)
+async def list_events(account_id: int, order_id: str) -> list[dict]:
+    query = (select(OrderEvent).where(OrderEvent.account_id == account_id, OrderEvent.order_id == order_id)
+             .order_by(OrderEvent.id))
     async with db.session() as s:
         return [
-            {"broker": e.broker, "order_id": e.order_id, "status": e.status,
+            {"account_id": e.account_id, "broker": e.broker, "order_id": e.order_id, "status": e.status,
              "filled_quantity": e.filled_quantity, "filled_price": e.filled_price,
              "reason": e.reason, "at": e.at.isoformat()}
             for e in await s.scalars(query)

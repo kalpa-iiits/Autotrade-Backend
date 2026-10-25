@@ -1,16 +1,24 @@
+"""Daily broker login per broker account (Fyers, Zerodha), with each account's own app
+credentials, and the stored token's lifetime."""
+
+from datetime import date
 from urllib.parse import parse_qs, urlparse
 
 import pytest
 
 import app.auth.router as auth_router
-from app.auth.token_store import TokenStore
-from app.core.config import settings
-from tests.conftest import TOKEN, run
+from app.accounts import store
+from app.accounts.models import BrokerAccount
+from app.core import db
+from tests.conftest import AUTH, add_user, run
 
 
 class FakeSession:
+    instances = []
+
     def __init__(self, **kwargs):
         self.kwargs = kwargs
+        FakeSession.instances.append(self)
 
     def generate_authcode(self):
         return f"https://api-t1.fyers.in/api/v3/generate-authcode?state={self.kwargs['state']}"
@@ -24,76 +32,86 @@ class FakeSession:
         return {"s": "ok", "access_token": "fresh-token"}
 
 
+def add_account(client, broker, credentials, headers=AUTH, label=None):
+    r = client.post("/api/accounts", json={"broker": broker, "label": label or broker.capitalize(),
+                                           "credentials": credentials}, headers=headers)
+    assert r.status_code == 201, r.text
+    return r.json()["id"]
+
+
 @pytest.fixture
-def fyers_login(client, monkeypatch):
-    monkeypatch.setattr(settings, "fyers_client_id", "XB12345-100")
-    monkeypatch.setattr(settings, "fyers_secret_key", "secret")
+def fyers(client, monkeypatch):
+    """A Fyers account (id returned) whose reconnects are recorded instead of connecting."""
+    FakeSession.instances = []
     monkeypatch.setattr(auth_router, "SessionModel", FakeSession)
-    monkeypatch.setattr(client.app.state.brokers, "name", "fyers")
-    restarts = []
+    account_id = add_account(client, "fyers", {"client_id": "XB12345-100", "secret_key": "fsecret"})
+    reconnects = []
 
-    async def fake_restart():
-        restarts.append(await client.app.state.token_stores["fyers"].load())
+    async def fake_reconnect(acct):
+        account = await store.get_account(acct)
+        reconnects.append((acct, store.token_of(account)))
 
-    monkeypatch.setattr(client.app.state.brokers, "restart", fake_restart)
-    return restarts
+    monkeypatch.setattr(client.app.state.accounts, "reconnect", fake_reconnect)
+    return account_id, reconnects
 
 
-def start_login(client):
-    r = client.get("/api/auth/fyers/login", headers={"Authorization": f"Bearer {TOKEN}"}, follow_redirects=False)
-    assert r.status_code == 307
+def start_login(client, account_id, headers=AUTH):
+    r = client.get(f"/api/accounts/{account_id}/broker-login", headers=headers, follow_redirects=False)
+    assert r.status_code == 307, r.text
     return parse_qs(urlparse(r.headers["location"]).query)["state"][0]
 
 
-def test_status_requires_token(client):
-    assert client.get("/api/auth/status").status_code == 401
-    body = client.get("/api/auth/status", headers={"Authorization": f"Bearer {TOKEN}"}).json()
-    assert body == {"broker": "paper", "connected": True, "reason": None,
-                    "logged_in_today": {"fyers": False, "zerodha": False}}
+def test_login_requires_the_owner(client, fyers):
+    account_id, _ = fyers
+    assert client.get(f"/api/accounts/{account_id}/broker-login", follow_redirects=False).status_code == 401
+    other, _ = add_user(client, "mallory")
+    assert client.get(f"/api/accounts/{account_id}/broker-login", headers=other,
+                      follow_redirects=False).status_code == 404
 
 
-def test_login_requires_api_token(client, fyers_login):
-    assert client.get("/api/auth/fyers/login", follow_redirects=False).status_code == 401
-
-
-def test_full_login_saves_token_and_reconnects(client, fyers_login):
-    state = start_login(client)
+def test_full_login_uses_the_accounts_own_app_and_saves_token(client, fyers):
+    account_id, reconnects = fyers
+    state = start_login(client, account_id)
+    assert (FakeSession.instances[-1].kwargs["client_id"], FakeSession.instances[-1].kwargs["secret_key"]) == (
+        "XB12345-100", "fsecret")  # decrypted for this account only
     r = client.get(f"/api/auth/fyers/callback?auth_code=abc&state={state}")
     assert r.status_code == 200 and "successful" in r.text
-    assert fyers_login == ["fresh-token"]  # broker restarted with the new token
+    assert reconnects == [(account_id, "fresh-token")]
+    assert client.get(f"/api/accounts/{account_id}", headers=AUTH).json()["logged_in_today"] is True
 
     # A state can only be used once.
     assert client.get(f"/api/auth/fyers/callback?auth_code=abc&state={state}").status_code == 400
 
 
-def test_callback_rejects_unknown_state_and_bad_code(client, fyers_login):
+def test_callback_rejects_unknown_state_and_bad_code(client, fyers):
+    account_id, reconnects = fyers
     assert client.get("/api/auth/fyers/callback?auth_code=abc&state=forged").status_code == 400
-    state = start_login(client)
+    state = start_login(client, account_id)
     assert client.get(f"/api/auth/fyers/callback?auth_code=bad&state={state}").status_code == 502
-    assert fyers_login == []
+    assert reconnects == []
 
 
-def test_token_store_expires_tokens_from_another_day(client):
-    from datetime import date
+def test_paper_accounts_need_no_login(client):
+    assert client.get("/api/accounts/1/broker-login", headers=AUTH).status_code == 422
 
-    from app.auth.models import BrokerToken
-    from app.core import db
 
-    store = TokenStore("fyers")
-    assert run(client, store.load) is None
-    run(client, store.save, "tok")
-    assert run(client, store.load) == "tok"
-    run(client, store.save, "tok2")  # saving again replaces today's token
-    assert run(client, store.load) == "tok2"
+def test_token_expires_with_the_day(client, fyers):
+    account_id, _ = fyers
+    run(client, store.save_token, account_id, "tok")
+
+    async def token():
+        return store.token_of(await store.get_account(account_id))
+
+    assert run(client, token) == "tok"
 
     async def backdate():
         async with db.session() as s, s.begin():
-            (await s.get(BrokerToken, "fyers")).token_date = date(2000, 1, 1)
+            (await s.get(BrokerAccount, account_id)).token_date = date(2000, 1, 1)
 
     run(client, backdate)
-    assert run(client, store.load) is None
-    run(client, store.clear)
-    assert run(client, store.load) is None
+    assert run(client, token) is None
+    run(client, store.clear_token, account_id)
+    assert run(client, token) is None
 
 
 # ---------- Zerodha ----------
@@ -114,21 +132,20 @@ class FakeKite:
 
 
 @pytest.fixture
-def zerodha_login(client, monkeypatch):
-    monkeypatch.setattr(settings, "zerodha_api_key", "kitekey")
-    monkeypatch.setattr(settings, "zerodha_api_secret", "zsecret")
+def zerodha(client, monkeypatch):
     monkeypatch.setattr(auth_router, "KiteConnect", FakeKite)
-    restarts = []
+    account_id = add_account(client, "zerodha", {"api_key": "kitekey", "api_secret": "zsecret"})
+    reconnects = []
 
-    async def fake_restart():
-        restarts.append(await client.app.state.token_stores["zerodha"].load())
+    async def fake_reconnect(acct):
+        reconnects.append((acct, store.token_of(await store.get_account(acct))))
 
-    monkeypatch.setattr(client.app.state.brokers, "restart", fake_restart)
-    return restarts
+    monkeypatch.setattr(client.app.state.accounts, "reconnect", fake_reconnect)
+    return account_id, reconnects
 
 
-def start_zerodha_login(client):
-    r = client.get("/api/auth/zerodha/login", headers={"Authorization": f"Bearer {TOKEN}"}, follow_redirects=False)
+def start_zerodha_login(client, account_id):
+    r = client.get(f"/api/accounts/{account_id}/broker-login", headers=AUTH, follow_redirects=False)
     assert r.status_code == 307
     query = parse_qs(urlparse(r.headers["location"]).query)
     assert query["api_key"] == ["kitekey"]
@@ -136,34 +153,32 @@ def start_zerodha_login(client):
     return parse_qs(query["redirect_params"][0])["state"][0]
 
 
-def test_zerodha_login_saves_token(client, zerodha_login, monkeypatch):
-    monkeypatch.setattr(client.app.state.brokers, "name", "zerodha")
-    state = start_zerodha_login(client)
+def test_zerodha_login_saves_token(client, zerodha):
+    account_id, reconnects = zerodha
+    state = start_zerodha_login(client, account_id)
     r = client.get(f"/api/auth/zerodha/callback?request_token=rt&action=login&status=success&state={state}")
     assert r.status_code == 200 and "Zerodha" in r.text
-    assert zerodha_login == ["kite-token"]
+    assert reconnects == [(account_id, "kite-token")]
 
 
-def test_zerodha_login_for_inactive_broker_saves_without_restart(client, zerodha_login):
-    state = start_zerodha_login(client)  # active broker is paper
-    assert client.get(f"/api/auth/zerodha/callback?request_token=rt&status=success&state={state}").status_code == 200
-    assert zerodha_login == []
-    assert run(client, client.app.state.token_stores["zerodha"].load) == "kite-token"
-
-
-def test_zerodha_callback_failures(client, zerodha_login):
-    # A Fyers state cannot complete a Zerodha login.
+def test_zerodha_callback_failures(client, zerodha):
+    account_id, reconnects = zerodha
     assert client.get("/api/auth/zerodha/callback?request_token=rt&state=forged").status_code == 400
-    state = start_zerodha_login(client)
+    state = start_zerodha_login(client, account_id)
     assert client.get(f"/api/auth/zerodha/callback?request_token=bad&status=success&state={state}").status_code == 502
-    state = start_zerodha_login(client)
+    state = start_zerodha_login(client, account_id)
     assert client.get(f"/api/auth/zerodha/callback?request_token=rt&status=cancelled&state={state}").status_code == 400
-    assert zerodha_login == []
+    assert reconnects == []
 
 
-def test_logout_clears_token(client, zerodha_login):
-    run(client, client.app.state.token_stores["zerodha"].save, "kite-token")
-    r = client.post("/api/auth/zerodha/logout", headers={"Authorization": f"Bearer {TOKEN}"})
+def test_a_fyers_state_cannot_finish_a_zerodha_login(client, fyers, zerodha):
+    state = start_login(client, fyers[0])
+    assert client.get(f"/api/auth/zerodha/callback?request_token=rt&state={state}").status_code == 400
+
+
+def test_broker_logout_clears_token(client, zerodha):
+    account_id, _ = zerodha
+    run(client, store.save_token, account_id, "kite-token")
+    r = client.post(f"/api/accounts/{account_id}/broker-logout", headers=AUTH)
     assert r.status_code == 200
-    assert run(client, client.app.state.token_stores["zerodha"].load) is None
-    assert client.post("/api/auth/nope/logout", headers={"Authorization": f"Bearer {TOKEN}"}).status_code == 404
+    assert client.get(f"/api/accounts/{account_id}", headers=AUTH).json()["logged_in_today"] is False

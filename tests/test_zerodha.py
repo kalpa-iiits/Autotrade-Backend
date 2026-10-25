@@ -6,13 +6,11 @@ import struct
 import time
 
 import pytest
-from fastapi.testclient import TestClient
 from kiteconnect.exceptions import InputException, OrderException
 
-import app.main
 from app.brokers import MissingCredentials, OrderError
 from app.brokers.zerodha import ZerodhaBroker, parse_ticks
-from app.core.config import settings
+from tests.conftest import AUTH, TOKEN
 from app.orders.schemas import OrderStatus, OrderType, PlaceOrder, Side
 
 SBIN = 779521  # NSE segment (token & 0xff == 1)
@@ -234,30 +232,31 @@ def test_ticks_and_subscriptions():
     asyncio.run(run())
 
 
-def test_apps_share_the_zerodha_broker(monkeypatch):
+def test_apps_share_the_accounts_zerodha_broker(client, monkeypatch):
     holder = {}
 
     def fake_create(*a, **kw):
         holder["broker"], _, holder["connect"] = make_broker()
         return holder["broker"]
 
-    monkeypatch.setattr(settings, "broker", "zerodha")
-    monkeypatch.setattr("app.core.broker_service.create_broker", fake_create)
-    with TestClient(app.main.app) as client:
-        with client.websocket_connect(f"/api/ws/tickers?token={settings.api_token}") as tickers, \
-             client.websocket_connect(f"/api/ws/orders?token={settings.api_token}") as orders:
-            assert tickers.receive_json()["broker"] == "zerodha"
-            orders.receive_json()
+    monkeypatch.setattr("app.accounts.registry.create_broker", fake_create)
+    acct = client.post("/api/accounts", json={"broker": "zerodha", "label": "Kite", "credentials": {
+        "api_key": "kitekey", "api_secret": "s"}}, headers=AUTH).json()["id"]
+    base = f"/api/accounts/{acct}/ws"
+    with client.websocket_connect(f"{base}/tickers?token={TOKEN}") as tickers, \
+         client.websocket_connect(f"{base}/orders?token={TOKEN}") as orders:
+        assert tickers.receive_json()["broker"] == "zerodha"
+        orders.receive_json()
 
-            tickers.send_json({"action": "subscribe", "symbols": ["NSE:SBIN"]})
-            assert tickers.receive_json()["symbols"] == ["NSE:SBIN"]
+        tickers.send_json({"action": "subscribe", "symbols": ["NSE:SBIN"]})
+        assert tickers.receive_json()["symbols"] == ["NSE:SBIN"]
 
-            # Push a tick through the fake Kite socket on the app's event loop.
-            ws = holder["connect"].ws
-            client.portal.call(ws.frames.put, tick_frame((SBIN, 805.5)))
-            assert tickers.receive_json() == {"type": "tick", "symbol": "NSE:SBIN", "ltp": 805.5}
+        # Push a tick through the fake Kite socket on the app's event loop.
+        ws = holder["connect"].ws
+        client.portal.call(ws.frames.put, tick_frame((SBIN, 805.5)))
+        assert tickers.receive_json() == {"type": "tick", "account_id": acct, "symbol": "NSE:SBIN", "ltp": 805.5}
 
-            orders.send_json({"action": "place_order", "symbol": "NSE:SBIN", "side": "BUY",
-                              "quantity": 1})
-            msgs = [orders.receive_json(), orders.receive_json()]
-            assert {m["type"] for m in msgs} == {"order_update", "ack"}
+        orders.send_json({"action": "place_order", "symbol": "NSE:SBIN", "side": "BUY",
+                          "quantity": 1})
+        msgs = [orders.receive_json(), orders.receive_json()]
+        assert {m["type"] for m in msgs} == {"order_update", "ack"}

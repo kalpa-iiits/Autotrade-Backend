@@ -10,21 +10,21 @@ from tests.conftest import ADMIN_PASSWORD, TOKEN, run, sign_in
 def test_pages_redirect_to_login_when_signed_out(client):
     r = client.get("/", follow_redirects=False)
     assert r.status_code == 303 and r.headers["location"] == "/login?next=/"
-    assert client.get("/api/auth/status").status_code == 401
-    assert client.get("/api/orders").status_code == 401
+    assert client.get("/api/accounts").status_code == 401
+    assert client.get("/api/accounts/1/orders").status_code == 401
     assert client.get("/health").status_code == 200  # stays public for monitoring
     page = client.get("/login")
     assert page.status_code == 200 and 'name="password"' in page.text
 
 
 def test_sign_in_and_out(client):
-    r = sign_in(client, next_="/api/account/funds")
-    assert r.status_code == 303 and r.headers["location"] == "/api/account/funds"
+    r = sign_in(client, next_="/api/accounts/1/funds")
+    assert r.status_code == 303 and r.headers["location"] == "/api/accounts/1/funds"
     cookie = r.headers["set-cookie"].lower()
     assert "httponly" in cookie and "samesite=lax" in cookie
 
     assert client.get("/").status_code == 200
-    assert client.get("/api/auth/status").json()["broker"] == "paper"
+    assert [a["broker"] for a in client.get("/api/accounts").json()] == ["paper"]
     assert client.get("/login", follow_redirects=False).status_code == 303  # already signed in
 
     assert client.post("/logout", follow_redirects=False).headers["location"] == "/login"
@@ -35,7 +35,7 @@ def test_wrong_credentials(client):
     r = sign_in(client, password="nope")
     assert r.status_code == 401 and "Invalid username or password" in r.text
     assert sign_in(client, username="root").status_code == 401
-    assert client.get("/api/auth/status").status_code == 401
+    assert client.get("/api/accounts").status_code == 401
 
 
 def test_next_cannot_leave_the_site(client):
@@ -55,9 +55,9 @@ def test_lockout_after_repeated_failures(client):
 
 def test_changing_password_ends_existing_sessions(client):
     sign_in(client)
-    assert client.get("/api/auth/status").status_code == 200
+    assert client.get("/api/accounts").status_code == 200
     run(client, set_password, "admin", "a brand new password")
-    assert client.get("/api/auth/status").status_code == 401
+    assert client.get("/api/accounts").status_code == 401
     assert sign_in(client).status_code == 401
     assert sign_in(client, password="a brand new password").status_code == 303
 
@@ -65,7 +65,7 @@ def test_changing_password_ends_existing_sessions(client):
 def test_disabled_user_is_signed_out_and_cannot_sign_in(client):
     sign_in(client)
     run(client, set_active, "admin", False)
-    assert client.get("/api/auth/status").status_code == 401
+    assert client.get("/api/accounts").status_code == 401
     assert sign_in(client).status_code == 401
     run(client, set_active, "admin", True)
     assert sign_in(client).status_code == 303
@@ -106,24 +106,24 @@ def test_not_configured(empty_client):
 
 def test_websockets_use_the_session(client):
     with pytest.raises(WebSocketDisconnect):
-        with client.websocket_connect("/api/ws/orders") as ws:
+        with client.websocket_connect("/api/accounts/1/ws/orders") as ws:
             ws.receive_json()
 
     sign_in(client)
-    with client.websocket_connect("/api/ws/orders") as ws:
+    with client.websocket_connect("/api/accounts/1/ws/orders") as ws:
         assert ws.receive_json()["type"] == "welcome"
 
     # Another site's page can't ride on the cookie.
     with pytest.raises(WebSocketDisconnect):
-        with client.websocket_connect("/api/ws/tickers", headers={"origin": "https://evil.example"}) as ws:
+        with client.websocket_connect("/api/accounts/1/ws/tickers", headers={"origin": "https://evil.example"}) as ws:
             ws.receive_json()
 
 
-def test_api_token_access(client, monkeypatch):
-    assert client.get("/api/account/funds", headers={"Authorization": f"Bearer {TOKEN}"}).status_code == 200
-    monkeypatch.setattr(settings, "api_token", "")  # empty disables token access
-    assert client.get("/api/account/funds", headers={"Authorization": "Bearer "}).status_code == 401
-    assert client.get("/api/account/funds?token=").status_code == 401
+def test_api_token_access(client):
+    assert client.get("/api/accounts/1/funds", headers={"Authorization": f"Bearer {TOKEN}"}).status_code == 200
+    assert client.get("/api/accounts/1/funds", headers={"Authorization": "Bearer "}).status_code == 401
+    assert client.get("/api/accounts/1/funds", headers={"Authorization": "Bearer wrong"}).status_code == 401
+    assert client.get("/api/accounts/1/funds?token=").status_code == 401
 
 
 def test_api_docs_need_login(client):
@@ -134,7 +134,7 @@ def test_api_docs_need_login(client):
     sign_in(client)
     assert "swagger" in client.get("/api/docs").text.lower()
     paths = client.get("/api/openapi.json").json()["paths"]
-    assert "/api/orders" in paths and "/login" not in paths
+    assert "/api/accounts/{account_id}/orders" in paths and "/login" not in paths
 
 
 def test_password_hashing():

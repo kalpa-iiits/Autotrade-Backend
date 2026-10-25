@@ -36,7 +36,7 @@ AUTH = {"Authorization": f"Bearer {TOKEN}"}
 
 
 def place_limit(client, price=1.0, qty=2):
-    r = client.post("/api/orders", json={"symbol": SYM, "side": "BUY", "quantity": qty,
+    r = client.post("/api/accounts/1/orders", json={"symbol": SYM, "side": "BUY", "quantity": qty,
                                          "order_type": "LIMIT", "limit_price": price}, headers=AUTH)
     assert r.status_code == 201, r.text
     return r.json()
@@ -45,18 +45,18 @@ def place_limit(client, price=1.0, qty=2):
 # ---------- reconciliation ----------
 
 def test_resync_applies_updates_the_socket_never_delivered(client, monkeypatch):
-    brokers = client.app.state.brokers
+    brokers = client.app.state.accounts.get(1).service
     order = place_limit(client)  # far below the price: stays open
     # The broker fills it, but the update is lost (socket down): only its order book knows.
     paper_order = brokers.broker.orders[order["id"]]
     paper_order.status, paper_order.filled_quantity, paper_order.filled_price = OrderStatus.FILLED, 2, 1.0
 
     assert run(client, brokers.resync) == 1
-    history = client.get("/api/orders/history", headers=AUTH).json()
+    history = client.get("/api/accounts/1/orders/history", headers=AUTH).json()
     assert (history[0]["status"], history[0]["filled_quantity"]) == ("FILLED", 2)
     assert client.get("/api/trades/open", headers=AUTH).json()["totals"]["count"] == 1  # fill recorded
     assert run(client, brokers.resync) == 0  # nothing missed any more
-    health = client.get("/health").json()["broker_detail"]
+    health = client.get("/api/accounts/1", headers=AUTH).json()["connection"]["broker"]
     assert health["resynced_orders"] == 1 and health["last_resync_at"] is not None
 
 
@@ -64,11 +64,11 @@ def test_resync_unblocks_a_strategy_waiting_on_a_lost_fill(deploy, monkeypatch):
     monkeypatch.setattr(settings, "strategies_live_enabled", True)
     c = deploy(dep("a", mode="live"))
     inst = start_strategy(c, "a")
-    runner, brokers = c.app.state.strategy_runner, c.app.state.brokers
+    runner, brokers = c.app.state.strategy_runner, c.app.state.accounts.get(1).service
     order = place_limit(c, qty=1)
     # As if the strategy had placed it: it owns the order and waits for it to finish.
     running = runner.running[inst["id"]]
-    running.pending_order_id, runner._order_owner[order["id"]] = order["id"], inst["id"]
+    running.pending_order_id, runner._order_owner[(1, order["id"])] = order["id"], inst["id"]
     SCRIPT.append(("buy",))
     tick(c)
     assert signals(c, inst["id"])[0]["outcome"] == "blocked"  # "order ... is still open"
@@ -211,10 +211,10 @@ def test_slow_strategy_does_not_stall_the_feed(deploy, monkeypatch):
 
     async def feed():
         GATE["open"] = asyncio.Event()
-        await runner.on_tick(SYM, 1.0)
+        await runner.on_tick(1, SYM, 1.0)
         await asyncio.sleep(0.01)  # the worker takes tick 1 and blocks on it
         for price in (2.0, 3.0, 4.0, 5.0):
-            await asyncio.wait_for(runner.on_tick(SYM, price), timeout=0.5)  # returns at once
+            await asyncio.wait_for(runner.on_tick(1, SYM, price), timeout=0.5)  # returns at once
         return runner.running[inst["id"]].dropped_ticks
 
     assert run(c, feed) == 2  # queue holds 2: ticks 2 and 3 were dropped for 4 and 5
@@ -270,7 +270,7 @@ def test_ledger_failure_is_retried_and_pauses_live_trading(deploy, monkeypatch):
     monkeypatch.setattr(settings, "strategies_live_enabled", True)
     c = deploy(dep("a", mode="live"))
     inst = start_strategy(c, "a")
-    ledger, brokers = c.app.state.ledger, c.app.state.brokers
+    ledger, brokers = c.app.state.accounts.get(1).ledger, c.app.state.accounts.get(1).service
     order = Order(id="lost1", symbol=SYM, side=Side.BUY, quantity=3, order_type=OrderType.MARKET,
                   status=OrderStatus.FILLED, filled_quantity=3, filled_price=100.5)
 
@@ -283,7 +283,9 @@ def test_ledger_failure_is_retried_and_pauses_live_trading(deploy, monkeypatch):
     run(c, ledger.on_order, order)
     r = c.get("/health")
     assert r.status_code == 503 and r.json()["status"] == "failing"
-    assert r.json()["ledger"] == {"healthy": False, "unsaved_orders": 1, "last_error": "RuntimeError: disk full"}
+    assert r.json()["accounts"]["ledger_unhealthy"] == 1  # public: a count, no details
+    detail = c.get("/api/accounts/1", headers=AUTH).json()["connection"]["ledger"]
+    assert detail == {"healthy": False, "unsaved_orders": 1, "last_error": "RuntimeError: disk full"}
     assert brokers.records_reliable() is False
 
     SCRIPT.append(("buy",))
@@ -297,14 +299,14 @@ def test_ledger_failure_is_retried_and_pauses_live_trading(deploy, monkeypatch):
 
     async def saved():
         async with db.session() as s:
-            return (await s.get(OrderRecord, (brokers.name, "lost1"))).filled_quantity
+            return (await s.get(OrderRecord, (1, "lost1"))).filled_quantity
     assert run(c, saved) == 3  # the update was not lost
 
 
 # ---------- money ----------
 
 def test_money_is_exact(client):
-    ledger = client.app.state.ledger
+    ledger = client.app.state.accounts.get(1).ledger
     for i, (side, price) in enumerate([(Side.BUY, 0.1), (Side.BUY, 0.2), (Side.SELL, 0.3)]):
         run(client, ledger.on_order, Order(
             id=f"m{i}", symbol="NSE:X", side=side, quantity=1 if side == Side.BUY else 2,
@@ -343,15 +345,18 @@ def test_money_migration_keeps_values(tmp_path):
 # ---------- auth ----------
 
 def test_rest_api_token_only_in_the_header(client):
-    assert client.get(f"/api/account/funds?token={TOKEN}").status_code == 401  # would leak into logs
-    assert client.get("/api/account/funds", headers=AUTH).status_code == 200
+    assert client.get(f"/api/accounts/1/funds?token={TOKEN}").status_code == 401  # would leak into logs
+    assert client.get("/api/accounts/1/funds", headers=AUTH).status_code == 200
 
 
 # ---------- health ----------
 
 def test_health_reports_components(client):
     body = client.get("/health").json()
-    assert body["status"] == "ok" and body["database"] is True and body["connected"] is True
-    assert body["ledger"]["healthy"] is True
-    assert {"ticks_received", "stream_error", "last_resync_at"} <= set(body["broker_detail"])
-    assert set(body["websockets"]) == {"orders", "tickers", "evicted_slow_clients"}
+    assert body["status"] == "ok" and body["database"] is True
+    assert body["accounts"]["active"] == body["accounts"]["connected"] == 1
+    assert body["accounts"]["ledger_unhealthy"] == 0
+    assert "admin" not in str(body) and "Paper" not in str(body)  # public: nothing per user
+    detail = client.get("/api/accounts/1", headers=AUTH).json()["connection"]
+    assert {"ticks_received", "stream_error", "last_resync_at"} <= set(detail["broker"])
+    assert set(detail["websockets"]) == {"orders", "tickers"}

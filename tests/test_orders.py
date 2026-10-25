@@ -8,12 +8,12 @@ from app.core.config import settings
 from app.orders.schemas import Order, PlaceOrder, Side
 from tests.conftest import TOKEN, recv_until, run
 
-URL = f"/api/ws/orders?token={TOKEN}"
+URL = f"/api/accounts/1/ws/orders?token={TOKEN}"
 
 
 def test_rejects_bad_token(client):
     with pytest.raises(WebSocketDisconnect):
-        with client.websocket_connect("/api/ws/orders?token=wrong") as ws:
+        with client.websocket_connect("/api/accounts/1/ws/orders?token=wrong") as ws:
             ws.receive_json()
 
 
@@ -72,8 +72,8 @@ def test_ping(client):
 
 
 def test_rest_reads_need_token(client):
-    assert client.get("/api/orders").status_code == 401
-    r = client.get("/api/account/funds", headers={"Authorization": f"Bearer {TOKEN}"})
+    assert client.get("/api/accounts/1/orders").status_code == 401
+    r = client.get("/api/accounts/1/funds", headers={"Authorization": f"Bearer {TOKEN}"})
     assert r.status_code == 200 and r.json()["cash"] > 0
 
 
@@ -82,12 +82,12 @@ AUTH = {"Authorization": f"Bearer {TOKEN}"}
 
 def test_same_client_order_id_places_once(client):
     body = {"symbol": "NSE:SBIN-EQ", "side": "BUY", "quantity": 3, "client_order_id": "retry1"}
-    first = client.post("/api/orders", json=body, headers=AUTH)
-    again = client.post("/api/orders", json=body, headers=AUTH)  # e.g. a retry after a timeout
+    first = client.post("/api/accounts/1/orders", json=body, headers=AUTH)
+    again = client.post("/api/accounts/1/orders", json=body, headers=AUTH)  # e.g. a retry after a timeout
     assert first.status_code == again.status_code == 201
     assert first.json()["id"] == again.json()["id"]
     assert first.json()["client_order_id"] == "retry1"
-    assert len(client.get("/api/orders", headers=AUTH).json()) == 1
+    assert len(client.get("/api/accounts/1/orders", headers=AUTH).json()) == 1
 
     # The WebSocket shares the same guard; without an id every order gets its own.
     with client.websocket_connect(URL) as ws:
@@ -95,15 +95,15 @@ def test_same_client_order_id_places_once(client):
         ws.send_json({"action": "place_order", "symbol": "NSE:SBIN-EQ", "side": "BUY",
                       "quantity": 3, "client_order_id": "retry1"})
         assert recv_until(ws, "ack")["order"]["id"] == first.json()["id"]
-    other = client.post("/api/orders", json=body | {"client_order_id": None}, headers=AUTH).json()
+    other = client.post("/api/accounts/1/orders", json=body | {"client_order_id": None}, headers=AUTH).json()
     assert other["id"] != first.json()["id"] and other["client_order_id"]
-    assert len(client.get("/api/orders", headers=AUTH).json()) == 2
+    assert len(client.get("/api/accounts/1/orders", headers=AUTH).json()) == 2
 
 
 def test_client_order_id_must_fit_broker_tags(client):
     for bad in ["has-dash", "x" * 21, ""]:
         body = {"symbol": "NSE:SBIN-EQ", "side": "BUY", "quantity": 1, "client_order_id": bad}
-        assert client.post("/api/orders", json=body, headers=AUTH).status_code == 422
+        assert client.post("/api/accounts/1/orders", json=body, headers=AUTH).status_code == 422
 
 
 class FlakyBroker:
@@ -125,7 +125,10 @@ class FlakyBroker:
 
 
 def test_retry_after_lost_reply_and_concurrent_retries_place_once(client):
-    service = BrokerService(settings, token_loader=lambda: None)
+    async def no_broker():
+        raise AssertionError("not used")
+
+    service = BrokerService(settings, no_broker, name="paper", account_id=1)
     service.broker = broker = FlakyBroker()
     req = PlaceOrder(action="place_order", symbol="NSE:SBIN-EQ", side=Side.BUY, quantity=1,
                      client_order_id="lost1")

@@ -1,6 +1,6 @@
-from datetime import date, datetime
+from datetime import datetime
 
-from sqlalchemy import Boolean, Date, Index, String
+from sqlalchemy import Boolean, ForeignKey, Index, String
 from sqlalchemy.orm import Mapped, mapped_column
 
 from app.core.db import Base, UTCDateTime, utcnow
@@ -17,15 +17,19 @@ class User(Base):
     last_login_at: Mapped[datetime | None] = mapped_column(UTCDateTime, nullable=True)
 
 
-class BrokerToken(Base):
-    """Today's access token per broker (Fyers/Zerodha tokens expire daily)."""
+class ApiToken(Base):
+    """A user's token for scripts and bots (Authorization: Bearer ...). Only a SHA-256 hash is
+    stored; the token itself is shown once, when it is created."""
 
-    __tablename__ = "broker_tokens"
+    __tablename__ = "api_tokens"
 
-    broker: Mapped[str] = mapped_column(String(32), primary_key=True)
-    access_token: Mapped[str] = mapped_column(String(4096))
-    token_date: Mapped[date] = mapped_column(Date)  # trading day (IST) the token is valid for
-    updated_at: Mapped[datetime] = mapped_column(UTCDateTime, default=utcnow, onupdate=utcnow)
+    id: Mapped[int] = mapped_column(primary_key=True)
+    user_id: Mapped[int] = mapped_column(ForeignKey("users.id"), index=True)
+    name: Mapped[str] = mapped_column(String(64))
+    token_hash: Mapped[str] = mapped_column(String(64), unique=True)
+    prefix: Mapped[str] = mapped_column(String(12))  # first characters, to recognise it in a list
+    created_at: Mapped[datetime] = mapped_column(UTCDateTime, default=utcnow)
+    last_used_at: Mapped[datetime | None] = mapped_column(UTCDateTime, nullable=True)
 
 
 class LoginAttempt(Base):

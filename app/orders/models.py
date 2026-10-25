@@ -1,21 +1,22 @@
 from datetime import datetime
 from decimal import Decimal
 
-from sqlalchemy import Index, Integer, String
+from sqlalchemy import ForeignKey, Index, Integer, String
 from sqlalchemy.orm import Mapped, mapped_column
 
 from app.core.db import Base, Money, UTCDateTime
 
 
 class OrderRecord(Base):
-    """Latest known state of every order the app has seen, across all brokers."""
+    """Latest known state of every order the app has seen, per broker account."""
 
     __tablename__ = "orders"
     __table_args__ = (Index("ix_orders_updated_at", "updated_at"),
-                      Index("ix_orders_client_order_id", "broker", "client_order_id"))
+                      Index("ix_orders_client_order_id", "account_id", "client_order_id"))
 
-    broker: Mapped[str] = mapped_column(String(32), primary_key=True)
+    account_id: Mapped[int] = mapped_column(ForeignKey("broker_accounts.id"), primary_key=True)
     id: Mapped[str] = mapped_column(String(64), primary_key=True)  # broker's order id
+    broker: Mapped[str] = mapped_column(String(32))  # paper / fyers / zerodha
     # Ours, sent as the broker's order tag; placing again with it returns this order.
     client_order_id: Mapped[str | None] = mapped_column(String(32), nullable=True)
     symbol: Mapped[str] = mapped_column(String(64), index=True)
@@ -35,9 +36,10 @@ class OrderEvent(Base):
     """Every change to an order (placed, partly filled, filled, cancelled, ...), in order."""
 
     __tablename__ = "order_events"
-    __table_args__ = (Index("ix_order_events_order", "broker", "order_id", "id"),)
+    __table_args__ = (Index("ix_order_events_order", "account_id", "order_id", "id"),)
 
     id: Mapped[int] = mapped_column(primary_key=True)
+    account_id: Mapped[int] = mapped_column(ForeignKey("broker_accounts.id"))
     broker: Mapped[str] = mapped_column(String(32))
     order_id: Mapped[str] = mapped_column(String(64))
     status: Mapped[str] = mapped_column(String(16))

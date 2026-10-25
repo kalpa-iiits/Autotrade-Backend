@@ -101,6 +101,7 @@ async def init(url: str) -> None:
 
 def import_models() -> None:
     """Import every app's models so their tables are registered on Base.metadata."""
+    import app.accounts.models  # noqa: F401
     import app.auth.models  # noqa: F401
     import app.orders.models  # noqa: F401
     import app.strategies.models  # noqa: F401

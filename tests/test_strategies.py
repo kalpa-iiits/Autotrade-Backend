@@ -4,6 +4,7 @@ from datetime import datetime, timezone
 import pytest
 from fastapi.testclient import TestClient
 from pydantic import BaseModel
+from sqlalchemy import select
 
 from app.core.config import settings
 from app.main import app
@@ -11,7 +12,7 @@ from app.strategies import deployments
 from app.strategies.base import Bar, BarBuilder, Strategy, Tick
 from app.strategies.builtin.sma_crossover import SmaCrossover
 from app.strategies.deployment import Deployment
-from tests.conftest import TOKEN, run
+from tests.conftest import ACCOUNT, TOKEN, add_user, run
 
 AUTH = {"Authorization": f"Bearer {TOKEN}"}
 SYM = "NSE:SBIN-EQ"
@@ -54,12 +55,30 @@ def deploy(monkeypatch):
             clients[-1].__exit__(None, None, None)  # "restart the server"
         c = TestClient(app)
         c.__enter__()
+        if not clients:
+            add_user(c, "admin", token=TOKEN)  # with paper account ACCOUNT
         clients.append(c)
+        for d in deps:
+            run(c, ensure_instance, d)
         return c
 
     yield start
     if clients:
         clients[-1].__exit__(None, None, None)
+
+
+async def ensure_instance(d: Deployment, account_id: int = ACCOUNT) -> None:
+    """The deployment's first instance on the account, on its default symbol and timeframe,
+    like a user adding it in the app (without the broker's symbol check)."""
+    from app.core import db
+    from app.strategies.models import StrategyInstance
+
+    async with db.session() as s, s.begin():
+        exists = await s.scalar(select(StrategyInstance.id).where(
+            StrategyInstance.account_id == account_id, StrategyInstance.deployment_key == d.key))
+        if exists is None:
+            s.add(StrategyInstance(account_id=account_id, deployment_key=d.key, symbol=d.symbol,
+                                   timeframe=d.timeframe, status="stopped", **d.settings()))
 
 
 def by_key(client, key, include_removed=False):
@@ -79,7 +98,7 @@ def start_strategy(client, key):
 def tick(client, price=100.0, symbol=SYM):
     """Feed a tick and wait until the strategies have handled it (they run on their own tasks)."""
     runner = client.app.state.strategy_runner
-    run(client, runner.on_tick, symbol, price)
+    run(client, runner.on_tick, ACCOUNT, symbol, price)
     run(client, runner.drain)
 
 
@@ -114,8 +133,8 @@ def test_logic_limits_and_mode_cannot_be_changed_in_the_app(deploy):
     assert r.status_code == 200
     assert (r.json()["mode"], r.json()["quantity"]) == ("signal", 1)
     # A brand-new strategy can't be defined from the app.
-    assert c.post("/api/strategies", json={"deployment_key": "nope", "symbol": SYM, "timeframe": "1m"},
-                  headers=AUTH).status_code == 404
+    assert c.post("/api/strategies", json={"deployment_key": "nope", "account_id": ACCOUNT, "symbol": SYM,
+                                           "timeframe": "1m"}, headers=AUTH).status_code == 404
 
 
 def test_invalid_deployments_fail_fast():
@@ -158,7 +177,7 @@ def test_start_stop(deploy):
     c = deploy(dep("a"))
     started = start_strategy(c, "a")
     assert started["status"] == "running" and started["position"] == 0
-    assert SYM in c.app.state.brokers.watched_symbols()  # kept subscribed for the strategy
+    assert SYM in c.app.state.accounts.get(1).service.watched_symbols()  # kept subscribed for the strategy
     assert c.post(f"/api/strategies/{started['id']}/stop", headers=AUTH).json()["status"] == "stopped"
 
 
@@ -189,7 +208,7 @@ def test_signal_mode_tracks_virtual_position_and_limits(deploy):
     assert "max_position" in got[2]["message"] and "max_orders_per_day" in got[4]["message"]
     assert got[3]["reason"] == "done" and got[0]["price"] == 100.0
     assert instance(quiet, inst["id"])["position"] == 0
-    assert quiet.get("/api/orders/history", headers=AUTH).json() == []  # nothing sent to the broker
+    assert quiet.get("/api/accounts/1/orders/history", headers=AUTH).json() == []  # nothing sent to the broker
 
 
 def test_live_mode_needs_global_switch(deploy):
@@ -218,7 +237,7 @@ def test_live_mode_places_orders_and_tracks_fills(deploy, monkeypatch):
     assert all(s["order_id"] for s in placed)
     assert instance(quiet, inst["id"])["position"] == 0
     # The orders went through the normal pipeline: history and the trades ledger.
-    history = quiet.get("/api/orders/history", headers=AUTH).json()
+    history = quiet.get("/api/accounts/1/orders/history", headers=AUTH).json()
     assert {o["id"] for o in history} == {s["order_id"] for s in placed}
     assert quiet.get("/api/trades/closed", headers=AUTH).json()["totals"]["count"] == 1
 
@@ -322,9 +341,10 @@ def test_exits_are_never_blocked_by_limits(deploy):
     ]
 
 
-def test_failed_startup_closes_the_broker(monkeypatch):
+def test_failed_startup_closes_the_broker(deploy, monkeypatch):
     """Regression: a startup error after the broker connected left its socket threads
     running, so the server process hung instead of exiting."""
+    deploy(dep("a")).__exit__(None, None, None)  # a user with a paper account exists
     stopped = []
 
     class Broker:
@@ -334,7 +354,7 @@ def test_failed_startup_closes_the_broker(monkeypatch):
         def on_order_update(self, fn): pass
         def on_tick(self, fn): pass
 
-    monkeypatch.setattr("app.core.broker_service.create_broker", lambda *a, **kw: Broker())
+    monkeypatch.setattr("app.accounts.registry.create_broker", lambda *a, **kw: Broker())
     monkeypatch.setattr(deployments, "DEPLOYMENTS", [dep("same"), dep("same")])  # duplicate keys
     with pytest.raises(ValueError, match="Duplicate deployment keys"):
         with TestClient(app):
@@ -344,9 +364,9 @@ def test_failed_startup_closes_the_broker(monkeypatch):
 
 # ---------- symbol and timeframe chosen in the app ----------
 
-def add(client, key, symbol, timeframe="1m"):
-    return client.post("/api/strategies", json={"deployment_key": key, "symbol": symbol, "timeframe": timeframe},
-                       headers=AUTH)
+def add(client, key, symbol, timeframe="1m", account_id=ACCOUNT, headers=AUTH):
+    return client.post("/api/strategies", json={"deployment_key": key, "account_id": account_id,
+                                                "symbol": symbol, "timeframe": timeframe}, headers=headers)
 
 
 def test_add_copies_on_other_symbols_and_timeframes(deploy):
@@ -429,13 +449,16 @@ def test_code_changes_apply_to_every_instance(deploy):
         (SYM, "1m", 2, "stopped"), ("NSE:TCS-EQ", "5m", 2, "stopped")}  # app's choices kept
 
 
-def test_default_instance_only_when_none_exist(deploy):
-    c = deploy(dep("a"))
-    inst = by_key(c, "a")
-    c.patch(f"/api/strategies/{inst['id']}", json={"symbol": "NSE:INFY-EQ"}, headers=AUTH)
-    c = deploy(dep("a"))  # restart: the app's symbol stays, no second default instance
-    rows = [i for i in c.get("/api/strategies", headers=AUTH).json()["strategies"] if i["deployment_key"] == "a"]
-    assert [i["symbol"] for i in rows] == ["NSE:INFY-EQ"]
+def test_code_creates_no_instances(deploy, monkeypatch):
+    """Code is the catalog; instances exist only where a user added them, on their account."""
+    c = deploy()
+    monkeypatch.setattr(deployments, "DEPLOYMENTS", [dep("a")])
+    c.__exit__(None, None, None)
+    with TestClient(app) as fresh:  # restart with a deployment in code
+        body = fresh.get("/api/strategies", headers=AUTH).json()
+        assert [d["key"] for d in body["deployments"]] == ["a"] and body["strategies"] == []
+        r = add(fresh, "a", SYM)
+        assert r.status_code == 201 and r.json()["account_id"] == ACCOUNT
 
 
 def test_orders_per_day_starts_again_the_next_day(deploy, monkeypatch):
@@ -457,24 +480,3 @@ def test_orders_per_day_starts_again_the_next_day(deploy, monkeypatch):
     tick(quiet)
     assert signals(quiet, inst["id"])[0]["outcome"] == "signal_only"
     assert instance(quiet, inst["id"])["orders_today"] == 1
-
-
-def test_archived_default_instance_comes_back_on_restart(deploy):
-    """All of a deployment's instances archived, one on its default symbol + timeframe: the
-    restart brings that one back (stopped, history kept) instead of failing on a duplicate."""
-    c = deploy(dep("a"))
-    inst = by_key(c, "a")
-    SCRIPT.append(("buy",))
-    start_strategy(c, "a")
-    tick(c)
-    c.post(f"/api/strategies/{inst['id']}/stop", headers=AUTH)
-    other = add(c, "a", "NSE:TCS-EQ").json()  # archived too, not on the defaults
-    for i in (inst["id"], other["id"]):
-        assert c.delete(f"/api/strategies/{i}", headers=AUTH).json()["status"] == "archived"
-
-    c = deploy(dep("a"))  # restart
-    [back] = [i for i in c.get("/api/strategies", headers=AUTH).json()["strategies"]
-              if i["deployment_key"] == "a"]
-    assert (back["id"], back["status"], back["last_error"]) == (inst["id"], "stopped", None)
-    assert len(signals(c, back["id"])) == 1  # history kept
-    assert instance(c, other["id"])["status"] == "archived"

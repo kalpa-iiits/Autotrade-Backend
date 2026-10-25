@@ -25,7 +25,7 @@ def order(oid, side, qty, status=OrderStatus.FILLED, filled=None, price=None, sy
 @pytest.fixture
 def ledger(client):
     """A ledger on the test database; `feed(*orders)` applies updates in sequence."""
-    led = TradeLedger("test")
+    led = TradeLedger(1, "paper")  # writes to admin's paper account
 
     def feed(*orders):
         for o in orders:
@@ -107,7 +107,7 @@ def test_flip_closes_and_opens(client, ledger):
         "SHORT", "OPEN", 5, 90.0
     )
     # The one 15-share fill is linked to both positions.
-    assert count(client, PositionFill, fill_id="test:s1:15") == 2
+    assert count(client, PositionFill, fill_id="1:s1:15") == 2
 
 
 def test_cancelled_after_partial_fill_and_missing_quantity(client, ledger):
@@ -121,11 +121,14 @@ def test_cancelled_after_partial_fill_and_missing_quantity(client, ledger):
     assert (tcs.symbol, tcs.quantity) == ("NSE:TCS-EQ", 2)  # FILLED without qty -> full qty
 
 
-def test_symbols_and_brokers_are_separate(client, ledger):
-    other = TradeLedger("other")
+def test_accounts_are_separate(client, ledger):
+    second = client.post("/api/accounts", json={"broker": "paper", "label": "Second"}, headers=AUTH).json()["id"]
+    other = TradeLedger(second, "paper")
     ledger.feed(order("b1", Side.BUY, 1, price=10.0))
-    run(client, other.on_order, order("x1", Side.SELL, 1, price=10.0))
-    assert [(p.broker, p.direction) for p in positions(client)] == [("test", "LONG"), ("other", "SHORT")]
+    run(client, other.on_order, order("b1", Side.SELL, 1, price=10.0))  # same order id, other account
+    assert [(p.account_id, p.direction) for p in positions(client)] == [(1, "LONG"), (second, "SHORT")]
+    only_second = client.get(f"/api/trades/open?account_id={second}", headers=AUTH).json()
+    assert [p["direction"] for p in only_second["positions"]] == ["SHORT"]
 
 
 # ---------- endpoints (paper broker end to end) ----------
@@ -136,7 +139,7 @@ def place(ws, side, qty, symbol=SYM):
 
 
 def test_open_and_closed_trades(client):
-    with client.websocket_connect(f"/api/ws/orders?token={TOKEN}") as ws:
+    with client.websocket_connect(f"/api/accounts/1/ws/orders?token={TOKEN}") as ws:
         ws.receive_json()
         buy = place(ws, "BUY", 10)
         sell = place(ws, "SELL", 10)
@@ -158,13 +161,13 @@ def test_open_and_closed_trades(client):
     assert [(f["role"], f["quantity"]) for f in detail["fills"]] == [("entry", 10), ("exit", 10)]
     assert client.get("/api/trades/999999", headers=AUTH).status_code == 404
 
-    events = client.get(f"/api/orders/{buy['id']}/events", headers=AUTH).json()
+    events = client.get(f"/api/accounts/1/orders/{buy['id']}/events", headers=AUTH).json()
     assert [e["status"] for e in events] == ["FILLED"]
 
 
 def test_unrealized_pnl_from_ticks(client):
-    with client.websocket_connect(f"/api/ws/tickers?token={TOKEN}") as tickers, \
-         client.websocket_connect(f"/api/ws/orders?token={TOKEN}") as orders:
+    with client.websocket_connect(f"/api/accounts/1/ws/tickers?token={TOKEN}") as tickers, \
+         client.websocket_connect(f"/api/accounts/1/ws/orders?token={TOKEN}") as orders:
         tickers.receive_json()
         orders.receive_json()
         tickers.send_json({"action": "subscribe", "symbols": [SYM]})
@@ -184,18 +187,18 @@ def test_closed_filters_and_totals(client, ledger):
         order("b3", Side.BUY, 1, price=10.0, symbol="NSE:TCS-EQ"),
         order("s3", Side.SELL, 1, price=12.0, symbol="NSE:TCS-EQ"),                    # +2
     )
-    body = client.get("/api/trades/closed?broker=test&limit=1", headers=AUTH).json()
+    body = client.get("/api/trades/closed?account_id=1&limit=1", headers=AUTH).json()
     assert len(body["positions"]) == 1  # page size
     assert body["totals"] == {"count": 3, "realized_pnl": 7.0, "wins": 2, "losses": 1,
                               "win_rate": 0.6667}  # totals ignore the page size
-    sbin = client.get(f"/api/trades/closed?broker=test&symbol={SYM}", headers=AUTH).json()
+    sbin = client.get(f"/api/trades/closed?account_id=1&symbol={SYM}", headers=AUTH).json()
     assert sbin["totals"]["count"] == 2
     future = client.get("/api/trades/closed?since=2999-01-01T00:00:00Z", headers=AUTH).json()
     assert future["totals"]["count"] == 0 and future["totals"]["win_rate"] is None
 
 
 def test_trades_need_login(client):
-    for path in ["/api/trades/open", "/api/trades/closed", "/api/trades/1", "/api/orders/x/events"]:
+    for path in ["/api/trades/open", "/api/trades/closed", "/api/trades/1", "/api/accounts/1/orders/x/events"]:
         assert client.get(path).status_code == 401
 
 
@@ -206,7 +209,7 @@ def test_stale_update_does_not_undo_a_fill(client, ledger):
 
     filled = order("b1", Side.BUY, 10, price=100.0).model_copy(update={"client_order_id": "abc123"})
     ledger.feed(filled, order("b1", Side.BUY, 10, status=OrderStatus.OPEN, filled=0))
-    [rec] = run(client, list_history, "test")
+    [rec] = run(client, list_history, 1)
     assert (rec["status"], rec["filled_quantity"], rec["client_order_id"]) == ("FILLED", 10, "abc123")
     assert count(client, Fill) == 1 and count(client, OrderEvent, order_id="b1") == 1
     [p] = positions(client)
@@ -214,5 +217,5 @@ def test_stale_update_does_not_undo_a_fill(client, ledger):
 
     # A real later update still applies, and keeps the client order id it doesn't carry.
     ledger.feed(order("b1", Side.BUY, 10, status=OrderStatus.CANCELLED, filled=10, price=100.0))
-    [rec] = run(client, list_history, "test")
+    [rec] = run(client, list_history, 1)
     assert (rec["status"], rec["client_order_id"]) == ("CANCELLED", "abc123")

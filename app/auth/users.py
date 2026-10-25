@@ -5,6 +5,7 @@
     python -m app.auth.users disable <username>
     python -m app.auth.users enable <username>
     python -m app.auth.users list
+    python -m app.auth.users token <username> [name]   # prints a new personal API token
 """
 
 import asyncio
@@ -111,6 +112,9 @@ def _main() -> None:
     for name in ("create", "set-password", "disable", "enable"):
         sub.add_parser(name).add_argument("username")
     sub.add_parser("list")
+    tok = sub.add_parser("token")
+    tok.add_argument("username")
+    tok.add_argument("name", nargs="?", default="cli")
     args = parser.parse_args()
 
     def ask_password() -> str:
@@ -128,6 +132,15 @@ def _main() -> None:
             if args.command == "set-password":
                 await set_password(args.username, ask_password())
                 return f"Password changed; {args.username!r} is signed out everywhere."
+            if args.command == "token":
+                from app.auth.tokens import create_token
+
+                async with db.session() as s:
+                    user = await s.scalar(select(User).where(User.username == args.username))
+                if user is None:
+                    raise UserError(f"No user {args.username!r}.")
+                _, token = await create_token(user.id, args.name)
+                return f"API token for {args.username!r} (shown once, keep it secret):\n{token}"
             if args.command in ("disable", "enable"):
                 await set_active(args.username, args.command == "enable")
                 return f"{args.username!r} {args.command}d."

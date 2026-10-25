@@ -36,7 +36,10 @@ def _weighted(avg: Decimal | None, qty: int, price: Decimal, add_qty: int) -> De
 
 
 class TradeLedger:
-    def __init__(self, broker: str) -> None:
+    """One per broker account: records that account's orders, fills and positions."""
+
+    def __init__(self, account_id: int, broker: str) -> None:
+        self.account_id = account_id
         self.broker = broker
         self.last_prices: dict[str, float] = {}  # from ticks; used for unrealized P&L
         # Updates are applied one at a time so two can't both read the same previous state.
@@ -104,7 +107,7 @@ class TradeLedger:
                 await self.retry()
 
     async def _apply_order(self, s: AsyncSession, order: Order) -> None:
-        prev = await s.get(OrderRecord, (self.broker, order.id))
+        prev = await s.get(OrderRecord, (self.account_id, order.id))
         filled_qty = order.filled_quantity
         if order.status == OrderStatus.FILLED and not filled_qty:
             filled_qty = order.quantity  # broker said filled but didn't send a quantity
@@ -119,7 +122,8 @@ class TradeLedger:
         state = (order.status.value, filled_qty, avg)
         if prev is None or (prev.status, prev.filled_quantity, prev.filled_price) != state:
             s.add(OrderEvent(
-                broker=self.broker, order_id=order.id, status=order.status.value,
+                account_id=self.account_id, broker=self.broker, order_id=order.id,
+                status=order.status.value,
                 filled_quantity=filled_qty, filled_price=avg,
                 reason=order.reason, at=order.updated_at,
             ))
@@ -135,7 +139,8 @@ class TradeLedger:
                 else:
                     price = avg
                 fill = Fill(
-                    id=f"{self.broker}:{order.id}:{filled_qty}", broker=self.broker,
+                    id=f"{self.account_id}:{order.id}:{filled_qty}", account_id=self.account_id,
+                    broker=self.broker,
                     order_id=order.id, symbol=order.symbol, side=order.side.value,
                     quantity=new_qty, price=price, filled_at=order.updated_at,
                 )
@@ -144,7 +149,7 @@ class TradeLedger:
                 await self._apply_fill(s, fill)
 
         await s.merge(OrderRecord(
-            broker=self.broker, id=order.id,
+            account_id=self.account_id, id=order.id, broker=self.broker,
             # Later updates may not carry it (e.g. orderbook rows): keep the one we placed with.
             client_order_id=order.client_order_id or (prev.client_order_id if prev else None),
             symbol=order.symbol, side=order.side.value,
@@ -158,7 +163,7 @@ class TradeLedger:
         direction = LONG if fill.side == Side.BUY.value else SHORT
         remaining = fill.quantity
         pos = await s.scalar(select(Position).where(
-            Position.broker == fill.broker, Position.symbol == fill.symbol, Position.status == OPEN,
+            Position.account_id == fill.account_id, Position.symbol == fill.symbol, Position.status == OPEN,
         ))
 
         if pos is not None and pos.direction != direction:
@@ -183,7 +188,8 @@ class TradeLedger:
         if pos is None:
             # Nothing open (or the fill just closed one and has quantity left): open a new one.
             pos = Position(
-                broker=fill.broker, symbol=fill.symbol, direction=direction, status=OPEN,
+                account_id=fill.account_id, broker=fill.broker, symbol=fill.symbol,
+                direction=direction, status=OPEN,
                 quantity=remaining, entry_quantity=remaining, avg_entry_price=fill.price,
                 exit_quantity=0, realized_pnl=Decimal(0), opened_at=fill.filled_at,
             )

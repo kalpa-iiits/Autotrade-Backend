@@ -11,3 +11,4 @@ python-multipart>=0.0.9
 sqlalchemy[asyncio]>=2.0
 aiosqlite>=0.20
 alembic>=1.13
+cryptography>=42

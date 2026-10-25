@@ -5,12 +5,10 @@ import threading
 import time
 
 import pytest
-from fastapi.testclient import TestClient
 
-import app.main
 from app.brokers import MissingCredentials, OrderError
 from app.brokers.fyers import FyersBroker
-from app.core.config import settings
+from tests.conftest import AUTH, TOKEN
 from app.orders.schemas import OrderStatus, OrderType, PlaceOrder, Side
 
 
@@ -186,43 +184,49 @@ def test_ticks_subscriptions_and_account_data():
     asyncio.run(run())
 
 
-def test_apps_share_the_fyers_broker(monkeypatch):
-    monkeypatch.setattr(settings, "broker", "fyers")
-    monkeypatch.setattr(
-        "app.core.broker_service.create_broker", lambda *a, **kw: make_broker()[0]
-    )
-    with TestClient(app.main.app) as client:
-        with client.websocket_connect(f"/api/ws/tickers?token={settings.api_token}") as tickers, \
-             client.websocket_connect(f"/api/ws/orders?token={settings.api_token}") as orders:
-            assert tickers.receive_json()["broker"] == "fyers"
-            orders.receive_json()
-
-            tickers.send_json({"action": "subscribe", "symbols": ["NSE:SBIN-EQ"]})
-            assert tickers.receive_json()["symbols"] == ["NSE:SBIN-EQ"]
-
-            orders.send_json({"action": "place_order", "symbol": "NSE:SBIN-EQ", "side": "BUY",
-                              "quantity": 1})
-            msgs = [orders.receive_json(), orders.receive_json()]
-            assert {m["type"] for m in msgs} == {"order_update", "ack"}
-
-            # Last ticker client leaves, so the upstream Fyers subscription is dropped.
-            tickers.close()
-            data_sock = FakeSocket.instances[0]
-            deadline = time.monotonic() + 2
-            while not data_sock.unsubscribed and time.monotonic() < deadline:
-                time.sleep(0.01)  # server-side cleanup runs on the app's loop
-            assert data_sock.unsubscribed[0]["symbols"] == ["NSE:SBIN-EQ"]
+def add_fyers_account(client):
+    r = client.post("/api/accounts", json={"broker": "fyers", "label": "Fyers", "credentials": {
+        "client_id": "XB12345-100", "secret_key": "secret"}}, headers=AUTH)
+    assert r.status_code == 201, r.text
+    return r.json()["id"]
 
 
-def test_orders_report_not_logged_in(monkeypatch):
-    monkeypatch.setattr(settings, "broker", "fyers")
-    monkeypatch.setattr(settings, "fyers_client_id", "")
-    with TestClient(app.main.app) as client:
-        assert client.get("/health").json()["connected"] is False
-        with client.websocket_connect(f"/api/ws/orders?token={settings.api_token}") as ws:
-            ws.receive_json()
-            ws.send_json({"action": "get_funds"})
-            assert "/api/auth/fyers/login" in ws.receive_json()["error"]
+def test_apps_share_the_accounts_fyers_broker(client, monkeypatch):
+    monkeypatch.setattr("app.accounts.registry.create_broker", lambda *a, **kw: make_broker()[0])
+    acct = add_fyers_account(client)
+    base = f"/api/accounts/{acct}/ws"
+    with client.websocket_connect(f"{base}/tickers?token={TOKEN}") as tickers, \
+         client.websocket_connect(f"{base}/orders?token={TOKEN}") as orders:
+        assert tickers.receive_json()["broker"] == "fyers"
+        orders.receive_json()
+
+        tickers.send_json({"action": "subscribe", "symbols": ["NSE:SBIN-EQ"]})
+        assert tickers.receive_json()["symbols"] == ["NSE:SBIN-EQ"]
+
+        orders.send_json({"action": "place_order", "symbol": "NSE:SBIN-EQ", "side": "BUY",
+                          "quantity": 1})
+        msgs = [orders.receive_json(), orders.receive_json()]
+        assert {m["type"] for m in msgs} == {"order_update", "ack"}
+
+        # Last ticker client leaves, so the upstream Fyers subscription is dropped.
+        tickers.close()
+        data_sock = FakeSocket.instances[0]
+        deadline = time.monotonic() + 2
+        while not data_sock.unsubscribed and time.monotonic() < deadline:
+            time.sleep(0.01)  # server-side cleanup runs on the app's loop
+        assert data_sock.unsubscribed[0]["symbols"] == ["NSE:SBIN-EQ"]
+
+
+def test_orders_report_not_logged_in(client, monkeypatch):
+    from app.brokers import create_broker
+
+    monkeypatch.setattr("app.accounts.registry.create_broker", create_broker)  # no token: no network
+    acct = add_fyers_account(client)
+    assert client.get(f"/api/accounts/{acct}", headers=AUTH).json()["connection"]["broker"]["connected"] is False
+    with client.websocket_connect(f"/api/accounts/{acct}/ws/orders?token={TOKEN}") as ws:
+        ws.receive_json()
+        ws.send_json({"action": "get_funds"})
+        assert "broker-login" in ws.receive_json()["error"]
 
 
 class SDKOrderSocket(FakeSocket):
@@ -249,19 +253,14 @@ def test_stop_survives_sdk_close_error():
 
 
 def test_login_callback_restarts_running_fyers_broker(client, monkeypatch):
-    """Regression: logging in again while Fyers is the active broker gave a 500."""
+    """Regression: logging in again while the account's Fyers broker runs gave a 500."""
     import app.auth.router as auth_router
-    from app.core.broker_service import BrokerService
 
-    built = []
-
-    def fake_create(_settings, access_token=None):
+    def fake_create(_settings, broker, credentials, options, access_token=None, account_id=None):
         FakeSocket.instances = []
-        b = FyersBroker(client_id="XB12345-100", access_token=access_token or "old",
-                        log_dir="/tmp/autotrade-test-logs", model=FakeModel(),
-                        data_socket_factory=FakeSocket, order_socket_factory=SDKOrderSocket)
-        built.append(b)
-        return b
+        return FyersBroker(client_id=credentials["client_id"], access_token=access_token or "old",
+                           log_dir="/tmp/autotrade-test-logs", model=FakeModel(),
+                           data_socket_factory=FakeSocket, order_socket_factory=SDKOrderSocket)
 
     class FakeSession:
         def __init__(self, **kw): pass
@@ -269,26 +268,20 @@ def test_login_callback_restarts_running_fyers_broker(client, monkeypatch):
         def set_token(self, code): pass
         def generate_token(self): return {"s": "ok", "access_token": "new-token"}
 
-    monkeypatch.setattr(settings, "broker", "fyers")
-    monkeypatch.setattr(settings, "fyers_client_id", "XB12345-100")
-    monkeypatch.setattr(settings, "fyers_secret_key", "secret")
-    monkeypatch.setattr(settings, "fyers_access_token", "old")
-    monkeypatch.setattr("app.core.broker_service.create_broker", fake_create)
+    monkeypatch.setattr("app.accounts.registry.create_broker", fake_create)
     monkeypatch.setattr(auth_router, "SessionModel", FakeSession)
+    acct = add_fyers_account(client)
+    service = client.app.state.accounts.get(acct).service
+    old = service.broker
+    assert old is not None  # running, like the real server after an earlier login
 
-    brokers: BrokerService = client.app.state.brokers
-    monkeypatch.setattr(brokers, "name", "fyers")
-    client.portal.call(brokers.restart)  # now running a Fyers broker, like the real server
-    old = brokers.broker
-
-    login = client.get("/api/auth/fyers/login", headers={"Authorization": f"Bearer {settings.api_token}"},
-                       follow_redirects=False)
+    login = client.get(f"/api/accounts/{acct}/broker-login", headers=AUTH, follow_redirects=False)
     assert login.status_code == 307
     state = next(iter(client.app.state.login_states))  # FakeSession doesn't put it in the URL
     r = client.get(f"/api/auth/fyers/callback?s=ok&code=200&auth_code=abc&state={state}")
     assert r.status_code == 200, r.text
-    assert brokers.broker is not old and brokers.connected
-    assert brokers.broker._socket_token.endswith(":new-token")
+    assert service.broker is not old and service.connected
+    assert service.broker._socket_token.endswith(":new-token")
 
 
 def test_fill_reported_before_place_order_returns_is_not_undone():

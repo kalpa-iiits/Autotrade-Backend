@@ -11,11 +11,12 @@ class Fill(Base):
     """One execution: part or all of an order traded at a price."""
 
     __tablename__ = "fills"
-    __table_args__ = (Index("ix_fills_symbol_time", "broker", "symbol", "filled_at"),)
+    __table_args__ = (Index("ix_fills_symbol_time", "account_id", "symbol", "filled_at"),)
 
-    # "<broker>:<order id>:<cumulative filled qty>" — the same update seen twice maps to the
-    # same id, so a fill is never counted twice.
+    # "<account id>:<order id>:<cumulative filled qty>" — the same update seen twice maps to
+    # the same id, so a fill is never counted twice.
     id: Mapped[str] = mapped_column(String(160), primary_key=True)
+    account_id: Mapped[int] = mapped_column(ForeignKey("broker_accounts.id"))
     broker: Mapped[str] = mapped_column(String(32))
     order_id: Mapped[str] = mapped_column(String(64), index=True)
     symbol: Mapped[str] = mapped_column(String(64))
@@ -29,10 +30,11 @@ class Position(Base):
     """A round trip: opened by a fill, closed when fills bring the quantity back to zero."""
 
     __tablename__ = "positions"
-    __table_args__ = (Index("ix_positions_lookup", "broker", "symbol", "status"),
+    __table_args__ = (Index("ix_positions_lookup", "account_id", "symbol", "status"),
                       Index("ix_positions_closed_at", "closed_at"))
 
     id: Mapped[int] = mapped_column(primary_key=True)
+    account_id: Mapped[int] = mapped_column(ForeignKey("broker_accounts.id"))
     broker: Mapped[str] = mapped_column(String(32))
     symbol: Mapped[str] = mapped_column(String(64))
     direction: Mapped[str] = mapped_column(String(5))  # LONG / SHORT

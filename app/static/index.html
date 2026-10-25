@@ -23,6 +23,8 @@
     #strategies td.num { text-align: right; font-variant-numeric: tabular-nums; }
     #strategies td input { width: 150px; margin: 0; }
     #strategies td select { margin: 0; }
+    .muted { color: #888; }
+    details summary { cursor: pointer; }
     .banner { padding: 6px 10px; border-radius: 6px; margin: 4px 0 8px; font-size: 14px; }
     .banner.off { background: #8882; }
     .banner.on { background: #d9363633; color: #d93636; font-weight: 600; }
@@ -32,7 +34,32 @@
   </style>
 </head>
 <body>
-  <h2>AutoTrade WebSocket test client</h2>
+  <h2>AutoTrade test client</h2>
+
+  <fieldset>
+    <legend>Broker account</legend>
+    <select id="account" aria-label="Broker account" onchange="switchAccount()"></select>
+    <span id="accountInfo" class="muted" style="font-size:13px"></span>
+    <br>
+    <button onclick="brokerLogin()">Broker login (today)</button>
+    <button onclick="pasteToken()">Paste access token</button>
+    <button onclick="accountAction('POST', 'reconnect')">Reconnect</button>
+    <button onclick="deleteAccount()">Delete account</button>
+    <form method="post" action="/logout" style="display:inline">
+      <button type="submit">Sign out</button>
+    </form>
+    <details style="margin-top:6px">
+      <summary>Add a broker account</summary>
+      <select id="newBroker" aria-label="Broker" onchange="fillCredentialFields()"></select>
+      <input id="newLabel" placeholder="Label, e.g. My Fyers" aria-label="Label" style="width:160px">
+      <span id="credFields"></span>
+      <button onclick="addAccount()">Add</button>
+      <div class="muted" style="font-size:13px">
+        Credentials are stored encrypted and never shown again. Register
+        <code id="redirectHint">/auth/&lt;broker&gt;/callback</code> as the redirect URL on your broker app.
+      </div>
+    </details>
+  </fieldset>
 
   <fieldset>
     <legend>Connection</legend>
@@ -40,13 +67,6 @@
     <button onclick="disconnect()">Disconnect</button>
     orders: <span id="state-orders">disconnected</span> ·
     tickers: <span id="state-tickers">disconnected</span>
-    <br>
-    <button onclick="authStatus()">Broker status</button>
-    <button onclick="login('fyers')">Fyers login</button>
-    <button onclick="login('zerodha')">Zerodha login</button>
-    <form method="post" action="/logout" style="display:inline">
-      <button type="submit">Sign out</button>
-    </form>
   </fieldset>
 
   <fieldset>
@@ -89,7 +109,7 @@
     <div id="liveBanner" class="banner off">Loading…</div>
     <div class="muted" style="font-size:13px">
       Strategy logic, size, limits and mode are defined in code (app/strategies/deployments.py).
-      Choose symbol and timeframe here (while stopped).
+      Add them to the selected broker account and choose symbol and timeframe here (while stopped).
     </div>
     <div style="margin:6px 0">
       Add <select id="addDeployment" aria-label="Strategy"></select>
@@ -103,7 +123,7 @@
           <tr><th>#</th><th>Strategy</th><th>Symbol</th><th>Timeframe</th><th>Mode</th><th>Status</th>
               <th class="num">Position</th><th class="num">Last</th><th class="num">Orders today</th><th></th></tr>
         </thead>
-        <tbody id="stRows"><tr><td colspan="10" class="muted">No strategies in deployments.py.</td></tr></tbody>
+        <tbody id="stRows"><tr><td colspan="10" class="muted">No strategies on this account yet.</td></tr></tbody>
       </table>
     </div>
     <button onclick="api('POST', '/api/strategies/stop-all').then(refreshStrategies)">Stop all</button>
@@ -128,11 +148,109 @@
       el.scrollTop = el.scrollHeight;
     };
 
+    // ---------- broker accounts ----------
+
+    let accounts = [], brokerSpecs = {};
+    const currentAccount = () => Number(val('account')) || null;
+    const accountPath = (suffix = '') => `/api/accounts/${currentAccount()}${suffix}`;
+
+    async function refreshAccounts(select) {
+      accounts = await api('GET', '/api/accounts');
+      const sel = document.getElementById('account');
+      const keep = select ?? currentAccount() ?? Number(localStorage.getItem('account'));
+      sel.replaceChildren(...accounts.map(a => new Option(`#${a.id} ${a.label} (${a.broker})`, a.id)));
+      if (!accounts.length) sel.append(new Option('No accounts yet: add one below', ''));
+      if (accounts.some(a => a.id === keep)) sel.value = keep;
+      showAccount();
+    }
+
+    function showAccount() {
+      const a = accounts.find(a => a.id === currentAccount());
+      const info = document.getElementById('accountInfo');
+      if (!a) { info.textContent = ''; return; }
+      const conn = a.connection?.broker;
+      const parts = [conn?.connected ? 'connected' : `not connected: ${conn?.reason ?? '—'}`];
+      if (a.needs_daily_login) parts.push(a.logged_in_today ? 'logged in today' : 'needs today\'s login');
+      if (a.credentials) parts.push(Object.entries(a.credentials).map(([k, v]) => `${k}: ${v ?? 'missing'}`).join(', '));
+      if (a.credentials_error) parts.push(a.credentials_error);
+      info.textContent = parts.join(' · ');
+    }
+
+    function switchAccount() {
+      try { localStorage.setItem('account', String(currentAccount())); } catch {}
+      disconnect();
+      syncPriceRows([]);
+      showAccount();
+      refreshStrategies().catch(() => {});
+    }
+
+    function fillCredentialFields() {
+      const spec = brokerSpecs[val('newBroker')] || { credentials: [] };
+      const box = document.getElementById('credFields');
+      box.replaceChildren(...spec.credentials.map(name => {
+        const input = document.createElement('input');
+        input.dataset.field = name;
+        input.placeholder = name;
+        input.setAttribute('aria-label', name);
+        input.autocomplete = 'off';
+        if (/secret/.test(name)) input.type = 'password';
+        input.style.width = '150px';
+        return input;
+      }));
+      document.getElementById('redirectHint').textContent = `${location.origin}/auth/${val('newBroker')}/callback`;
+    }
+
+    async function addAccount() {
+      const credentials = {};
+      document.querySelectorAll('#credFields input').forEach(i => { if (i.value) credentials[i.dataset.field] = i.value; });
+      const body = { broker: val('newBroker'), label: val('newLabel').trim() || val('newBroker') };
+      if (Object.keys(credentials).length) body.credentials = credentials;
+      const created = await api('POST', '/api/accounts', body);
+      document.querySelectorAll('#credFields input').forEach(i => i.value = '');  // don't keep secrets on screen
+      log(`← [accounts] added #${created.id} ${created.label}`);
+      await refreshAccounts(created.id);
+      switchAccount();
+    }
+
+    async function accountAction(method, suffix, body) {
+      if (!currentAccount()) return log('! add a broker account first');
+      const res = await api(method, accountPath('/' + suffix), body);
+      log(`← [account ${currentAccount()}] ${suffix}: ${JSON.stringify(res)}`);
+      await refreshAccounts();
+    }
+
+    function brokerLogin() {
+      if (!currentAccount()) return log('! add a broker account first');
+      location.href = accountPath('/broker-login');
+    }
+
+    function pasteToken() {
+      const token = prompt('Access token for today (from the broker):');
+      if (token) accountAction('POST', 'access-token', { access_token: token });
+    }
+
+    async function deleteAccount() {
+      const a = accounts.find(a => a.id === currentAccount());
+      if (!a || !confirm(`Delete ${a.label}? Its credentials are wiped; order and trade history is kept.`)) return;
+      await api('DELETE', accountPath());
+      await refreshAccounts();
+      switchAccount();
+    }
+
+    async function loadBrokers() {
+      brokerSpecs = await api('GET', '/api/accounts/brokers');
+      document.getElementById('newBroker').replaceChildren(...Object.keys(brokerSpecs).map(b => new Option(b, b)));
+      fillCredentialFields();
+    }
+
+    // ---------- sockets (the selected account's) ----------
+
     function connect() {
+      if (!currentAccount()) return log('! add a broker account first');
       const proto = location.protocol === 'https:' ? 'wss' : 'ws';
       for (const name of ['orders', 'tickers']) {
         // The session cookie authenticates the socket; no token in the URL.
-        const ws = new WebSocket(`${proto}://${location.host}/api/ws/${name}`);
+        const ws = new WebSocket(`${proto}://${location.host}${accountPath('/ws/' + name)}`);
         const state = document.getElementById('state-' + name);
         ws.onopen = () => state.textContent = 'connected';
         ws.onclose = e => {
@@ -166,16 +284,6 @@
 
     function toLogin() {
       location.href = '/login?next=' + encodeURIComponent(location.pathname);
-    }
-
-    function login(broker) {
-      location.href = `/api/auth/${broker}/login`;
-    }
-
-    async function authStatus() {
-      const r = await fetch('/api/auth/status');
-      if (r.status === 401) return toLogin();
-      log('← [auth] ' + await r.text());
     }
 
     // ---------- tickers: subscribe to a list, show the latest price per symbol ----------
@@ -299,8 +407,9 @@
     async function addInstance() {
       const symbol = val('addSymbol').trim();
       if (!symbol) return log('! enter a symbol');
+      if (!currentAccount()) return log('! add a broker account first');
       const res = await api('POST', '/api/strategies', {
-        deployment_key: val('addDeployment'), symbol, timeframe: val('addTimeframe'),
+        deployment_key: val('addDeployment'), account_id: currentAccount(), symbol, timeframe: val('addTimeframe'),
       });
       if (res.warning) log('! ' + res.warning);
       document.getElementById('addSymbol').value = '';
@@ -313,7 +422,7 @@
 
     async function refreshStrategies(force = true) {
       if (!force && isEditing()) return;
-      const data = await api('GET', '/api/strategies');
+      const data = await api('GET', currentAccount() ? `/api/strategies?account_id=${currentAccount()}` : '/api/strategies');
       const banner = document.getElementById('liveBanner');
       banner.className = 'banner ' + (data.live_trading_enabled ? 'on' : 'off');
       banner.textContent = data.live_trading_enabled
@@ -324,7 +433,7 @@
 
       const body = document.getElementById('stRows');
       if (!data.strategies.length) {
-        body.innerHTML = '<tr><td colspan="10" class="muted">No strategies in deployments.py.</td></tr>';
+        body.innerHTML = '<tr><td colspan="10" class="muted">No strategies on this account yet: add one above.</td></tr>';
         return;
       }
       body.replaceChildren(...data.strategies.map(inst => {
@@ -390,8 +499,12 @@
       }));
     }
 
-    refreshStrategies().catch(() => {});
+    loadBrokers().catch(() => {});
+    refreshAccounts().then(() => refreshStrategies()).catch(() => {});
     setInterval(() => document.hidden || refreshStrategies(false).catch(() => {}), 5000);
+    // A broker login returns here: show the account it was for.
+    const back = new URLSearchParams(location.search);
+    if (back.get('broker_login_error')) log('! broker login failed: ' + back.get('broker_login_error'));
 
     function placeOrder() {
       const msg = { action: 'place_order', symbol: val('symbol'), side: val('side'),

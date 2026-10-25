@@ -1,5 +1,8 @@
 """Runs strategy instances: feeds them ticks, checks every trade they ask for, places orders.
 
+Each instance runs on one broker account (its owner's): it sees only that account's ticks and
+order updates, and its orders go to that account's broker, with that account's rate limit.
+
 Safety rules, applied to every buy/sell before anything reaches the broker:
   - mode "signal": nothing is sent; the trade is recorded and the strategy's position moves
     as if it filled at the last price, so a dry run behaves like the real thing
@@ -20,7 +23,7 @@ import asyncio
 import logging
 from collections import OrderedDict
 from datetime import date, datetime, time
-from typing import Awaitable, Callable
+from typing import TYPE_CHECKING
 from zoneinfo import ZoneInfo
 
 from sqlalchemy import func, select
@@ -36,12 +39,12 @@ from app.strategies.base import TIMEFRAMES, Strategy, Tick
 from app.strategies.deployment import Deployment
 from app.strategies.models import StrategyInstance, StrategySignal
 
+if TYPE_CHECKING:
+    from app.accounts.registry import AccountRegistry
+
 log = logging.getLogger(__name__)
 IST = ZoneInfo("Asia/Kolkata")
 TERMINAL = {OrderStatus.FILLED, OrderStatus.CANCELLED, OrderStatus.REJECTED}
-
-Publisher = Callable[[dict], Awaitable[None]]
-
 
 class StrategyError(ValueError):
     """A request about strategy instances that can't be done (bad params, not stopped, ...)."""
@@ -111,7 +114,10 @@ class StrategyContext:
         from datetime import timedelta
 
         today = datetime.now(IST).date()
-        broker = self._runner.brokers.require()
+        service = self._runner.service(self._inst.account_id)
+        if service is None:
+            raise OrderError("Broker account not available")
+        broker = service.require()
         return await broker.get_history(self.symbol, resolution, today - timedelta(days=days), today)
 
     def log(self, message: str) -> None:
@@ -122,6 +128,7 @@ class RunningInstance:
     def __init__(self, config: StrategyInstance, queue_size: int = 1000) -> None:
         self.config = config
         self.id = config.id
+        self.account_id = config.account_id
         self.symbol = config.symbol
         self.strategy: Strategy | None = None
         self.position = 0
@@ -157,24 +164,30 @@ class RunningInstance:
 
 
 class StrategyRunner:
-    def __init__(self, brokers: BrokerService, settings: Settings, publish: Publisher | None = None):
-        self.brokers = brokers
+    def __init__(self, accounts: "AccountRegistry", settings: Settings):
+        self.accounts = accounts
         self.settings = settings
-        self._publish = publish
         self.running: dict[int, RunningInstance] = {}
         self.deployments: dict[str, Deployment] = {}
-        self._order_owner: dict[str, int] = {}
+        # (account id, order id) -> instance that placed it. Order ids are only unique per account.
+        self._order_owner: dict[tuple[int, str], int] = {}
         # Order updates can arrive before place_order returns (and we learn the id).
-        self._recent_orders: OrderedDict[str, Order] = OrderedDict()
+        self._recent_orders: OrderedDict[tuple[int, str], Order] = OrderedDict()
+
+    def service(self, account_id: int) -> BrokerService | None:
+        runtime = self.accounts.get(account_id)
+        return runtime.service if runtime is not None else None
 
     # ---------- lifecycle ----------
 
-    def symbols(self) -> set[str]:
-        """Symbols running strategies need; kept subscribed on the broker."""
-        return {inst.symbol for inst in self.running.values()}
+    def symbols(self, account_id: int) -> set[str]:
+        """Symbols this account's running strategies need; kept subscribed on its broker."""
+        return {inst.symbol for inst in self.running.values() if inst.account_id == account_id}
 
     async def sync(self, deployments: list[Deployment]) -> None:
-        """At startup: make strategy_instances match the deployments declared in code."""
+        """At startup: make strategy_instances match the deployments declared in code. Code
+        defines what can run; users add instances of it on their own accounts in the app, so
+        nothing is created here."""
         keys = [d.key for d in deployments]
         if len(keys) != len(set(keys)):
             raise ValueError(f"Duplicate deployment keys in deployments.py: {keys}")
@@ -187,19 +200,7 @@ class StrategyRunner:
 
             for dep in deployments:
                 wanted = dep.settings()
-                instances = by_key.get(dep.key, [])
-                if not [r for r in instances if r.status != "archived"]:
-                    # First run of this deployment (or all its instances were archived).
-                    # An archived one on the defaults comes back, with its history, as adding
-                    # it in the app would; a second row there would break the unique target.
-                    default = next((r for r in instances
-                                    if (r.symbol, r.timeframe) == (dep.symbol, dep.timeframe)), None)
-                    if default is not None:
-                        default.status, default.last_error = "stopped", None
-                    else:
-                        s.add(StrategyInstance(deployment_key=dep.key, symbol=dep.symbol,
-                                               timeframe=dep.timeframe, status="stopped", **wanted))
-                for row in instances:
+                for row in by_key.get(dep.key, []):
                     changed = any(getattr(row, k) != v for k, v in wanted.items())
                     for k, v in wanted.items():
                         setattr(row, k, v)
@@ -242,6 +243,9 @@ class StrategyRunner:
             dep.check_timeframe(config.timeframe)
         except ValueError as e:
             raise StrategyError(str(e))
+        service = self.service(config.account_id)
+        if service is None:
+            raise StrategyError("Its broker account is not available (deleted?)")
 
         inst = RunningInstance(config, self.settings.strategy_queue_size)
         inst.position, inst.filled, inst.pending_order_id = await self._load_position(config)
@@ -252,9 +256,9 @@ class StrategyRunner:
         inst.worker = asyncio.create_task(self._work(inst))
         await self._set_status(instance_id, "running", None)
 
-        if self.brokers.connected:
+        if service.connected:
             try:
-                await self.brokers.broker.subscribe([config.symbol])
+                await service.broker.subscribe([config.symbol])
             except Exception as e:
                 # Stays running; the broker re-subscribes watched symbols when it (re)connects.
                 log.warning("Strategy %s: could not subscribe %s: %s", instance_id, config.symbol, e)
@@ -269,14 +273,16 @@ class StrategyRunner:
                 except Exception:
                     log.exception("Strategy %s on_stop failed", instance_id)
         await self._set_status(instance_id, status, error)
-        if inst is not None and self.brokers.connected and inst.symbol not in self.brokers.watched_symbols():
+        service = self.service(inst.account_id) if inst is not None else None
+        if service is not None and service.connected and inst.symbol not in service.watched_symbols():
             try:
-                await self.brokers.broker.unsubscribe([inst.symbol])
+                await service.broker.unsubscribe([inst.symbol])
             except Exception:
                 pass
 
-    async def stop_all(self) -> list[int]:
-        ids = list(self.running)
+    async def stop_all(self, account_ids: set[int] | None = None) -> list[int]:
+        """Kill switch: stop every running instance (of these accounts only, if given)."""
+        ids = [i for i, inst in self.running.items() if account_ids is None or inst.account_id in account_ids]
         for instance_id in ids:
             await self.stop(instance_id)
         return ids
@@ -337,20 +343,21 @@ class StrategyRunner:
 
     # ---------- broker events ----------
 
-    async def on_tick(self, symbol: str, price: float) -> None:
+    async def on_tick(self, account_id: int, symbol: str, price: float) -> None:
         tick = None
         for inst in list(self.running.values()):
-            if inst.symbol != symbol:
+            if inst.account_id != account_id or inst.symbol != symbol:
                 continue
             tick = tick or Tick(symbol=symbol, price=price, at=utcnow())
             inst.enqueue(tick)
 
-    async def on_order(self, order: Order) -> None:
-        self._recent_orders[order.id] = order
-        self._recent_orders.move_to_end(order.id)
+    async def on_order(self, account_id: int, order: Order) -> None:
+        key = (account_id, order.id)
+        self._recent_orders[key] = order
+        self._recent_orders.move_to_end(key)
         while len(self._recent_orders) > 500:
             self._recent_orders.popitem(last=False)
-        owner = self._order_owner.get(order.id)
+        owner = self._order_owner.get(key)
         if owner is not None and owner in self.running:
             self._apply_order(self.running[owner], order)
 
@@ -369,11 +376,14 @@ class StrategyRunner:
         """The reason a trade is blocked, or None if it may go ahead."""
         cfg = inst.config
         if cfg.mode == "live":
+            service = self.service(inst.account_id)
             if not self.settings.strategies_live_enabled:
                 return "Live strategy trading is off (set AUTOTRADE_STRATEGIES_LIVE=true)"
-            if not self.brokers.connected:
-                return f"Broker not connected: {self.brokers.not_connected_reason}"
-            if not self.brokers.records_reliable():
+            if service is None:
+                return "Broker account not available"
+            if not service.connected:
+                return f"Broker not connected: {service.not_connected_reason}"
+            if not service.records_reliable():
                 return "Trade ledger has unsaved order updates (see /health); live orders paused"
             if inst.pending_order_id:
                 return f"Order {inst.pending_order_id} is still open"
@@ -406,12 +416,13 @@ class StrategyRunner:
                 inst.orders_today += 1
             else:
                 await self._place(inst, side, quantity, signal)
-            await self._record(signal)
+            await self._record(signal, inst.account_id)
 
     async def _place(self, inst: RunningInstance, side: Side, quantity: int, signal: StrategySignal) -> None:
-        signal.broker = self.brokers.name
+        service = self.service(inst.account_id)
+        signal.broker = service.name
         try:
-            order = await self.brokers.place_order(PlaceOrder(
+            order = await service.place_order(PlaceOrder(
                 action="place_order", symbol=inst.symbol, side=side, quantity=quantity,
                 order_type=OrderType.MARKET,
             ))
@@ -428,21 +439,20 @@ class StrategyRunner:
             signal.outcome, signal.message = "rejected", order.reason
             return
         signal.outcome = "placed"
-        self._order_owner[order.id] = inst.id
+        self._order_owner[(inst.account_id, order.id)] = inst.id
         if order.status not in TERMINAL:
             inst.pending_order_id = order.id
         # Apply what we know now, plus any update that raced ahead of place_order returning.
         self._apply_order(inst, order)
-        if early := self._recent_orders.get(order.id):
+        if early := self._recent_orders.get((inst.account_id, order.id)):
             self._apply_order(inst, early)
 
     # ---------- persistence ----------
 
-    async def _record(self, signal: StrategySignal) -> None:
+    async def _record(self, signal: StrategySignal, account_id: int) -> None:
         async with db.session() as s, s.begin():
             s.add(signal)
-        if self._publish:
-            await self._publish({"type": "strategy_signal", "signal": signal_dict(signal)})
+        await self.accounts.publish(account_id, {"type": "strategy_signal", "signal": signal_dict(signal)})
 
     async def _set_status(self, instance_id: int, status: str, error: str | None) -> None:
         async with db.session() as s, s.begin():
@@ -450,9 +460,9 @@ class StrategyRunner:
             if row is None:
                 return
             row.status, row.last_error = status, error
-        if self._publish:
-            await self._publish({"type": "strategy_status", "instance_id": instance_id,
-                                 "status": status, "error": error})
+            account_id = row.account_id
+        await self.accounts.publish(account_id, {"type": "strategy_status", "instance_id": instance_id,
+                                                 "status": status, "error": error})
 
     async def _load_position(
         self, config: StrategyInstance
@@ -471,7 +481,7 @@ class StrategyRunner:
             rows = (await s.execute(
                 select(OrderRecord.id, OrderRecord.side, OrderRecord.filled_quantity, OrderRecord.status)
                 .join(StrategySignal, (StrategySignal.order_id == OrderRecord.id)
-                      & (StrategySignal.broker == OrderRecord.broker))
+                      & (OrderRecord.account_id == config.account_id))
                 .where(StrategySignal.instance_id == config.id, StrategySignal.outcome == "placed")
             )).all()
         position, filled, pending = 0, {}, None
@@ -479,7 +489,7 @@ class StrategyRunner:
             filled[order_id] = qty or 0
             position += (qty or 0) if side == Side.BUY.value else -(qty or 0)
             if status not in {s.value for s in TERMINAL}:
-                self._order_owner[order_id] = config.id
+                self._order_owner[(config.account_id, order_id)] = config.id
                 pending = order_id
         return position, filled, pending
 

@@ -5,6 +5,7 @@ from typing import Any, Awaitable, Callable
 from fastapi import WebSocket, WebSocketDisconnect, status
 from pydantic import TypeAdapter, ValidationError
 
+from app.accounts.registry import AccountRuntime
 from app.auth.dependencies import websocket_user
 from app.brokers import OrderError
 from app.core.connections import ConnectionManager
@@ -19,19 +20,28 @@ async def serve(
     ws: WebSocket,
     adapter: TypeAdapter,
     handle: Handler,
-    connections: ConnectionManager,
+    runtime: AccountRuntime | None,
+    connections: Callable[[AccountRuntime], ConnectionManager],
     on_disconnect: Callable[[WebSocket], Awaitable[None]] | None = None,
 ) -> None:
-    """Replies go through `connections` like pushed messages, so a client sees them in the
-    order they happened (e.g. an order's update before the ack of the request that placed it)."""
-    if await websocket_user(ws) is None:
+    """One broker account's socket. Only the account's owner (session or API token) gets in;
+    anyone else, and unknown accounts, are refused alike.
+
+    Replies go through the account's connection manager like pushed messages, so a client sees
+    them in the order they happened (e.g. an order's update before the ack that placed it)."""
+    user = await websocket_user(ws)
+    if user is None:
         await ws.close(code=status.WS_1008_POLICY_VIOLATION, reason="Not logged in")
         return
+    if runtime is None or runtime.user_id != user.id:
+        await ws.close(code=status.WS_1008_POLICY_VIOLATION, reason="No such broker account")
+        return
 
+    manager = connections(runtime)
     await ws.accept()
-    connections.add(ws)
-    send = connections.send
-    send(ws, {"type": "welcome", "broker": ws.app.state.brokers.name})
+    manager.add(ws)
+    send = manager.send
+    send(ws, {"type": "welcome", "account_id": runtime.id, "broker": runtime.broker})
     try:
         while True:
             raw = await ws.receive_text()
@@ -59,4 +69,4 @@ async def serve(
     finally:
         if on_disconnect is not None:
             await on_disconnect(ws)
-        connections.remove(ws)
+        manager.remove(ws)

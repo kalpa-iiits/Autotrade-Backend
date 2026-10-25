@@ -1,4 +1,5 @@
-"""Owns the live broker so apps can share it and auth can reconnect it after a login."""
+"""Owns one broker account's live connection, so its apps (orders, tickers, strategies) share
+it and a broker login can reconnect it. There is one per broker account."""
 
 import asyncio
 import logging
@@ -6,7 +7,7 @@ from datetime import datetime
 from decimal import Decimal
 from typing import Awaitable, Callable
 
-from app.brokers import Broker, MissingCredentials, OrderError, create_broker
+from app.brokers import Broker, MissingCredentials, OrderError
 from app.brokers.base import OrderListener, TickListener
 from app.core.config import Settings
 from app.core.db import utcnow
@@ -35,12 +36,17 @@ class BrokerService:
     def __init__(
         self,
         settings: Settings,
-        token_loader: Callable[[], Awaitable[str | None]],
+        broker_factory: Callable[[], Awaitable[Broker]],
+        name: str,
+        account_id: int | None = None,
         records_reliable: Callable[[], bool] = lambda: True,
     ) -> None:
         self.settings = settings
-        self.name = settings.broker
-        self._token_loader = token_loader
+        self.name = name  # paper / fyers / zerodha
+        self.account_id = account_id
+        # Builds the account's broker from its stored credentials and today's token; raises
+        # MissingCredentials while it can't (no credentials, not logged in today ...).
+        self._broker_factory = broker_factory
         # False while the trade ledger has updates it could not save: then the database can't
         # be trusted to say whether an order was already placed, so the broker is asked.
         self.records_reliable = records_reliable
@@ -85,7 +91,7 @@ class BrokerService:
 
     async def start(self, resync: bool = True) -> None:
         try:
-            broker = create_broker(self.settings, access_token=await self._token_loader())
+            broker = await self._broker_factory()
         except MissingCredentials as e:
             self.not_connected_reason = str(e)
             return
@@ -135,7 +141,7 @@ class BrokerService:
         async with self._resync_lock:
             try:
                 orders = await broker.get_orders()
-                known = await recorded_states(self.name, [o.id for o in orders])
+                known = await recorded_states(self.account_id, [o.id for o in orders])
                 replayed = 0
                 for order in orders:
                     state = _state(order)
@@ -150,13 +156,14 @@ class BrokerService:
                         await listener(order)
             except Exception as e:
                 self.last_resync_error = f"{type(e).__name__}: {e}"
-                log.warning("Order resync with %s failed: %s", self.name, self.last_resync_error)
+                log.warning("Order resync with account %s (%s) failed: %s", self.account_id, self.name,
+                            self.last_resync_error)
                 return 0
             self.last_resync_at, self.last_resync_error = utcnow(), None
             self.resynced_orders += replayed
             if replayed:
-                log.warning("Resync: %d order update(s) from %s had been missed; applied now",
-                            replayed, self.name)
+                log.warning("Resync: %d order update(s) on account %s (%s) had been missed; applied now",
+                            replayed, self.account_id, self.name)
             return replayed
 
     async def _resync_loop(self) -> None:
@@ -196,7 +203,7 @@ class BrokerService:
     async def _place_once(self, broker: Broker, req: PlaceOrder) -> Order:
         cid = req.client_order_id
         # Already placed: the trade ledger recorded it when the broker reported it.
-        if (order := await find_by_client_order_id(self.name, cid)) is not None:
+        if (order := await find_by_client_order_id(self.account_id, cid)) is not None:
             return order
         if cid in self._unknown_outcome or not self.records_reliable():
             # The last try got no answer (or the ledger missed updates), so it may have

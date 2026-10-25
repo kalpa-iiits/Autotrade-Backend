@@ -1,4 +1,5 @@
-"""Trades app: open and closed round-trip positions with P&L, built by app.trades.ledger."""
+"""Trades app: open and closed round-trip positions with P&L, built by app.trades.ledger.
+Each user sees the trades of their own broker accounts (all of them, or ?account_id=)."""
 
 from datetime import datetime
 from decimal import Decimal
@@ -6,13 +7,15 @@ from decimal import Decimal
 from fastapi import APIRouter, Depends, HTTPException, Query, Request, status
 from sqlalchemy import case, func, select
 
+from app.accounts.store import account_ids
 from app.auth.dependencies import require_user
+from app.auth.models import User
 from app.core import db
 from app.core.db import to_decimal
 from app.trades.ledger import CLOSED, LONG, OPEN
 from app.trades.models import Fill, Position, PositionFill
 
-router = APIRouter(prefix="/trades", tags=["trades"], dependencies=[Depends(require_user)])
+router = APIRouter(prefix="/trades", tags=["trades"])
 
 
 def _num(value: Decimal | None) -> float | None:
@@ -30,7 +33,7 @@ def _unrealized(p: Position, last_price: float | None) -> Decimal | None:
 
 def _position(p: Position, last_price: float | None = None) -> dict:
     out = {
-        "id": p.id, "broker": p.broker, "symbol": p.symbol, "direction": p.direction,
+        "id": p.id, "account_id": p.account_id, "broker": p.broker, "symbol": p.symbol, "direction": p.direction,
         "status": p.status, "quantity": p.quantity, "entry_quantity": p.entry_quantity,
         "avg_entry_price": _num(p.avg_entry_price), "exit_quantity": p.exit_quantity,
         "avg_exit_price": _num(p.avg_exit_price), "realized_pnl": _num(p.realized_pnl),
@@ -43,23 +46,32 @@ def _position(p: Position, last_price: float | None = None) -> dict:
     return out
 
 
-def _filters(query, broker: str | None, symbol: str | None):
-    if broker:
-        query = query.where(Position.broker == broker)
+async def _filters(query, user: User, account_id: int | None, symbol: str | None):
+    """Only the user's accounts (or one of them). Someone else's account id matches nothing."""
+    mine = await account_ids(user.id)
+    if account_id is not None:
+        mine = [account_id] if account_id in mine else []
+    query = query.where(Position.account_id.in_(mine))
     if symbol:
         query = query.where(Position.symbol == symbol)
     return query
 
 
+def _last_price(request: Request, p: Position) -> float | None:
+    """Latest tick on the position's account (only while someone watches the symbol there)."""
+    runtime = request.app.state.accounts.get(p.account_id)
+    return runtime.ledger.last_prices.get(p.symbol) if runtime else None
+
+
 @router.get("/open")
-async def open_trades(request: Request, broker: str | None = None, symbol: str | None = None):
-    query = _filters(select(Position).where(Position.status == OPEN), broker, symbol)
+async def open_trades(request: Request, account_id: int | None = None, symbol: str | None = None,
+                      user: User = Depends(require_user)):
+    query = await _filters(select(Position).where(Position.status == OPEN), user, account_id, symbol)
     async with db.session() as s:
         rows = list(await s.scalars(query.order_by(Position.opened_at.desc())))
-    prices = request.app.state.ledger.last_prices
-    known = [u for p in rows if (u := _unrealized(p, prices.get(p.symbol))) is not None]
+    known = [u for p in rows if (u := _unrealized(p, _last_price(request, p))) is not None]
     return {
-        "positions": [_position(p, prices.get(p.symbol)) for p in rows],
+        "positions": [_position(p, _last_price(request, p)) for p in rows],
         "totals": {
             "count": len(rows),
             "unrealized_pnl": _num(sum(known)) if known else None,
@@ -71,13 +83,14 @@ async def open_trades(request: Request, broker: str | None = None, symbol: str |
 
 @router.get("/closed")
 async def closed_trades(
-    broker: str | None = None,
+    account_id: int | None = None,
     symbol: str | None = None,
     since: datetime | None = Query(default=None, description="closed at or after (ISO 8601)"),
     until: datetime | None = Query(default=None, description="closed before (ISO 8601)"),
     limit: int = Query(default=100, ge=1, le=1000),
+    user: User = Depends(require_user),
 ):
-    query = _filters(select(Position).where(Position.status == CLOSED), broker, symbol)
+    query = await _filters(select(Position).where(Position.status == CLOSED), user, account_id, symbol)
     if since:
         query = query.where(Position.closed_at >= since)
     if until:
@@ -103,10 +116,10 @@ async def closed_trades(
 
 
 @router.get("/{position_id}")
-async def trade_detail(request: Request, position_id: int):
+async def trade_detail(request: Request, position_id: int, user: User = Depends(require_user)):
     async with db.session() as s:
         p = await s.get(Position, position_id)
-        if p is None:
+        if p is None or p.account_id not in await account_ids(user.id):
             raise HTTPException(status.HTTP_404_NOT_FOUND, "No such trade")
         fills = (await s.execute(
             select(Fill, PositionFill)
@@ -115,7 +128,7 @@ async def trade_detail(request: Request, position_id: int):
             .order_by(Fill.filled_at, Fill.id)
         )).all()
     return {
-        **_position(p, request.app.state.ledger.last_prices.get(p.symbol)),
+        **_position(p, _last_price(request, p)),
         "fills": [
             {"fill_id": f.id, "order_id": f.order_id, "side": f.side, "role": link.role,
              "quantity": link.quantity, "price": _num(f.price), "filled_at": f.filled_at.isoformat()}

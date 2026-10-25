@@ -1,6 +1,6 @@
 from tests.conftest import TOKEN, recv_until
 
-URL = f"/api/ws/tickers?token={TOKEN}"
+URL = f"/api/accounts/1/ws/tickers?token={TOKEN}"
 
 
 def test_subscribe_streams_only_requested_symbols(client):

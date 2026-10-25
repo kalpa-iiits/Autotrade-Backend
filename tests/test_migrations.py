@@ -100,7 +100,8 @@ def test_baseline_is_the_first_revision():
 
 
 def test_instances_migration_keeps_existing_rows(tmp_path):
-    """Rows from before symbol/timeframe-per-instance become 1m instances of their deployment."""
+    """Rows from before symbol/timeframe-per-instance become 1m instances of their deployment,
+    on an imported broker account; a running one comes back stopped (check it, then start)."""
     path = tmp_path / "old.db"
     with create_engine(f"sqlite:///{path}").begin() as conn:
         command.upgrade(alembic_config(conn), BASELINE_REVISION)
@@ -111,6 +112,8 @@ def test_instances_migration_keeps_existing_rows(tmp_path):
             "'2026-01-01', '2026-01-01')")
     init(path)
     row = sqlite3.connect(path).execute(
-        "select deployment_key, symbol, timeframe, status from strategy_instances").fetchone()
-    assert row == ("brk", "NSE:X", "1m", "running")
+        "select deployment_key, symbol, timeframe, status, account_id from strategy_instances").fetchone()
+    assert row == ("brk", "NSE:X", "1m", "stopped", 1)
+    account = sqlite3.connect(path).execute("select user_id, broker, label from broker_accounts").fetchone()
+    assert account[1:] == ("paper", "Imported (paper)")  # owned by a disabled "legacy" user (no users)
     assert diffs_against_models(path) == []

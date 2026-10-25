@@ -238,14 +238,16 @@ def test_history_through_the_real_runner(tmp_path, monkeypatch):
     from app.main import app
     from app.strategies import deployments
     from app.strategies.deployment import Deployment
-    from tests.conftest import TOKEN, run
+    from tests.conftest import AUTH, TOKEN, add_user, run
 
     monkeypatch.setattr(settings, "tick_interval", 3600)
     monkeypatch.setattr(deployments, "DEPLOYMENTS", [
         Deployment(key="brk", strategy=IntradayBreakout, symbol="NSE:SBIN-EQ", quantity=1)])
     with TestClient(app) as c:
-        inst = c.get("/api/strategies", headers={"Authorization": f"Bearer {TOKEN}"}).json()["strategies"][0]
-        c.post(f"/api/strategies/{inst['id']}/start", headers={"Authorization": f"Bearer {TOKEN}"})
+        _, account_id = add_user(c, "admin", token=TOKEN)
+        inst = c.post("/api/strategies", json={"deployment_key": "brk", "account_id": account_id,
+                                               "symbol": "NSE:SBIN-EQ", "timeframe": "1m"}, headers=AUTH).json()
+        c.post(f"/api/strategies/{inst['id']}/start", headers=AUTH)
         running = c.app.state.strategy_runner.running[inst["id"]]
         candles = run(c, running.strategy.ctx.history, "D", 30)
         assert len(candles) >= 14 and all(c_.high > c_.low for c_ in candles)

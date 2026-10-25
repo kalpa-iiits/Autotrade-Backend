@@ -1,8 +1,10 @@
-"""Strategies app: run the strategies declared in app/strategies/deployments.py.
+"""Strategies app: run the strategies declared in app/strategies/deployments.py on your own
+broker accounts.
 
-Code defines each strategy's logic, parameters, size, limits and mode (a "deployment"). In
-the app you choose where it runs: add instances of a deployment, each on its own symbol and
-timeframe, change those while an instance is stopped, start/stop them, and see their signals.
+Code defines each strategy's logic, parameters, size, limits and mode (a "deployment"): the
+catalog. Each user chooses where it runs: add instances of a deployment on one of their broker
+accounts, each with its own symbol and timeframe, change those while an instance is stopped,
+start/stop them, and see their signals. Users only ever see and touch their own instances.
 """
 
 from datetime import datetime, timedelta
@@ -12,19 +14,23 @@ from fastapi import APIRouter, Depends, HTTPException, Query, Request, status
 from pydantic import BaseModel, Field
 from sqlalchemy import select
 
+from app.accounts import store
+from app.accounts.dependencies import owns
 from app.auth.dependencies import require_user
+from app.auth.models import User
 from app.brokers import OrderError
 from app.core import db
 from app.strategies.models import StrategyInstance, StrategySignal
 from app.strategies.runner import StrategyError, StrategyRunner, signal_dict
 
-router = APIRouter(prefix="/strategies", tags=["strategies"], dependencies=[Depends(require_user)])
+router = APIRouter(prefix="/strategies", tags=["strategies"])
 IST = ZoneInfo("Asia/Kolkata")
 HIDDEN = ("archived", "removed")
 
 
 class InstanceCreate(BaseModel):
     deployment_key: str
+    account_id: int
     symbol: str = Field(min_length=1, max_length=64)
     timeframe: str
 
@@ -42,8 +48,8 @@ def _instance_dict(row: StrategyInstance, runner: StrategyRunner) -> dict:
     live = runner.running.get(row.id)
     dep = runner.deployments.get(row.deployment_key)
     return {
-        "id": row.id, "deployment_key": row.deployment_key, "strategy": row.strategy,
-        "description": dep.strategy.description if dep else None,
+        "id": row.id, "account_id": row.account_id, "deployment_key": row.deployment_key,
+        "strategy": row.strategy, "description": dep.strategy.description if dep else None,
         "label": row.label, "symbol": row.symbol, "timeframe": row.timeframe,
         "timeframes": list(dep.strategy.timeframes) if dep else [],
         "params": row.params, "mode": row.mode, "status": row.status,
@@ -58,10 +64,11 @@ def _instance_dict(row: StrategyInstance, runner: StrategyRunner) -> dict:
     }
 
 
-async def _get(instance_id: int) -> StrategyInstance:
+async def _get(instance_id: int, user: User) -> StrategyInstance:
+    """The user's instance, or 404 (also for someone else's)."""
     async with db.session() as s:
         row = await s.get(StrategyInstance, instance_id)
-    if row is None:
+    if row is None or row.account_id not in await store.account_ids(user.id):
         raise HTTPException(status.HTTP_404_NOT_FOUND, "No such strategy instance")
     return row
 
@@ -76,21 +83,24 @@ def _check_timeframe(runner: StrategyRunner, deployment_key: str, timeframe: str
         raise HTTPException(status.HTTP_422_UNPROCESSABLE_ENTITY, str(e))
 
 
-async def _check_symbol(runner: StrategyRunner, symbol: str) -> str | None:
-    """Ask the broker whether it knows the symbol. Returns a warning if it can't be checked."""
-    if not runner.brokers.connected:
-        return f"Broker not connected; could not check {symbol!r}"
+async def _check_symbol(runner: StrategyRunner, account_id: int, symbol: str) -> str | None:
+    """Ask the account's broker whether it knows the symbol. Returns a warning if it can't be checked."""
+    service = runner.service(account_id)
+    if service is None or not service.connected:
+        return f"Broker account not connected; could not check {symbol!r}"
     today = datetime.now(IST).date()
     try:
-        await runner.brokers.broker.get_history(symbol, "D", today - timedelta(days=7), today)
+        await service.broker.get_history(symbol, "D", today - timedelta(days=7), today)
     except OrderError as e:
         raise HTTPException(status.HTTP_422_UNPROCESSABLE_ENTITY, f"{symbol}: {e}")
     return None
 
 
-async def _conflict(deployment_key: str, symbol: str, timeframe: str, exclude_id: int | None = None):
+async def _conflict(account_id: int, deployment_key: str, symbol: str, timeframe: str,
+                    exclude_id: int | None = None):
     async with db.session() as s:
         row = await s.scalar(select(StrategyInstance).where(
+            StrategyInstance.account_id == account_id,
             StrategyInstance.deployment_key == deployment_key,
             StrategyInstance.symbol == symbol,
             StrategyInstance.timeframe == timeframe,
@@ -99,8 +109,13 @@ async def _conflict(deployment_key: str, symbol: str, timeframe: str, exclude_id
 
 
 @router.get("")
-async def list_strategies(request: Request, include_hidden: bool = False):
-    query = select(StrategyInstance).order_by(StrategyInstance.deployment_key, StrategyInstance.id)
+async def list_strategies(request: Request, include_hidden: bool = False, account_id: int | None = None,
+                          user: User = Depends(require_user)):
+    mine = await store.account_ids(user.id)
+    if account_id is not None:
+        mine = [account_id] if account_id in mine else []
+    query = (select(StrategyInstance).where(StrategyInstance.account_id.in_(mine))
+             .order_by(StrategyInstance.deployment_key, StrategyInstance.id))
     if not include_hidden:
         query = query.where(StrategyInstance.status.not_in(HIDDEN))
     async with db.session() as s:
@@ -120,14 +135,17 @@ async def list_strategies(request: Request, include_hidden: bool = False):
 
 
 @router.post("", status_code=status.HTTP_201_CREATED)
-async def add_instance(request: Request, body: InstanceCreate):
-    """Run a code-defined deployment on another symbol/timeframe. Starts stopped."""
+async def add_instance(request: Request, body: InstanceCreate, user: User = Depends(require_user)):
+    """Run a code-defined deployment on one of your broker accounts, symbol and timeframe.
+    Starts stopped."""
     runner = _runner(request)
+    if not owns(user, await store.get_account(body.account_id)):
+        raise HTTPException(status.HTTP_404_NOT_FOUND, "No such broker account")
     symbol = body.symbol.strip()
     _check_timeframe(runner, body.deployment_key, body.timeframe)
-    warning = await _check_symbol(runner, symbol)
+    warning = await _check_symbol(runner, body.account_id, symbol)
 
-    existing = await _conflict(body.deployment_key, symbol, body.timeframe)
+    existing = await _conflict(body.account_id, body.deployment_key, symbol, body.timeframe)
     if existing is not None and existing.status != "archived":
         raise HTTPException(status.HTTP_409_CONFLICT,
                             f"{body.deployment_key} already runs on {symbol} {body.timeframe} (#{existing.id})")
@@ -137,22 +155,29 @@ async def add_instance(request: Request, body: InstanceCreate):
             row = await s.get(StrategyInstance, existing.id)
             row.status, row.last_error = "stopped", None
         else:
-            row = StrategyInstance(deployment_key=dep.key, symbol=symbol, timeframe=body.timeframe,
-                                   status="stopped", **dep.settings())
+            row = StrategyInstance(account_id=body.account_id, deployment_key=dep.key, symbol=symbol,
+                                   timeframe=body.timeframe, status="stopped", **dep.settings())
             s.add(row)
     return _instance_dict(row, runner) | {"warning": warning}
 
 
+@router.post("/stop-all")
+async def stop_all(request: Request, user: User = Depends(require_user)):
+    """Kill switch: stop every running strategy on your accounts. Open orders are left as they are."""
+    return {"stopped": await _runner(request).stop_all(set(await store.account_ids(user.id)))}
+
+
 @router.get("/{instance_id}")
-async def get_instance(request: Request, instance_id: int):
-    return _instance_dict(await _get(instance_id), _runner(request))
+async def get_instance(request: Request, instance_id: int, user: User = Depends(require_user)):
+    return _instance_dict(await _get(instance_id, user), _runner(request))
 
 
 @router.patch("/{instance_id}")
-async def update_instance(request: Request, instance_id: int, body: InstanceUpdate):
+async def update_instance(request: Request, instance_id: int, body: InstanceUpdate,
+                          user: User = Depends(require_user)):
     """Change an instance's symbol and/or timeframe. It must be stopped."""
     runner = _runner(request)
-    row = await _get(instance_id)
+    row = await _get(instance_id, user)
     if instance_id in runner.running:
         raise HTTPException(status.HTTP_409_CONFLICT, "Stop the strategy before changing it")
     if row.status in HIDDEN:
@@ -160,8 +185,9 @@ async def update_instance(request: Request, instance_id: int, body: InstanceUpda
     symbol = (body.symbol or row.symbol).strip()
     timeframe = body.timeframe or row.timeframe
     _check_timeframe(runner, row.deployment_key, timeframe)
-    warning = await _check_symbol(runner, symbol) if symbol != row.symbol else None
-    if (other := await _conflict(row.deployment_key, symbol, timeframe, exclude_id=instance_id)) is not None:
+    warning = await _check_symbol(runner, row.account_id, symbol) if symbol != row.symbol else None
+    other = await _conflict(row.account_id, row.deployment_key, symbol, timeframe, exclude_id=instance_id)
+    if other is not None:
         raise HTTPException(status.HTTP_409_CONFLICT,
                             f"Instance #{other.id} ({other.status}) already uses {symbol} {timeframe}")
     async with db.session() as s, s.begin():
@@ -173,11 +199,11 @@ async def update_instance(request: Request, instance_id: int, body: InstanceUpda
 
 
 @router.delete("/{instance_id}")
-async def archive_instance(request: Request, instance_id: int):
+async def archive_instance(request: Request, instance_id: int, user: User = Depends(require_user)):
     """Remove an instance from the list. Its signal history is kept; adding the same
-    symbol and timeframe again brings it back."""
+    account, symbol and timeframe again brings it back."""
     runner = _runner(request)
-    await _get(instance_id)
+    await _get(instance_id, user)
     if instance_id in runner.running:
         raise HTTPException(status.HTTP_409_CONFLICT, "Stop the strategy before removing it")
     async with db.session() as s, s.begin():
@@ -187,34 +213,29 @@ async def archive_instance(request: Request, instance_id: int):
 
 
 @router.post("/{instance_id}/start")
-async def start_instance(request: Request, instance_id: int):
+async def start_instance(request: Request, instance_id: int, user: User = Depends(require_user)):
     runner = _runner(request)
-    await _get(instance_id)
+    await _get(instance_id, user)
     try:
         await runner.start(instance_id)
     except StrategyError as e:
         raise HTTPException(status.HTTP_409_CONFLICT, str(e))
-    return _instance_dict(await _get(instance_id), runner)
+    return _instance_dict(await _get(instance_id, user), runner)
 
 
 @router.post("/{instance_id}/stop")
-async def stop_instance(request: Request, instance_id: int):
+async def stop_instance(request: Request, instance_id: int, user: User = Depends(require_user)):
     runner = _runner(request)
-    row = await _get(instance_id)
+    row = await _get(instance_id, user)
     if row.status not in HIDDEN:
         await runner.stop(instance_id)
-    return _instance_dict(await _get(instance_id), runner)
-
-
-@router.post("/stop-all")
-async def stop_all(request: Request):
-    """Kill switch: stop every running strategy. Open orders are left as they are."""
-    return {"stopped": await _runner(request).stop_all()}
+    return _instance_dict(await _get(instance_id, user), runner)
 
 
 @router.get("/{instance_id}/signals")
-async def list_signals(instance_id: int, limit: int = Query(default=100, ge=1, le=1000)):
-    await _get(instance_id)
+async def list_signals(instance_id: int, limit: int = Query(default=100, ge=1, le=1000),
+                       user: User = Depends(require_user)):
+    await _get(instance_id, user)
     async with db.session() as s:
         rows = await s.scalars(
             select(StrategySignal).where(StrategySignal.instance_id == instance_id)

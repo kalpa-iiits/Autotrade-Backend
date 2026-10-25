@@ -7,18 +7,21 @@ from app.core.db import Base, UTCDateTime, utcnow
 
 
 class StrategyInstance(Base):
-    """One run of a deployment from app/strategies/deployments.py on a symbol and timeframe.
+    """One run of a deployment from app/strategies/deployments.py on one broker account,
+    symbol and timeframe.
 
-    Symbol and timeframe are chosen in the app. Everything else (strategy, params, size,
-    limits, mode) is copied from code at startup. Status and history live here.
+    Account, symbol and timeframe are chosen in the app by the account's owner. Everything else
+    (strategy, params, size, limits, mode) is copied from code at startup. Status and history
+    live here.
     """
 
     __tablename__ = "strategy_instances"
     __table_args__ = (
-        UniqueConstraint("deployment_key", "symbol", "timeframe", name="uq_strategy_instance_target"),
+        UniqueConstraint("account_id", "deployment_key", "symbol", "timeframe", name="uq_strategy_instance_target"),
     )
 
     id: Mapped[int] = mapped_column(primary_key=True)
+    account_id: Mapped[int] = mapped_column(ForeignKey("broker_accounts.id"), index=True)
     deployment_key: Mapped[str] = mapped_column(String(64), index=True)  # Deployment.key
     strategy: Mapped[str] = mapped_column(String(64))  # Strategy.name
     label: Mapped[str] = mapped_column(String(128))

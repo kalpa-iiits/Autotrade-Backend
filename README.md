@@ -1,16 +1,21 @@
 # AutoTrade
 
-FastAPI trading backend, split into three apps that share one broker connection:
+FastAPI trading platform for many users, each with their own broker accounts. Every user
+signs in, adds one or more broker accounts (paper, Fyers, Zerodha) by pasting that broker app's
+credentials, logs in to the broker each day, and trades or runs strategies on those accounts.
+Credentials and access tokens are stored encrypted; users never see each other's accounts,
+orders, trades or strategies.
 
 | app | what it does | endpoints |
 |---|---|---|
-| **auth** | app sign-in (JSON + HTML page), API token, daily broker login, broker status | `/api/auth/...` |
-| **tickers** | live prices, quotes, candles | `WS /api/ws/tickers`, `/api/market/...` |
-| **orders** | place / cancel orders, order updates, history, positions, funds | `WS /api/ws/orders`, `/api/orders/...`, `/api/account/...` |
-| **trades** | open / closed round-trip trades with P&L | `/api/trades/...` |
-| **strategies** | run the strategies defined in code on symbols/timeframes chosen in the app | `/api/strategies/...` |
+| **auth** | app sign-in (JSON + HTML page), optional sign-up, personal API tokens | `/api/auth/...` |
+| **accounts** | your broker accounts: add (credentials), edit, delete, daily broker login | `/api/accounts/...` |
+| **tickers** | live prices, quotes, candles, per account | `WS /api/accounts/{id}/ws/tickers`, `/api/accounts/{id}/market/...` |
+| **orders** | place / cancel orders, order updates, history, positions, funds, per account | `WS /api/accounts/{id}/ws/orders`, `/api/accounts/{id}/orders/...` |
+| **trades** | open / closed round-trip trades with P&L, across your accounts | `/api/trades/...` |
+| **strategies** | run the strategies defined in code on your accounts, symbols and timeframes | `/api/strategies/...` |
 
-Brokers (pick one with `AUTOTRADE_BROKER`):
+Brokers (each account is one of these):
 
 | broker | orders | live data | symbol format |
 |---|---|---|---|
@@ -26,8 +31,15 @@ source .venv/bin/activate
 uv pip install -r requirements.txt  # or: pip install -r requirements.txt
 cp .env.example .env
 python -c "import secrets; print(secrets.token_urlsafe(32))"   # -> AUTOTRADE_SESSION_SECRET
+python -m app.accounts.vault generate-key                        # -> AUTOTRADE_CREDENTIALS_KEY
 python -m app.auth.users create admin   # creates autotrade.db and your first user
 ```
+
+Then sign in at http://127.0.0.1:8000 and add a broker account (start with a paper one).
+Upgrading from the single-broker version: your `AUTOTRADE_BROKER` / `AUTOTRADE_FYERS_*` /
+`AUTOTRADE_ZERODHA_*` / `AUTOTRADE_API_TOKEN` settings are ignored now (the server logs their
+names). Existing orders and trades move to an "Imported (...)" account owned by the first user:
+paste that broker app's credentials into it, then remove them from `.env`.
 
 ## Run
 
@@ -37,10 +49,44 @@ uvicorn app.main:app --reload
 
 Open http://127.0.0.1:8000, sign in, and use the built-in test client.
 
-Run **one** server process (no `--workers 2`): strategies, the broker connection and order
+Run **one** server process (no `--workers 2`): strategies, the broker connections and order
 de-duplication live in it, so a second process would place every order twice. The server
 holds a lock file while it runs (next to the SQLite file, or `AUTOTRADE_LOCK_FILE`) and a
 second one refuses to start.
+
+## Broker accounts and credentials
+
+Each user adds their own accounts (`POST /api/accounts`, or **Add a broker account** on the test
+page), up to `AUTOTRADE_MAX_ACCOUNTS_PER_USER` (10). Each has a label unique to that user.
+
+| broker | credentials (secret, write-only) | options | daily login |
+|---|---|---|---|
+| `paper` | none | `starting_cash` | no |
+| `fyers` | `client_id`, `secret_key` of *your* Fyers app (https://myapi.fyers.in) | `product_type` (INTRADAY, CNC, MARGIN, MTF) | yes |
+| `zerodha` | `api_key`, `api_secret` of *your* Kite Connect app (https://developers.kite.trade) | `product` (MIS, CNC, NRML) | yes |
+
+- **Encrypted at rest.** Credentials and each day's access token are encrypted with AES-256-GCM
+  using `AUTOTRADE_CREDENTIALS_KEY`, which lives in the environment, never in the database. Each
+  value is bound to its account and field, so a ciphertext copied onto another row won't
+  decrypt. Without the key, only paper accounts can be added. Keep the key out of database
+  backups: whoever has both can decrypt.
+- **Never shown back.** Responses say which credential fields are set; the client id / API key
+  is masked (`XB12…00`) so you can tell accounts apart; secrets aren't shown at all. To change
+  them, `PATCH` the fields you're replacing (that also drops today's broker login).
+- **Key rotation:** move the current key into `AUTOTRADE_CREDENTIALS_OLD_KEYS`, set a new
+  `AUTOTRADE_CREDENTIALS_KEY`, run `python -m app.accounts.vault rotate`, then drop the old key.
+- **Daily broker login** (Fyers and Zerodha tokens expire daily): open
+  `/api/accounts/{id}/broker-login` (or **Broker login** on the test page). It uses that
+  account's own app; afterwards the token is stored encrypted for the day and the account
+  connects. Or paste a token you generated elsewhere: `POST /api/accounts/{id}/access-token`.
+  Register **one redirect URL per broker for all accounts** on your broker app:
+  `http://<server>/auth/fyers/callback` (also `AUTOTRADE_FYERS_REDIRECT_URI`) or
+  `http://<server>/auth/zerodha/callback`. The login's `state` says which account it was for.
+- **Deleting** an account wipes its credentials and token and disconnects it; its order and
+  trade history stays yours. Stop its strategies first (they're archived).
+- **Isolation.** Another user's account id gets the same 404 as one that doesn't exist, on
+  every route and socket. Each account has its own broker connection, rate limit, ledger,
+  resync and WebSocket channels: one account's broker or ledger failing never affects another.
 
 ## Reliability
 
@@ -60,13 +106,14 @@ second one refuses to start.
   retried (latest state per order) until it is. Meanwhile `/health` reports `failing`, order
   placement double-checks the broker before sending, and live strategies are paused.
 - **Broker rate limit.** Placements and cancels are spaced to
-  `AUTOTRADE_BROKER_ORDERS_PER_SECOND` (8; Fyers and Kite allow 10).
+  `AUTOTRADE_BROKER_ORDERS_PER_SECOND` (8; Fyers and Kite allow 10), per account.
 - **Exact money.** Prices and P&L are stored as exact decimals (whole 1/10000ths), so totals
   don't drift the way float sums do.
-- **`GET /health`** (public, no secrets): `status` is `ok`, `degraded` (broker not connected or
-  its stream reports a problem: normal before the daily login) or `failing` with HTTP 503
-  (database unreachable or unsaved ledger updates). Also reports tick counts and the last tick
-  time, the last resync, dropped ticks, queued ticks and evicted WebSocket clients.
+- **`GET /health`** (public, so counts only: nothing about any user or account): `status` is
+  `ok`, `degraded` (a connected account's stream or resync reports a problem) or `failing` with
+  HTTP 503 (database unreachable or an account's ledger has unsaved updates), with account and
+  strategy counts. Each account's detail (connection, tick counts, last resync, ledger, sockets)
+  is in `GET /api/accounts/{id}` for its owner.
 
 ## Database
 
@@ -107,9 +154,10 @@ as being at the baseline revision).
 | table | holds |
 |---|---|
 | `users` | app logins (scrypt password hashes), active flag, last login |
-| `broker_tokens` | today's Fyers / Zerodha access token |
+| `api_tokens` | personal API tokens (SHA-256 hashes only) |
+| `broker_accounts` | each user's broker accounts: encrypted credentials and today's encrypted access token, options |
 | `login_attempts` | every sign-in attempt: drives the lockout, kept 90 days as an audit log |
-| `orders` | latest state of every order from any broker; read via `GET /api/orders/history` |
+| `orders` | latest state of every order, per account; read via `GET /api/accounts/{id}/orders/history` |
 | `order_events` | every state change of every order (placed, part-filled, filled, cancelled ...) |
 | `fills` | one row per execution: order, quantity, price, time |
 | `positions` | round-trip trades: LONG/SHORT, OPEN/CLOSED, entry/exit averages, realized P&L |
@@ -120,23 +168,24 @@ as being at the baseline revision).
 Every order update goes through `app/trades/ledger.py` in one transaction. Brokers report an
 order's cumulative filled quantity and average price; the difference from the previous update
 is a new fill (so partial fills work, and a repeated update adds nothing). Each fill is applied
-to the open position for that broker + symbol:
+to the open position for that account + symbol:
 
 - no open position → opens one (BUY = LONG, SELL = SHORT)
 - same side → adds to it (average entry price is re-weighted)
 - opposite side → reduces it and books realized P&L; at zero it is CLOSED. Any extra quantity
   opens a new position the other way (e.g. SELL 15 while LONG 10 → close, then SHORT 5)
 
-`GET /api/trades/open` includes `unrealized_pnl` for symbols the broker is streaming prices for
-(paper: all; Fyers/Zerodha: symbols someone is subscribed to on `/api/ws/tickers`). Without a recent
-price it is `null` and counted in `totals.unpriced`. `GET /api/trades/closed` takes
-`broker`, `symbol`, `since`, `until` (ISO 8601 close time) and `limit`; its totals (count,
+`GET /api/trades/open` (all your accounts, or `?account_id=`) includes `unrealized_pnl` for
+symbols the account's broker is streaming prices for (paper: all; Fyers/Zerodha: symbols someone
+is subscribed to on that account's tickers socket). Without a recent price it is `null` and
+counted in `totals.unpriced`. `GET /api/trades/closed` takes
+`account_id`, `symbol`, `since`, `until` (ISO 8601 close time) and `limit`; its totals (count,
 realized P&L, wins, losses, win rate) cover every match, not just the page. P&L is before
 brokerage, charges and taxes. Only orders this app sees are tracked; trades placed elsewhere
 before the app connects (or an existing broker position) are not imported.
 
-The file is created with owner-only permissions (it holds password hashes and broker tokens).
-Paper-broker cash and the simulated broker positions (`/api/account/positions`) are still in memory
+The file is created with owner-only permissions (it holds password hashes and encrypted broker
+credentials). Paper-broker cash and the simulated broker positions (`/api/accounts/{id}/positions`) are still in memory
 and reset on restart; the `positions` table above keeps its trade history.
 
 Manage users:
@@ -146,6 +195,7 @@ python -m app.auth.users create <username>
 python -m app.auth.users set-password <username>   # also signs them out everywhere
 python -m app.auth.users disable <username>        # or: enable
 python -m app.auth.users list
+python -m app.auth.users token <username> [name]   # a personal API token (shown once)
 ```
 
 ## Authentication
@@ -156,29 +206,22 @@ python -m app.auth.users list
   for 5 minutes, even across restarts. Changing a password or disabling a user signs out their
   existing sessions. WebSockets use the same cookie and reject pages from other
   origins. Behind HTTPS, set `AUTOTRADE_SECURE_COOKIES=true`.
-- **API token (optional)** for scripts and bots: set `AUTOTRADE_API_TOKEN`, then send
-  `Authorization: Bearer ...` to REST endpoints or `?token=...` on WebSockets (browsers can't
-  set WebSocket headers). REST does not accept `?token=`: URLs end up in logs. Empty = disabled.
+- **Sign-up.** With `AUTOTRADE_ALLOW_SIGNUP=true`, anyone can create a user with
+  `POST /api/auth/signup` (same lockout as login). Off by default: users are created with the CLI.
+- **Personal API tokens** for scripts and bots: `POST /api/auth/tokens {name}` (shown once,
+  stored hashed), `GET /api/auth/tokens`, `DELETE /api/auth/tokens/{id}`, or the CLI above. A
+  token acts as its user. Send `Authorization: Bearer ...` to REST endpoints or `?token=...` on
+  WebSockets (browsers can't set WebSocket headers). REST does not accept `?token=`: URLs end
+  up in logs. A disabled user's tokens stop working.
 - Interactive API docs: `/api/docs` (and `/api/openapi.json`), for signed-in users only.
   Turn off with `AUTOTRADE_ENABLE_DOCS=false`.
-- **Broker login** (real money). Fyers and Zerodha tokens expire daily, so log in once each
-  trading day. Sign in to the app, then open `http://127.0.0.1:8000/api/auth/<broker>/login`
-  (or use the login buttons on the test page). After you log in, the token is saved to
-  `broker_tokens` table for the day and the broker connects. Until then, order and ticker
-  requests reply with a "not logged in" error.
-
-  | | Fyers | Zerodha |
-  |---|---|---|
-  | create app | https://myapi.fyers.in | https://developers.kite.trade |
-  | redirect URL to register | `http://127.0.0.1:8000/auth/fyers/callback` | `http://127.0.0.1:8000/auth/zerodha/callback` |
-  | `.env` | `AUTOTRADE_BROKER=fyers`, `AUTOTRADE_FYERS_CLIENT_ID`, `AUTOTRADE_FYERS_SECRET_KEY` | `AUTOTRADE_BROKER=zerodha`, `AUTOTRADE_ZERODHA_API_KEY`, `AUTOTRADE_ZERODHA_API_SECRET` |
-  | product setting | `AUTOTRADE_FYERS_PRODUCT_TYPE` (INTRADAY, CNC, ...) | `AUTOTRADE_ZERODHA_PRODUCT` (MIS, CNC, NRML) |
+- **Broker login** per account: see [Broker accounts](#broker-accounts-and-credentials).
 
 ## Strategies
 
-**Code** (the admin) defines each strategy's logic, parameters, size, limits and mode.
-**The app** chooses where it runs: which symbol and timeframe, on as many symbols at once as
-you like.
+**Code** (the platform admin) defines each strategy's logic, parameters, size, limits and mode:
+the catalog. **Each user** chooses where it runs: which of their broker accounts, symbol and
+timeframe, on as many at once as they like. Users only see and control their own instances.
 
 - A **strategy** is a Python class that reacts to price bars (or ticks) and calls `buy()`,
   `sell()` or `exit()` (`app/strategies/builtin/`). It can limit which timeframes it allows.
@@ -190,8 +233,8 @@ DEPLOYMENTS = [
     Deployment(
         key="nifty-1m-breakout",            # stable id; keep it the same across edits
         strategy=IntradayBreakout,
-        symbol="NSE:NIFTY26NOVFUT",         # default for the first instance only
-        timeframe="1m",                     # default for the first instance only
+        symbol="NSE:NIFTY26NOVFUT",         # suggested symbol in the "add" form
+        timeframe="1m",                     # suggested timeframe
         params=IntradayBreakout.Params(...),
         quantity=65, max_position=65, max_orders_per_day=20,
         mode="signal",                      # "live" places real orders
@@ -199,13 +242,13 @@ DEPLOYMENTS = [
 ]
 ```
 
-- An **instance** is one run of a deployment on a symbol and timeframe
-  (`1m, 3m, 5m, 10m, 15m, 30m, 60m`). The first one is created automatically from the
-  deployment's defaults. In the app (Strategies section, or the API) you can **add** more
-  instances, **change** an instance's symbol/timeframe while it's stopped, and **remove** it
-  (archived: its signal history is kept, and adding the same symbol + timeframe again brings it
-  back). A deployment can't run twice on the same symbol + timeframe. When the broker is
-  connected, a new symbol is checked with it first. Each instance has its own position and its
+- An **instance** is one run of a deployment on one broker account, symbol and timeframe
+  (`1m, 3m, 5m, 10m, 15m, 30m, 60m`). Code creates none: users **add** instances on their
+  accounts (Strategies section, or the API), **change** an instance's symbol/timeframe while it's
+  stopped, and **remove** it (archived: its signal history is kept, and adding the same
+  account + symbol + timeframe again brings it back). A deployment can't run twice on the same
+  account + symbol + timeframe. When the account's broker is connected, a new symbol is checked
+  with it first. Its orders go to that account's broker only. Each instance has its own position and its
   own copy of the limits, so two instances can each hold `max_position`.
 
 On every server start, instances are synced from code: changed parameters/size/limits/mode
@@ -226,8 +269,8 @@ unattended. Unchanged running ones resume. Removing a deployment from code marks
    by these limits, so a strategy can always exit.
 4. **Errors.** A strategy that raises is stopped with status `error` and the message in
    `last_error`.
-5. **Kill switch.** `POST /api/strategies/stop-all` (or **Stop all** on the test page). It stops
-   strategies; it does not cancel orders already at the broker.
+5. **Kill switch.** `POST /api/strategies/stop-all` (or **Stop all** on the test page) stops
+   all of *your* strategies; it does not cancel orders already at the broker.
 
 After a restart, indicators start empty (no historical warm-up yet) and each strategy's
 position is rebuilt from its own signals/orders.
@@ -264,23 +307,24 @@ class MyStrategy(Strategy):
 
 `self.ctx` also has `symbol`, `position`, `last_price`, `quantity` and `log()`. Strategy
 orders also flow into `orders`, `fills` and `positions` like manual ones (the `positions`
-table is per broker + symbol, so it mixes manual and strategy trades on the same symbol).
+table is per account + symbol, so it mixes manual and strategy trades on the same symbol).
 
-Signals and status changes are pushed to `/api/ws/orders` clients as `strategy_signal` and
+Signals and status changes are pushed to the account's orders socket as `strategy_signal` and
 `strategy_status` messages.
 
 ## API (for a separate frontend)
 
-Everything a frontend needs is under **`/api`**: REST endpoints and the two WebSockets.
+Everything a frontend needs is under **`/api`**: REST endpoints and each account's two WebSockets.
 Browse and try them at **`/api/docs`** (sign in first); the OpenAPI schema at
 `/api/openapi.json` can generate a typed client, e.g.
 `npx openapi-typescript http://localhost:8000/api/openapi.json -o src/api.d.ts` (needs a
 session cookie or `Authorization: Bearer <API token>` header).
 
 Errors are JSON `{"detail": ...}` with: **401** not signed in, **403** wrong current password,
-**404** not found, **409** conflict (e.g. strategy running), **422** invalid request or refused by
-the broker (bad symbol, can't cancel), **429** locked out (`Retry-After`), **502** broker
-API error, **503** broker not connected (log in to the broker).
+**404** not found (also: not yours), **409** conflict (e.g. strategy running), **422** invalid
+request or refused by the broker (bad symbol, can't cancel), **429** locked out (`Retry-After`),
+**502** broker API error, **503** account's broker not connected (log in to the broker) or no
+credentials key on the server.
 
 | | endpoint | |
 |---|---|---|
@@ -288,22 +332,27 @@ API error, **503** broker not connected (log in to the broker).
 | | `POST /api/auth/logout` | |
 | | `GET /api/auth/me` | current user or 401 (call on app load) |
 | | `POST /api/auth/password` `{current_password, new_password}` | other sessions are signed out |
-| **Broker** | `GET /api/auth/status` | active broker, connected, logged in today |
-| | `GET /api/auth/{fyers,zerodha}/login?redirect=false` | `{url}`: send the browser there |
-| | `POST /api/auth/{broker}/logout` | |
-| **Market** | `GET /api/market/quotes?symbols=A,B` | `{symbol: last price}` |
-| | `GET /api/market/candles?symbol=&resolution=1\|D&start=&end=` | OHLCV for charts |
-| | `WS /api/ws/tickers` | `subscribe` / `unsubscribe`, pushes `tick` |
-| **Orders** | `GET /api/orders` | today's order book (broker) |
-| | `POST /api/orders` `{symbol, side, quantity, order_type, limit_price}` | 201 with the order |
-| | `DELETE /api/orders/{id}` | cancel |
-| | `GET /api/orders/history?broker=&symbol=&limit=` | from the database |
-| | `GET /api/orders/{id}/events` | status changes of one order |
-| | `WS /api/ws/orders` | same actions, pushes `order_update`, `strategy_signal`, `strategy_status` |
-| **Account** | `GET /api/account/positions`, `GET /api/account/funds` | from the broker |
-| **Trades** | `GET /api/trades/open`, `/api/trades/closed?broker=&symbol=&since=&until=&limit=`, `/api/trades/{id}` | round trips + P&L |
+| | `POST /api/auth/signup` `{username, password}` | when enabled |
+| | `GET/POST /api/auth/tokens`, `DELETE /api/auth/tokens/{id}` | personal API tokens |
+| **Accounts** | `GET /api/accounts`, `GET /api/accounts/brokers` | yours; what each broker needs |
+| | `POST /api/accounts` `{broker, label, credentials?, options?}` | add one (credentials encrypted) |
+| | `GET/PATCH/DELETE /api/accounts/{id}` | `connection` holds its live status |
+| | `GET /api/accounts/{id}/broker-login?redirect=false` | `{url}`: send the browser there |
+| | `POST /api/accounts/{id}/access-token` `{access_token}`, `/broker-logout`, `/reconnect` | |
+| **Market** | `GET /api/accounts/{id}/market/quotes?symbols=A,B` | `{symbol: last price}` |
+| | `GET /api/accounts/{id}/market/candles?symbol=&resolution=1\|D&start=&end=` | OHLCV for charts |
+| | `WS /api/accounts/{id}/ws/tickers` | `subscribe` / `unsubscribe`, pushes `tick` |
+| **Orders** | `GET /api/accounts/{id}/orders` | today's order book (broker) |
+| | `POST /api/accounts/{id}/orders` `{symbol, side, quantity, order_type, limit_price}` | 201 with the order |
+| | `DELETE /api/accounts/{id}/orders/{order_id}` | cancel |
+| | `GET /api/accounts/{id}/orders/history?symbol=&limit=` | from the database |
+| | `GET /api/accounts/{id}/orders/{order_id}/events` | status changes of one order |
+| | `WS /api/accounts/{id}/ws/orders` | same actions, pushes `order_update`, `strategy_signal`, `strategy_status` |
+| **Account** | `GET /api/accounts/{id}/positions`, `GET /api/accounts/{id}/funds` | from the broker |
+| **Trades** | `GET /api/trades/open`, `/api/trades/closed?account_id=&symbol=&since=&until=&limit=`, `/api/trades/{id}` | round trips + P&L |
 | **Strategies** | `GET /api/strategies` | instances, plus the deployments code defines |
-| | `POST /api/strategies` `{deployment_key, symbol, timeframe}` | add an instance |
+| | `GET /api/strategies?account_id=` | one account's only |
+| | `POST /api/strategies` `{deployment_key, account_id, symbol, timeframe}` | add an instance |
 | | `PATCH /api/strategies/{id}` `{symbol?, timeframe?}` | while stopped |
 | | `DELETE /api/strategies/{id}` | archive (history kept) |
 | | `POST /api/strategies/{id}/start`, `/stop`, `POST /api/strategies/stop-all` | |
@@ -328,7 +377,7 @@ export default defineConfig({
 });
 ```
 
-Then call `fetch("/api/...")` and `new WebSocket(`ws://${location.host}/api/ws/orders`)`.
+Then call `fetch("/api/...")` and `new WebSocket(`ws://${location.host}/api/accounts/${id}/ws/orders`)`.
 
 **Separate origins** (frontend on its own host or port without a proxy): list it in `.env`
 
@@ -342,24 +391,26 @@ The session cookie is `SameSite=Lax`, so frontend and API must be on the same si
 `app.example.com` + `api.example.com`, or `localhost` on two ports). In production use HTTPS
 and `AUTOTRADE_SECURE_COOKIES=true`.
 
-**Broker login from the frontend:** `GET /api/auth/fyers/login?redirect=false` → set
-`window.location = url`. After the user logs in at Fyers, the browser comes back to
-`AUTOTRADE_FRONTEND_URL` with `?broker_login=fyers` (or `?broker_login_error=...`).
+**Broker login from the frontend:** `GET /api/accounts/{id}/broker-login?redirect=false` → set
+`window.location = url`. After the user logs in at the broker, the browser comes back to
+`AUTOTRADE_FRONTEND_URL` with `?broker_login=fyers&account_id={id}` (or `?broker_login_error=...`).
 
 ## WebSocket protocol
 
-Every message is JSON with an `action` and an optional `request_id` (echoed back).
-Both sockets accept `ping`. Server replies: `welcome`, `ack`, `error`, `pong`.
+Each broker account has two sockets; only its owner can open them (session cookie, or
+`?token=` with a personal API token). Every message is JSON with an `action` and an optional
+`request_id` (echoed back). Both sockets accept `ping`. Server replies: `welcome` (with
+`account_id` and `broker`), `ack`, `error`, `pong`.
 
-**`/api/ws/tickers`**
+**`/api/accounts/{id}/ws/tickers`**
 
 | action | fields |
 |---|---|
-| `subscribe` / `unsubscribe` | `symbols: [...]` in the active broker's format (see above) |
+| `subscribe` / `unsubscribe` | `symbols: [...]` in the account's broker's format (see above) |
 
-Pushes `{"type": "tick", "symbol": ..., "ltp": ...}`.
+Pushes `{"type": "tick", "account_id": ..., "symbol": ..., "ltp": ...}`.
 
-**`/api/ws/orders`**
+**`/api/accounts/{id}/ws/orders`**
 
 | action | fields |
 |---|---|
@@ -367,23 +418,31 @@ Pushes `{"type": "tick", "symbol": ..., "ltp": ...}`.
 | `cancel_order` | `order_id` |
 | `get_orders`, `get_positions`, `get_funds` | — |
 
-Pushes `{"type": "order_update", "order": {...}}` to every connected client.
+Pushes `{"type": "order_update", "account_id": ..., "order": {...}}` to that account's clients only.
 
 ## Layout
 
 ```
 app/
-  main.py                 wires the apps, broker and connection managers together
+  main.py                 wires the apps, the account registry and the strategy runner together
   core/
     config.py             settings from env / .env
     db.py                 SQLAlchemy async engine/session; runs migrations at startup
-    broker_service.py     owns the live broker; restarted after a broker login; order
+    broker_service.py     one account's live broker; restarted after a broker login; order
                           de-duplication, rate limit, reconciliation with the order book
     connections.py        tracks sockets per app, what each one follows, per-client send queues
     instance_lock.py      one server process at a time
     ratelimit.py          token bucket for broker order calls
     ws.py                 shared WebSocket loop (auth, parsing, ack/error replies)
     schemas.py            messages shared by all apps (ping)
+  accounts/
+    models.py             broker_accounts table
+    vault.py              AES-256-GCM encryption of credentials/tokens + key CLI
+    specs.py              what each broker needs (credentials, options); masking
+    store.py              account CRUD; the only place secrets are encrypted/decrypted
+    registry.py           each active account's broker, ledger and sockets
+    router.py             /api/accounts
+    dependencies.py       "your account or 404"
   brokers/
     base.py               Broker interface — implement this for another broker
     paper.py              simulated broker
@@ -391,13 +450,13 @@ app/
     zerodha.py            Zerodha Kite Connect broker
   auth/
     pages.py              /login page, /logout
-    models.py             users, broker_tokens, login_attempts tables
+    models.py             users, api_tokens, login_attempts tables
+    tokens.py             personal API tokens (hashed)
     users.py              user accounts + `python -m app.auth.users` CLI
     passwords.py          scrypt hashing
     throttle.py           failed-login lockout (backed by login_attempts)
-    dependencies.py       who's calling: session cookie or API token
-    router.py             broker logins and status
-    token_store.py        today's broker access tokens
+    dependencies.py       who's calling: session cookie or API token -> a User
+    router.py             daily broker login per account, broker callbacks
   tickers/                router.py, schemas.py
   orders/                 router.py, schemas.py, models.py (orders, order_events), history.py
   trades/                 ledger.py (fills -> positions), models.py, router.py
@@ -407,7 +466,8 @@ app/
   static/                 test client page
 migrations/               Alembic env.py and versions/ (the schema history)
 alembic.ini
-tests/                    one file per app, test_fyers.py, test_zerodha.py, test_reliability.py
+tests/                    one file per app, test_accounts.py (encryption, isolation), test_fyers.py,
+                          test_zerodha.py, test_reliability.py
 ```
 
 ## Tests
