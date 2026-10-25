@@ -5,12 +5,14 @@ from sqlalchemy import select
 from app.core import db
 from app.orders.models import OrderEvent, OrderRecord
 from app.orders.schemas import Order
+from app.strategies.models import StrategyInstance, StrategySignal
 
 
 def _to_order(r: OrderRecord) -> Order:
     return Order(
         id=r.id, client_order_id=r.client_order_id, symbol=r.symbol, side=r.side,
-        quantity=r.quantity, order_type=r.order_type, limit_price=r.limit_price, status=r.status,
+        quantity=r.quantity, order_type=r.order_type, limit_price=r.limit_price,
+        trigger_price=r.trigger_price, status=r.status,
         filled_quantity=r.filled_quantity, filled_price=r.filled_price, reason=r.reason,
         created_at=r.created_at, updated_at=r.updated_at,
     )
@@ -24,9 +26,22 @@ async def list_history(
     if symbol:
         query = query.where(OrderRecord.symbol == symbol)
     async with db.session() as s:
-        rows = await s.scalars(query)
-        return [{"account_id": r.account_id, "broker": r.broker, **_to_order(r).model_dump(mode="json")}
-                for r in rows]
+        rows = list(await s.scalars(query))
+        strategies = await strategies_of(s, account_id, [r.id for r in rows])
+    return [{"account_id": r.account_id, "broker": r.broker, "strategy": strategies.get(r.id),
+             **_to_order(r).model_dump(mode="json")} for r in rows]
+
+
+async def strategies_of(s, account_id: int, order_ids: list[str]) -> dict[str, str]:
+    """order id -> label of the strategy instance that placed it (orders placed by hand are left out)."""
+    if not order_ids:
+        return {}
+    rows = await s.execute(
+        select(StrategySignal.order_id, StrategyInstance.label)
+        .join(StrategyInstance, StrategyInstance.id == StrategySignal.instance_id)
+        .where(StrategyInstance.account_id == account_id, StrategySignal.order_id.in_(order_ids))
+    )
+    return {order_id: label for order_id, label in rows}
 
 
 async def find_by_client_order_id(account_id: int, client_order_id: str) -> Order | None:

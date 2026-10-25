@@ -12,7 +12,7 @@ from app.core.ws import serve
 from app.orders.history import list_events, list_history
 from app.orders.schemas import (
     CLIENT_ORDER_ID_PATTERN, CancelOrder, Order, OrderMessage, OrderQuery, OrderType, PlaceOrder,
-    Position, Side,
+    Position, Product, Side,
 )
 
 router = APIRouter(tags=["orders"])
@@ -49,7 +49,9 @@ class OrderCreate(BaseModel):
     side: Side
     quantity: int = Field(gt=0)
     order_type: OrderType = OrderType.MARKET
-    limit_price: float | None = Field(default=None, gt=0)
+    limit_price: float | None = Field(default=None, gt=0)  # LIMIT and SL
+    trigger_price: float | None = Field(default=None, gt=0)  # SL and SL-M
+    product: Product | None = None  # missing: the account's default product
     # Send the same one when retrying: the order is placed only once.
     client_order_id: str | None = Field(default=None, pattern=CLIENT_ORDER_ID_PATTERN)
 

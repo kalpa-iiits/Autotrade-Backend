@@ -336,3 +336,27 @@ def test_order_tag_maps_to_client_order_id():
     assert _order_from_fyers(row | {"orderTag": "abc123"}).client_order_id == "abc123"
     assert _order_from_fyers(row | {"orderTag": "2:Untagged"}).client_order_id is None
     assert _order_from_fyers(row).client_order_id is None
+
+
+def test_stop_orders_and_product_map_to_fyers():
+    from app.brokers.fyers import _order_from_fyers
+    from app.orders.schemas import Product
+
+    async def run():
+        broker, model = make_broker()
+        await broker.place_order(PlaceOrder(
+            action="place_order", symbol="NSE:NIFTY26NOVFUT", side=Side.SELL, quantity=75,
+            order_type=OrderType.SL, trigger_price=25388.0, limit_price=25380.0, product=Product.DELIVERY,
+        ))
+        await broker.place_order(PlaceOrder(
+            action="place_order", symbol="NSE:SBIN-EQ", side=Side.SELL, quantity=1,
+            order_type=OrderType.SL_M, trigger_price=790.0, product=Product.DELIVERY,
+        ))
+        sl, slm = model.placed
+        assert (sl["type"], sl["stopPrice"], sl["limitPrice"], sl["productType"]) == (4, 25388.0, 25380.0, "MARGIN")
+        assert (slm["type"], slm["stopPrice"], slm["limitPrice"], slm["productType"]) == (3, 790.0, 0, "CNC")
+
+    asyncio.run(run())
+    order = _order_from_fyers({"id": "1", "symbol": "NSE:SBIN-EQ", "qty": 1, "type": 3, "side": -1,
+                               "status": 6, "limitPrice": 0, "stopPrice": 790.0})
+    assert (order.order_type, order.trigger_price, order.limit_price) == (OrderType.SL_M, 790.0, None)

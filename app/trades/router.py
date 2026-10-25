@@ -12,6 +12,7 @@ from app.auth.dependencies import require_user
 from app.auth.models import User
 from app.core import db
 from app.core.db import to_decimal
+from app.strategies.models import StrategyInstance, StrategySignal
 from app.trades.ledger import CLOSED, LONG, OPEN
 from app.trades.models import Fill, Position, PositionFill
 
@@ -31,7 +32,23 @@ def _unrealized(p: Position, last_price: float | None) -> Decimal | None:
     return to_decimal(sign * (to_decimal(last_price) - p.avg_entry_price) * p.quantity)
 
 
-def _position(p: Position, last_price: float | None = None) -> dict:
+async def _strategies(s, positions: list[Position]) -> dict[int, str]:
+    """position id -> label of the strategy instance whose order opened it. Positions opened by
+    hand (or by a strategy since removed) are left out."""
+    if not positions:
+        return {}
+    rows = await s.execute(
+        select(PositionFill.position_id, StrategyInstance.label)
+        .join(Fill, Fill.id == PositionFill.fill_id)
+        .join(StrategySignal, StrategySignal.order_id == Fill.order_id)
+        .join(StrategyInstance, (StrategyInstance.id == StrategySignal.instance_id)
+              & (StrategyInstance.account_id == Fill.account_id))
+        .where(PositionFill.position_id.in_([p.id for p in positions]), PositionFill.role == "entry")
+    )
+    return {position_id: label for position_id, label in rows}
+
+
+def _position(p: Position, last_price: float | None = None, strategy: str | None = None) -> dict:
     out = {
         "id": p.id, "account_id": p.account_id, "broker": p.broker, "symbol": p.symbol, "direction": p.direction,
         "status": p.status, "quantity": p.quantity, "entry_quantity": p.entry_quantity,
@@ -39,6 +56,7 @@ def _position(p: Position, last_price: float | None = None) -> dict:
         "avg_exit_price": _num(p.avg_exit_price), "realized_pnl": _num(p.realized_pnl),
         "opened_at": p.opened_at.isoformat(),
         "closed_at": p.closed_at.isoformat() if p.closed_at else None,
+        "strategy": strategy,  # None: placed by hand
     }
     if p.status == OPEN:
         out["last_price"] = last_price
@@ -69,9 +87,10 @@ async def open_trades(request: Request, account_id: int | None = None, symbol: s
     query = await _filters(select(Position).where(Position.status == OPEN), user, account_id, symbol)
     async with db.session() as s:
         rows = list(await s.scalars(query.order_by(Position.opened_at.desc())))
+        strategies = await _strategies(s, rows)
     known = [u for p in rows if (u := _unrealized(p, _last_price(request, p))) is not None]
     return {
-        "positions": [_position(p, _last_price(request, p)) for p in rows],
+        "positions": [_position(p, _last_price(request, p), strategies.get(p.id)) for p in rows],
         "totals": {
             "count": len(rows),
             "unrealized_pnl": _num(sum(known)) if known else None,
@@ -106,8 +125,9 @@ async def closed_trades(
     async with db.session() as s:
         rows = list(await s.scalars(query.order_by(Position.closed_at.desc()).limit(limit)))
         count, pnl, wins, losses = (await s.execute(stats)).one()
+        strategies = await _strategies(s, rows)
     return {
-        "positions": [_position(p) for p in rows],
+        "positions": [_position(p, strategy=strategies.get(p.id)) for p in rows],
         "totals": {
             "count": count, "realized_pnl": _num(pnl), "wins": wins, "losses": losses,
             "win_rate": round(wins / count, 4) if count else None,
@@ -127,8 +147,9 @@ async def trade_detail(request: Request, position_id: int, user: User = Depends(
             .where(PositionFill.position_id == position_id)
             .order_by(Fill.filled_at, Fill.id)
         )).all()
+        strategies = await _strategies(s, [p])
     return {
-        **_position(p, _last_price(request, p)),
+        **_position(p, _last_price(request, p), strategies.get(p.id)),
         "fills": [
             {"fill_id": f.id, "order_id": f.order_id, "side": f.side, "role": link.role,
              "quantity": link.quantity, "price": _num(f.price), "filled_at": f.filled_at.isoformat()}

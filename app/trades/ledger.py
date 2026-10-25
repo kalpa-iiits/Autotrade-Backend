@@ -154,7 +154,9 @@ class TradeLedger:
             client_order_id=order.client_order_id or (prev.client_order_id if prev else None),
             symbol=order.symbol, side=order.side.value,
             quantity=order.quantity, order_type=order.order_type.value,
-            limit_price=order.limit_price, status=order.status.value,
+            limit_price=order.limit_price,
+            trigger_price=order.trigger_price or (prev.trigger_price if prev else None),
+            status=order.status.value,
             filled_quantity=filled_qty, filled_price=avg, reason=order.reason,
             created_at=prev.created_at if prev else order.created_at, updated_at=order.updated_at,
         ))

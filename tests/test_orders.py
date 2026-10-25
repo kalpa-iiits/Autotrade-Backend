@@ -145,3 +145,48 @@ def test_retry_after_lost_reply_and_concurrent_retries_place_once(client):
         return len(broker.placed)
 
     assert run(client, scenario) == 1
+
+
+def test_stop_orders_need_their_prices(client):
+    from tests.conftest import AUTH
+    body = {"symbol": "NSE:SBIN-EQ", "side": "SELL", "quantity": 1}
+    assert client.post("/api/accounts/1/orders", headers=AUTH,
+                       json=body | {"order_type": "SL-M"}).status_code == 422  # no trigger
+    assert client.post("/api/accounts/1/orders", headers=AUTH,
+                       json=body | {"order_type": "SL", "trigger_price": 1.0}).status_code == 422  # no limit
+    r = client.post("/api/accounts/1/orders", headers=AUTH,
+                    json=body | {"order_type": "SL-M", "trigger_price": 1.0, "product": "DELIVERY"})
+    assert r.status_code == 201
+    order = r.json()
+    assert (order["status"], order["trigger_price"], order["limit_price"]) == ("OPEN", 1.0, None)
+    [recorded] = [o for o in client.get("/api/accounts/1/orders/history", headers=AUTH).json()
+                  if o["id"] == order["id"]]
+    assert recorded["trigger_price"] == 1.0 and recorded["strategy"] is None
+
+
+def test_paper_stop_orders_trigger_at_their_price():
+    from app.brokers.paper import PaperBroker
+    from app.orders.schemas import OrderStatus, OrderType
+
+    async def go():
+        broker = PaperBroker(starting_cash=1_000_000)
+        broker.prices["NSE:SBIN-EQ"] = 800.0
+        stop_m = await broker.place_order(PlaceOrder(
+            action="place_order", symbol="NSE:SBIN-EQ", side=Side.SELL, quantity=1,
+            order_type=OrderType.SL_M, trigger_price=790.0))
+        stop_l = await broker.place_order(PlaceOrder(
+            action="place_order", symbol="NSE:SBIN-EQ", side=Side.SELL, quantity=1,
+            order_type=OrderType.SL, trigger_price=790.0, limit_price=795.0))
+        await broker._match_limit_orders()
+        assert stop_m.status == stop_l.status == OrderStatus.OPEN  # not reached yet
+
+        broker.prices["NSE:SBIN-EQ"] = 789.0
+        await broker._match_limit_orders()
+        assert (stop_m.status, stop_m.filled_price) == (OrderStatus.FILLED, 789.0)
+        assert stop_l.status == OrderStatus.OPEN  # triggered: now a limit at 795
+
+        broker.prices["NSE:SBIN-EQ"] = 796.0
+        await broker._match_limit_orders()
+        assert (stop_l.status, stop_l.filled_price) == (OrderStatus.FILLED, 795.0)
+
+    asyncio.run(go())

@@ -197,5 +197,7 @@ def public_view(account: BrokerAccount) -> dict:
         "credentials_error": unreadable,
         "needs_daily_login": spec.daily_login,
         "logged_in_today": logged_in_today if spec.daily_login else None,
+        # IST trading day of the last broker login (its token is only used on that day).
+        "last_login_date": account.token_date.isoformat() if spec.daily_login and account.token_date else None,
         "created_at": account.created_at.isoformat(),
     }

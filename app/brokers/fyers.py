@@ -21,6 +21,7 @@ from app.orders.schemas import (
     OrderType,
     PlaceOrder,
     Position,
+    Product,
     Side,
 )
 
@@ -34,7 +35,21 @@ FYERS_STATUS = {
     5: OrderStatus.REJECTED,
     6: OrderStatus.OPEN,  # pending
 }
-FYERS_ORDER_TYPE = {OrderType.LIMIT: 1, OrderType.MARKET: 2}
+FYERS_ORDER_TYPE = {OrderType.LIMIT: 1, OrderType.MARKET: 2, OrderType.SL_M: 3, OrderType.SL: 4}
+FYERS_ORDER_TYPE_OF = {code: t for t, code in FYERS_ORDER_TYPE.items()}
+
+
+def _is_derivative(symbol: str) -> bool:
+    """F&O contracts ("NSE:NIFTY26NOVFUT", "NSE:NIFTY26N0425000CE"): delivery is MARGIN, not CNC."""
+    return symbol.upper().endswith(("FUT", "CE", "PE"))
+
+
+def _product_type(req: PlaceOrder, default: str) -> str:
+    if req.product == Product.INTRADAY:
+        return "INTRADAY"
+    if req.product == Product.DELIVERY:
+        return "MARGIN" if _is_derivative(req.symbol) else "CNC"
+    return default
 FYERS_SIDE = {Side.BUY: 1, Side.SELL: -1}
 
 
@@ -46,7 +61,7 @@ def _client_order_id(tag) -> str | None:
 
 def _order_from_fyers(data: dict) -> Order:
     """Build an Order from an orderbook row or an order-socket update (same field names)."""
-    order_type = OrderType.LIMIT if data.get("type") == 1 else OrderType.MARKET
+    order_type = FYERS_ORDER_TYPE_OF.get(data.get("type"), OrderType.MARKET)
     return Order(
         id=str(data["id"]),
         client_order_id=_client_order_id(data.get("orderTag")),
@@ -54,7 +69,8 @@ def _order_from_fyers(data: dict) -> Order:
         side=Side.BUY if data.get("side") == 1 else Side.SELL,
         quantity=int(data.get("qty", 0)),
         order_type=order_type,
-        limit_price=data.get("limitPrice") if order_type == OrderType.LIMIT else None,
+        limit_price=data.get("limitPrice") if order_type in (OrderType.LIMIT, OrderType.SL) else None,
+        trigger_price=data.get("stopPrice") if order_type in (OrderType.SL, OrderType.SL_M) else None,
         status=FYERS_STATUS.get(data.get("status"), OrderStatus.OPEN),
         filled_quantity=int(data.get("filledQty") or 0),
         filled_price=data.get("tradedPrice") or None,
@@ -230,9 +246,9 @@ class FyersBroker(Broker):
             "qty": req.quantity,
             "type": FYERS_ORDER_TYPE[req.order_type],
             "side": FYERS_SIDE[req.side],
-            "productType": self.product_type,
+            "productType": _product_type(req, self.product_type),
             "limitPrice": req.limit_price or 0,
-            "stopPrice": 0,
+            "stopPrice": req.trigger_price or 0,
             "validity": "DAY",
             "disclosedQty": 0,
             "offlineOrder": False,
@@ -248,6 +264,8 @@ class FyersBroker(Broker):
             quantity=req.quantity,
             order_type=req.order_type,
             limit_price=req.limit_price,
+            trigger_price=req.trigger_price,
+            product=req.product,
         )
         if resp.get("s") == "ok" and resp.get("id"):
             order.id = str(resp["id"])

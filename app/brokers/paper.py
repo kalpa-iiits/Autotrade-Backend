@@ -33,6 +33,7 @@ class PaperBroker(Broker):
         self.prices: dict[str, float] = dict(SEED_PRICES)
         self.orders: dict[str, Order] = {}
         self.positions: dict[str, Position] = {}
+        self._triggered: set[str] = set()  # SL / SL-M orders whose trigger price was reached
         self._lock = asyncio.Lock()
         self._task: asyncio.Task | None = None
 
@@ -65,6 +66,20 @@ class PaperBroker(Broker):
                 if order.status != OrderStatus.OPEN:
                     continue
                 price = self.prices[order.symbol]
+                if order.order_type in (OrderType.SL, OrderType.SL_M) and order.id not in self._triggered:
+                    # Stops trigger when the price reaches trigger_price from the safe side.
+                    hit = (order.side == Side.BUY and price >= order.trigger_price) or (
+                        order.side == Side.SELL and price <= order.trigger_price
+                    )
+                    if not hit:
+                        continue
+                    self._triggered.add(order.id)
+                    if order.order_type == OrderType.SL_M:
+                        self._fill(order, price)
+                        await self._emit_order(order)
+                        continue
+                if order.limit_price is None:
+                    continue
                 crossed = (order.side == Side.BUY and price <= order.limit_price) or (
                     order.side == Side.SELL and price >= order.limit_price
                 )
@@ -114,11 +129,14 @@ class PaperBroker(Broker):
             quantity=req.quantity,
             order_type=req.order_type,
             limit_price=req.limit_price,
+            trigger_price=req.trigger_price,
+            product=req.product,
         )
         async with self._lock:
-            ref_price = (
-                self.prices[req.symbol] if req.order_type == OrderType.MARKET else req.limit_price
-            )
+            ref_price = {
+                OrderType.MARKET: self.prices[req.symbol],
+                OrderType.SL_M: req.trigger_price,
+            }.get(req.order_type, req.limit_price)
             if req.side == Side.BUY and ref_price * req.quantity > self.cash:
                 order.status = OrderStatus.REJECTED
                 order.reason = "Insufficient funds"

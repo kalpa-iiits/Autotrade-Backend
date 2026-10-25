@@ -21,7 +21,7 @@ from websockets.asyncio.client import connect as ws_connect
 from websockets.exceptions import ConnectionClosed, InvalidStatus
 
 from app.brokers.base import Broker, Candle, MissingCredentials, OrderError, Resolution
-from app.orders.schemas import Order, OrderStatus, OrderType, PlaceOrder, Position, Side
+from app.orders.schemas import Order, OrderStatus, OrderType, PlaceOrder, Position, Product, Side
 
 log = logging.getLogger(__name__)
 KITE_WS_URL = "wss://ws.kite.trade"
@@ -44,6 +44,14 @@ def split_symbol(symbol: str) -> tuple[str, str]:
     if not sep or not exchange or not tradingsymbol:
         raise OrderError(f"Zerodha symbols look like EXCHANGE:TRADINGSYMBOL, e.g. NSE:SBIN (got {symbol!r})")
     return exchange.upper(), tradingsymbol
+
+
+def _product(req: PlaceOrder, exchange: str, default: str) -> str:
+    if req.product == Product.INTRADAY:
+        return "MIS"
+    if req.product == Product.DELIVERY:
+        return "NRML" if exchange in ("NFO", "BFO", "MCX", "CDS") else "CNC"
+    return default
 
 
 def parse_ticks(frame: bytes) -> list[tuple[int, float]]:
@@ -77,7 +85,10 @@ def parse_ticks(frame: bytes) -> list[tuple[int, float]]:
 
 def _order_from_kite(data: dict) -> Order:
     """Build an Order from an orders() row or a WebSocket order update (same fields)."""
-    order_type = OrderType.LIMIT if data.get("order_type") == "LIMIT" else OrderType.MARKET
+    try:
+        order_type = OrderType(data.get("order_type"))
+    except ValueError:
+        order_type = OrderType.MARKET
     return Order(
         id=str(data["order_id"]),
         client_order_id=data.get("tag") or None,
@@ -85,7 +96,8 @@ def _order_from_kite(data: dict) -> Order:
         side=Side.BUY if data.get("transaction_type") == "BUY" else Side.SELL,
         quantity=int(data.get("quantity", 0)),
         order_type=order_type,
-        limit_price=data.get("price") if order_type == OrderType.LIMIT else None,
+        limit_price=data.get("price") if order_type in (OrderType.LIMIT, OrderType.SL) else None,
+        trigger_price=data.get("trigger_price") if order_type in (OrderType.SL, OrderType.SL_M) else None,
         status=KITE_STATUS.get(data.get("status"), OrderStatus.OPEN),
         filled_quantity=int(data.get("filled_quantity") or 0),
         filled_price=data.get("average_price") or None,
@@ -224,16 +236,18 @@ class ZerodhaBroker(Broker):
             tradingsymbol=tradingsymbol,
             transaction_type=req.side.value,
             quantity=req.quantity,
-            product=self.product,
+            product=_product(req, exchange, self.product),
             order_type=req.order_type.value,
             validity="DAY",
         )
         if req.client_order_id:
             params["tag"] = req.client_order_id
-        if req.order_type == OrderType.LIMIT:
+        if req.order_type in (OrderType.LIMIT, OrderType.SL):
             params["price"] = req.limit_price
         else:
             params["market_protection"] = -1  # let Kite apply its automatic price band
+        if req.order_type in (OrderType.SL, OrderType.SL_M):
+            params["trigger_price"] = req.trigger_price
 
         order = Order(
             client_order_id=req.client_order_id,
@@ -242,6 +256,8 @@ class ZerodhaBroker(Broker):
             quantity=req.quantity,
             order_type=req.order_type,
             limit_price=req.limit_price,
+            trigger_price=req.trigger_price,
+            product=req.product,
         )
         try:
             order.id = str(await asyncio.to_thread(self._kite.place_order, **params))

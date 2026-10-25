@@ -260,3 +260,29 @@ def test_apps_share_the_accounts_zerodha_broker(client, monkeypatch):
                           "quantity": 1})
         msgs = [orders.receive_json(), orders.receive_json()]
         assert {m["type"] for m in msgs} == {"order_update", "ack"}
+
+
+def test_stop_orders_and_product_map_to_kite():
+    from app.brokers.zerodha import _order_from_kite
+    from app.orders.schemas import Product
+
+    async def run():
+        broker, kite, _ = make_broker()
+        await broker.place_order(PlaceOrder(
+            action="place_order", symbol="NFO:NIFTY26NOVFUT", side=Side.SELL, quantity=75,
+            order_type=OrderType.SL_M, trigger_price=25388.0, product=Product.DELIVERY,
+        ))
+        await broker.place_order(PlaceOrder(
+            action="place_order", symbol="NSE:SBIN", side=Side.BUY, quantity=1,
+            order_type=OrderType.SL, trigger_price=810.0, limit_price=812.0, product=Product.DELIVERY,
+        ))
+        slm, sl = kite.placed
+        assert (slm["order_type"], slm["trigger_price"], slm["product"]) == ("SL-M", 25388.0, "NRML")
+        assert "price" not in slm
+        assert (sl["order_type"], sl["trigger_price"], sl["price"], sl["product"]) == ("SL", 810.0, 812.0, "CNC")
+
+    asyncio.run(run())
+    order = _order_from_kite({"order_id": "1", "exchange": "NSE", "tradingsymbol": "SBIN", "transaction_type": "BUY",
+                              "quantity": 1, "order_type": "SL", "price": 812.0, "trigger_price": 810.0,
+                              "status": "TRIGGER PENDING"})
+    assert (order.order_type, order.limit_price, order.trigger_price) == (OrderType.SL, 812.0, 810.0)

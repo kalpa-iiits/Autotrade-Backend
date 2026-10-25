@@ -239,7 +239,9 @@ def test_live_mode_places_orders_and_tracks_fills(deploy, monkeypatch):
     # The orders went through the normal pipeline: history and the trades ledger.
     history = quiet.get("/api/accounts/1/orders/history", headers=AUTH).json()
     assert {o["id"] for o in history} == {s["order_id"] for s in placed}
-    assert quiet.get("/api/trades/closed", headers=AUTH).json()["totals"]["count"] == 1
+    assert {o["strategy"] for o in history} == {inst["label"]}  # attributed to the strategy
+    closed = quiet.get("/api/trades/closed", headers=AUTH).json()
+    assert closed["totals"]["count"] == 1 and closed["positions"][0]["strategy"] == inst["label"]
 
 
 def test_live_rejection_is_recorded(deploy, monkeypatch):

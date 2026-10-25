@@ -24,6 +24,7 @@ class OrderRecord(Base):
     quantity: Mapped[int] = mapped_column(Integer)
     order_type: Mapped[str] = mapped_column(String(16))
     limit_price: Mapped[Decimal | None] = mapped_column(Money, nullable=True)
+    trigger_price: Mapped[Decimal | None] = mapped_column(Money, nullable=True)  # SL / SL-M
     status: Mapped[str] = mapped_column(String(16))
     filled_quantity: Mapped[int] = mapped_column(Integer, default=0)
     filled_price: Mapped[Decimal | None] = mapped_column(Money, nullable=True)

@@ -16,6 +16,14 @@ class Side(str, Enum):
 class OrderType(str, Enum):
     MARKET = "MARKET"
     LIMIT = "LIMIT"
+    SL = "SL"  # stop-limit: at trigger_price it becomes a LIMIT order at limit_price
+    SL_M = "SL-M"  # stop-market: at trigger_price it becomes a MARKET order
+
+
+class Product(str, Enum):
+    """Per order; missing means the account's default product (its options)."""
+    INTRADAY = "INTRADAY"  # squared off by the broker the same day (Fyers INTRADAY, Kite MIS)
+    DELIVERY = "DELIVERY"  # held overnight (Fyers CNC/MARGIN, Kite CNC/NRML)
 
 
 class OrderStatus(str, Enum):
@@ -57,6 +65,8 @@ class Order(BaseModel):
     quantity: int
     order_type: OrderType
     limit_price: float | None = None
+    trigger_price: float | None = None  # SL / SL-M only
+    product: Product | None = None
     status: OrderStatus = OrderStatus.OPEN
     filled_quantity: int = 0  # cumulative; fills are derived from changes in this
     filled_price: float | None = None  # average price of the filled quantity
@@ -82,14 +92,22 @@ class PlaceOrder(BaseModel):
     quantity: int = Field(gt=0)
     order_type: OrderType = OrderType.MARKET
     limit_price: float | None = Field(default=None, gt=0)
+    trigger_price: float | None = Field(default=None, gt=0)
+    product: Product | None = None
     # Optional; send the same one when retrying so a lost reply can't place a second order.
     # Missing: the server makes one up (still sent to the broker as the order's tag).
     client_order_id: str | None = Field(default=None, pattern=CLIENT_ORDER_ID_PATTERN)
 
     @model_validator(mode="after")
-    def _check_limit_price(self):
-        if self.order_type == OrderType.LIMIT and self.limit_price is None:
-            raise ValueError("limit_price is required for LIMIT orders")
+    def _check_prices(self):
+        if self.order_type in (OrderType.LIMIT, OrderType.SL) and self.limit_price is None:
+            raise ValueError(f"limit_price is required for {self.order_type.value} orders")
+        if self.order_type in (OrderType.SL, OrderType.SL_M) and self.trigger_price is None:
+            raise ValueError(f"trigger_price is required for {self.order_type.value} orders")
+        if self.order_type in (OrderType.MARKET, OrderType.LIMIT):
+            self.trigger_price = None
+        if self.order_type in (OrderType.MARKET, OrderType.SL_M):
+            self.limit_price = None
         return self
 
 
