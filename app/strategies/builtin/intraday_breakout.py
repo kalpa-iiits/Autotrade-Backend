@@ -38,6 +38,40 @@ class IntradayBreakout(Strategy):
         "the average daily range, intraday only (square-off at 15:15)."
     )
     timeframes = ("1m", "3m", "5m", "10m", "15m")  # intraday; longer bars leave too few per day
+    tags = ("Intraday", "Breakout", "Long & short", "Trailing stop")
+
+    @classmethod
+    def rules(cls, p: "IntradayBreakout.Params") -> list[dict]:
+        n, rng = p.lookback, f"avg daily range ({p.avg_days} days)"
+        width = f"; skipped if that high-low range is wider than {p.max_width:g} × {rng}" if p.max_width else ""
+        cap = f"At most {p.max_trades_per_day} entries a day" if p.max_trades_per_day else "No daily entry cap"
+        return [
+            {"kind": "filter", "title": "When it trades", "conditions": [
+                f"New entries only between {p.entries_from:%H:%M} and {p.entries_until:%H:%M} IST",
+                f"Levels are armed at each candle close from the last {n} of today's candles{width}",
+                "Levels live for one candle; whichever side breaks first is traded and the other dropped",
+                cap,
+            ]},
+            {"kind": "entry_long", "title": "Buy", "conditions": [
+                f"Price trades above the highest high of the last {n} candles",
+                "Position is flat",
+            ]},
+            {"kind": "entry_short", "title": "Sell short", "conditions": [
+                f"Price trades below the lowest low of the last {n} candles",
+                "Position is flat",
+            ]},
+            {"kind": "risk", "title": "Stop-loss", "conditions": [
+                f"Initial stop {p.stop_k:g} × {rng} from the entry price",
+                (f"Trails {p.trail_k:g} × {rng} behind the best price since entry, checked on every tick"
+                 if p.trail_k else "No trailing stop"),
+                "No profit target",
+            ]},
+            {"kind": "exit", "title": "Exit", "conditions": [
+                "Stop (initial or trailing) is hit",
+                f"Everything is squared off at {p.square_off:%H:%M} IST: never holds overnight",
+                "After a stop-out, the next breakout is taken again (up to the daily cap)",
+            ]},
+        ]
 
     class Params(BaseModel):
         lookback: int = Field(5, ge=2, description="Breakout lookback (1-minute candles)")

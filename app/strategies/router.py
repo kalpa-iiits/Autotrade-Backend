@@ -7,11 +7,11 @@ accounts, each with its own symbol and timeframe, change those while an instance
 start/stop them, and see their signals. Users only ever see and touch their own instances.
 """
 
-from datetime import datetime, timedelta
+from datetime import date, datetime, timedelta
 from zoneinfo import ZoneInfo
 
 from fastapi import APIRouter, Depends, HTTPException, Query, Request, status
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, Field, TypeAdapter
 from sqlalchemy import select
 
 from app.accounts import store
@@ -20,6 +20,9 @@ from app.auth.dependencies import require_user
 from app.auth.models import User
 from app.brokers import OrderError
 from app.core import db
+from app.core.http import broker_errors, broker_or_503
+from app.strategies.backtest import DEFAULT_CAPITAL, Backtester, BacktestError, Run
+from app.strategies.deployment import Deployment
 from app.strategies.models import StrategyInstance, StrategySignal
 from app.strategies.runner import StrategyError, StrategyRunner, signal_dict
 
@@ -132,6 +135,90 @@ async def list_strategies(request: Request, include_hidden: bool = False, accoun
         ],
         "strategies": [_instance_dict(r, runner) for r in rows],
     }
+
+
+# ---------- catalog: each strategy's page (description, rules, performance) ----------
+
+
+def _catalog_dict(dep: Deployment) -> dict:
+    strategy, values = dep.strategy, dep.params.model_dump(mode="json")
+    params = [
+        {"name": name, "title": f.title or name.replace("_", " ").capitalize(), "description": f.description,
+         "value": values.get(name), "default": f.get_default(call_default_factory=True)}
+        for name, f in strategy.Params.model_fields.items()
+    ]
+    for p in params:
+        p["default"] = TypeAdapter(object).dump_python(p["default"], mode="json")
+    return {
+        "key": dep.key, "label": dep.label or dep.key, "strategy": strategy.name,
+        "description": strategy.description, "tags": list(strategy.tags),
+        "rules": strategy.rules(dep.params), "params": params,
+        "mode": dep.mode, "default_symbol": dep.symbol, "default_timeframe": dep.timeframe,
+        "timeframes": list(strategy.timeframes),
+        **{k: v for k, v in dep.settings().items() if k in
+           ("quantity", "max_order_qty", "max_position", "max_orders_per_day")},
+    }
+
+
+def _deployment(runner: StrategyRunner, key: str) -> Deployment:
+    dep = runner.deployments.get(key)
+    if dep is None:
+        raise HTTPException(status.HTTP_404_NOT_FOUND, f"No strategy {key!r}")
+    return dep
+
+
+async def _backtest(request: Request, user: User, key: str, account_id: int, symbol: str, timeframe: str,
+                    start: date | None, end: date | None) -> Run:
+    runner = _runner(request)
+    dep = _deployment(runner, key)
+    if not owns(user, await store.get_account(account_id)):
+        raise HTTPException(status.HTTP_404_NOT_FOUND, "No such broker account")
+    _check_timeframe(runner, key, timeframe)
+    service = runner.service(account_id)
+    if service is None:
+        raise HTTPException(status.HTTP_503_SERVICE_UNAVAILABLE, "Broker account not available")
+    broker = broker_or_503(service)
+    async with broker_errors():
+        try:
+            start, end = Backtester.check_range(start, end)
+            return await runner.backtester.run(account_id, broker, dep, symbol.strip(), timeframe, start, end)
+        except BacktestError as e:
+            raise HTTPException(status.HTTP_422_UNPROCESSABLE_ENTITY, str(e))
+
+
+@router.get("/catalog")
+async def list_catalog(request: Request, user: User = Depends(require_user)):
+    """Every strategy defined in code, with its description, rules and settings."""
+    return [_catalog_dict(d) for d in _runner(request).deployments.values()]
+
+
+@router.get("/catalog/{key}")
+async def get_catalog(request: Request, key: str, user: User = Depends(require_user)):
+    return _catalog_dict(_deployment(_runner(request), key))
+
+
+@router.get("/catalog/{key}/performance")
+async def performance(request: Request, key: str, account_id: int, symbol: str = Query(min_length=1),
+                      timeframe: str = Query(), start: date | None = None, end: date | None = None,
+                      capital: float = Query(DEFAULT_CAPITAL, gt=0), user: User = Depends(require_user)):
+    """Strategy tester: backtest on one timeframe over a date range (default: the last 3 months)
+    of the account's broker history. Summary for all / long / short trades, every simulated
+    trade with its run-up and drawdown, and buy & hold for comparison. Cached for the IST day."""
+    run = await _backtest(request, user, key, account_id, symbol, timeframe, start, end)
+    return run.report(capital)
+
+
+@router.get("/catalog/{key}/performance/matrix")
+async def performance_matrix(request: Request, key: str, account_id: int, symbol: str = Query(min_length=1),
+                             start: date | None = None, end: date | None = None,
+                             capital: float = Query(DEFAULT_CAPITAL, gt=0), user: User = Depends(require_user)):
+    """The same range on every timeframe the strategy supports: summaries only."""
+    dep = _deployment(_runner(request), key)
+    out = {}
+    for tf in dep.strategy.timeframes:
+        run = await _backtest(request, user, key, account_id, symbol, tf, start, end)
+        out[tf] = run.report(capital)["summary"]["all"]
+    return {"symbol": symbol.strip(), "timeframes": out}
 
 
 @router.post("", status_code=status.HTTP_201_CREATED)

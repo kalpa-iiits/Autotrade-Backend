@@ -11,6 +11,34 @@ class SmaCrossover(Strategy):
         "Buys when the fast moving average of bar closes crosses above the slow one and exits "
         "when it crosses back below. With allow_short, also sells short on the downward cross."
     )
+    tags = ("Trend following", "Moving averages", "Any timeframe")
+
+    @classmethod
+    def rules(cls, p: "SmaCrossover.Params") -> list[dict]:
+        fast, slow = f"SMA({p.fast})", f"SMA({p.slow})"
+        rules = [
+            {"kind": "filter", "title": "Warm-up", "conditions": [
+                f"Waits for {p.slow} completed bars before the first signal (indicators start empty)",
+                "Signals are checked once per bar, at the bar's close",
+            ]},
+            {"kind": "entry_long", "title": "Buy", "conditions": [
+                f"{fast} of closes crosses above {slow}: was at or below on the previous bar, above now",
+                "Position is flat (a short is covered first)",
+            ]},
+            {"kind": "exit", "title": "Exit long", "conditions": [
+                f"{fast} crosses back below {slow}",
+            ]},
+        ]
+        if p.allow_short:
+            rules.insert(2, {"kind": "entry_short", "title": "Sell short", "conditions": [
+                f"{fast} crosses below {slow}, after any long is closed",
+            ]})
+            rules.append({"kind": "exit", "title": "Cover short", "conditions": [f"{fast} crosses back above {slow}"]})
+        rules.append({"kind": "risk", "title": "Risk", "conditions": [
+            "No stop-loss or target: the opposite cross is the only exit",
+            "Holds overnight if no cross happens (not intraday-only)",
+        ]})
+        return rules
 
     class Params(BaseModel):
         fast: int = Field(9, ge=1, description="Fast moving average length, in bars")

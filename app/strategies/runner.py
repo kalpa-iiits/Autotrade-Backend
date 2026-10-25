@@ -35,6 +35,7 @@ from app.core.config import Settings
 from app.core.db import utcnow
 from app.orders.models import OrderRecord
 from app.orders.schemas import Order, OrderStatus, OrderType, PlaceOrder, Side
+from app.strategies.backtest import Backtester
 from app.strategies.base import TIMEFRAMES, Strategy, Tick
 from app.strategies.deployment import Deployment
 from app.strategies.models import StrategyInstance, StrategySignal
@@ -169,6 +170,7 @@ class StrategyRunner:
         self.settings = settings
         self.running: dict[int, RunningInstance] = {}
         self.deployments: dict[str, Deployment] = {}
+        self.backtester = Backtester()  # the strategy pages' performance reports
         # (account id, order id) -> instance that placed it. Order ids are only unique per account.
         self._order_owner: dict[tuple[int, str], int] = {}
         # Order updates can arrive before place_order returns (and we learn the id).

@@ -84,6 +84,15 @@ class BarBuilder:
 class Strategy(ABC):
     name: ClassVar[str]
     description: ClassVar[str] = ""
+    # Short labels for the strategy's page and list, e.g. ("Intraday", "Breakout").
+    tags: ClassVar[tuple[str, ...]] = ()
+
+    @classmethod
+    def rules(cls, params: BaseModel) -> list[dict]:
+        """Its trigger conditions in plain words, with these params filled in, for the strategy's
+        page: [{"kind": "entry_long" | "entry_short" | "exit" | "risk" | "filter",
+        "title": str, "conditions": [str, ...]}]."""
+        return []
 
     class Params(BaseModel):
         """Override with the strategy's settings; validated when the deployment is loaded."""

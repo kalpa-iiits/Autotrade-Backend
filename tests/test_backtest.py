@@ -1,0 +1,113 @@
+import asyncio
+from datetime import datetime, timedelta, timezone
+from zoneinfo import ZoneInfo
+
+from pydantic import BaseModel
+
+from app.brokers.base import Candle
+from app.strategies.backtest import Simulation, summarize
+from app.strategies.base import Bar, Strategy
+from app.strategies.builtin.sma_crossover import SmaCrossover
+from app.strategies.deployment import Deployment
+from tests.test_strategies import AUTH, SYM, deploy  # noqa: F401  (fixture)
+from tests.conftest import ACCOUNT
+
+IST = ZoneInfo("Asia/Kolkata")
+
+
+class EveryBar(Strategy):
+    """Test strategy: long on even bars, flat on odd ones."""
+    name = "test_every_bar"
+
+    class Params(BaseModel):
+        pass
+
+    async def on_start(self) -> None:
+        self.n = 0
+
+    async def on_bar(self, bar: Bar) -> None:
+        self.n += 1
+        if self.ctx.position == 0:
+            await self.ctx.buy(reason="even")
+        else:
+            await self.ctx.exit(reason="odd")
+
+
+def candles(closes, start=datetime(2026, 10, 20, 4, 0, tzinfo=timezone.utc)):
+    return [Candle(start + timedelta(minutes=i), c, c, c, c) for i, c in enumerate(closes)]
+
+
+def simulate(strategy=EveryBar, closes=(100, 101, 102, 103, 104, 105), **dep_fields):
+    dep = Deployment(**{"key": "t", "strategy": strategy, "symbol": SYM, "quantity": 2} | dep_fields)
+    sim = Simulation(dep, SYM, "1m", daily=[])
+    asyncio.run(sim.run(candles(closes)))
+    return sim
+
+
+def test_fills_at_the_triggering_price_and_closes_at_the_end():
+    sim = simulate()
+    # Each bar closes when the next minute's first tick arrives: the order fills at that price.
+    assert [(t.entry_price, t.exit_price, t.quantity) for t in sim.trades] == [
+        (101, 102, 2), (103, 104, 2), (105, 105, 2)]
+    assert sim.trades[-1].exit_reason == "end of backtest"
+    assert sim.position == 0
+
+
+def test_risk_limits_apply_but_never_block_exits():
+    sim = simulate(closes=range(100, 120), max_orders_per_day=3)
+    assert len(sim.trades) == 2  # buy, sell, buy (3 orders), then the exit at the end
+    assert sim.blocked > 0
+
+
+def test_summary():
+    sim = simulate(closes=(100, 101, 103, 104, 101))
+    s = summarize(sim.trades, capital=1000)
+    # Trades: 101 -> 103 (+4), 104 -> 101 (-6)
+    assert (s["trades"], s["wins"], s["losses"], s["net_pnl"]) == (2, 1, 1, -2)
+    assert s["win_rate"] == 50 and s["net_pnl_pct"] == -0.2
+    assert s["max_drawdown"] == 6 and s["max_drawdown_pct"] == round(6 / 1004 * 100, 2)
+    assert s["profit_factor"] == round(4 / 6, 2)
+
+
+def test_trade_excursions():
+    # Long at the second candle's open (101); that candle dips to 95 and spikes to 110.
+    c = candles((100, 101, 101, 101))
+    c[1] = Candle(c[1].start, 101, 110, 95, 101)
+    dep = Deployment(key="t", strategy=EveryBar, symbol=SYM, quantity=2)
+    sim = Simulation(dep, SYM, "1m", daily=[])
+    asyncio.run(sim.run(c))
+    first = sim.trades[0]
+    assert (first.entry_price, first.run_up, first.drawdown) == (101, 18, 12)
+
+
+def test_catalog_and_performance(deploy):
+    c = deploy(Deployment(key="sma", strategy=SmaCrossover, symbol=SYM, quantity=1,
+                          params={"fast": 3, "slow": 8, "allow_short": True}))
+    [item] = c.get("/api/strategies/catalog", headers=AUTH).json()
+    assert item["key"] == "sma" and item["tags"]
+    assert {r["kind"] for r in item["rules"]} >= {"entry_long", "entry_short", "exit"}
+    assert {p["name"]: p["value"] for p in item["params"]} == {"fast": 3, "slow": 8, "allow_short": True}
+    assert c.get("/api/strategies/catalog/nope", headers=AUTH).status_code == 404
+
+    today = datetime.now(IST).date()
+    q = f"account_id={ACCOUNT}&symbol={SYM}&start={today - timedelta(days=30)}&end={today}"
+    r = c.get(f"/api/strategies/catalog/sma/performance?{q}&timeframe=15m&capital=100000", headers=AUTH)
+    assert r.status_code == 200, r.text
+    body = r.json()
+    s = body["summary"]
+    assert s["all"]["trades"] == len(body["trades"]) == s["long"]["trades"] + s["short"]["trades"] > 0
+    assert body["trades"][-1]["cum_pnl"] == s["all"]["net_pnl"]
+    assert body["capital"] == 100000 and body["buy_hold"][0]["pnl"] == 0
+    assert all(t["entry_at"] >= body["start"] for t in body["trades"])
+
+    m = c.get(f"/api/strategies/catalog/sma/performance/matrix?{q}&capital=100000", headers=AUTH).json()
+    assert set(m["timeframes"]) == set(item["timeframes"])
+    assert m["timeframes"]["15m"] == s["all"]
+
+    def status(query):
+        return c.get(f"/api/strategies/catalog/sma/performance?{query}", headers=AUTH).status_code
+
+    assert status(f"account_id={ACCOUNT}&symbol=NSE:NOPE&timeframe=1m") == 422
+    assert status(f"account_id={ACCOUNT}&symbol={SYM}&timeframe=1m&start={today}&end={today - timedelta(days=1)}") == 422
+    assert status(f"account_id={ACCOUNT}&symbol={SYM}&timeframe=1m&start={today - timedelta(days=900)}") == 422
+    assert status(f"account_id=999&symbol={SYM}&timeframe=1m") == 404
