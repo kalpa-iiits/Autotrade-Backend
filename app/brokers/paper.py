@@ -22,6 +22,7 @@ SEED_PRICES = {
     "NSE:INFY-EQ": 1850.0,
     "NSE:HDFCBANK-EQ": 1700.0,
     "NSE:SBIN-EQ": 820.0,
+    "NSE:NIFTY50-INDEX": 25800.0,  # for backtests; an index, so the live brokers won't take orders on it
 }
 
 

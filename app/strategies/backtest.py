@@ -4,12 +4,13 @@ the way the runner runs it in signal mode, and report how it would have done.
 The broker only gives daily and 1-minute candles, so every timeframe is replayed from
 1-minute candles: each one becomes four ticks (open, then low and high in the order the candle
 most likely took, then close), which the strategy's own BarBuilder groups into its bars, as it
-does with live ticks. Fills are at the price of the tick that asked for them; the same risk
-limits as the runner apply (max_position, max_order_qty, max_orders_per_day; exits are never
-blocked). Charges and slippage are not modelled.
+does with live ticks. Fills are at the price of the tick that asked for them. Charges and
+slippage are not modelled.
 
-A test covers a date range (up to MAX_RANGE_DAYS) and starting capital. Capital only scales
-the percentages: trade size is the deployment's quantity, as in live trading.
+A test covers a date range (up to MAX_RANGE_DAYS) and starting capital. Trades are sized from
+the capital like TradingView's "% of equity" order size: each entry buys as many units as
+`size_pct` of the current equity (capital plus closed P&L) pays for, so results compound. The
+deployment's max_orders_per_day still applies; its fixed quantity and position limits don't.
 """
 
 import asyncio
@@ -24,14 +25,15 @@ from app.strategies.base import TIMEFRAMES, Tick
 from app.strategies.deployment import Deployment
 
 IST = ZoneInfo("Asia/Kolkata")
-DEFAULT_DAYS = 91  # range when none is given: the last 3 months
+DEFAULT_DAYS = 365  # range when none is given: the last year
 MAX_RANGE_DAYS = 730
 DEFAULT_CAPITAL = 500_000.0
+DEFAULT_SIZE_PCT = 100.0
 CHUNK_DAYS = 55  # 1-minute history per broker request (Kite allows 60, Fyers 100)
 ASSUMPTIONS = [
     "Replayed from 1-minute candles: each candle is four ticks (open, low/high, close)",
     "Market fills at the triggering price; no brokerage, taxes or slippage",
-    "Same size and risk limits as the deployment (quantity, max position, orders per day)",
+    "Each entry is sized at the order size % of current equity (compounding); orders per day as deployed",
     "A position still open at the end is closed at the last price",
 ]
 
@@ -131,6 +133,8 @@ class Simulation:
     symbol: str
     timeframe: str
     daily: list[Candle]
+    capital: float = DEFAULT_CAPITAL
+    size_pct: float = DEFAULT_SIZE_PCT
     position: int = 0
     last_price: float | None = None
     now: datetime = field(default_factory=lambda: datetime.now(timezone.utc))
@@ -141,23 +145,32 @@ class Simulation:
     _orders_count: int = 0
 
     def __post_init__(self) -> None:
-        s = self.deployment.settings()
-        self.quantity = s["quantity"]
-        self.max_order_qty, self.max_position = s["max_order_qty"], s["max_position"]
-        self.max_orders_per_day = s["max_orders_per_day"]
+        self.max_orders_per_day = self.deployment.settings()["max_orders_per_day"]
+        self.realized = 0.0
+
+    @property
+    def quantity(self) -> int:
+        """Units `size_pct` of the current equity buys at the last price (what buy() and sell() use)."""
+        if not self.last_price:
+            return 0
+        return max(0, int((self.capital + self.realized) * self.size_pct / 100 // self.last_price))
 
     # ---------- orders ----------
 
     def request(self, delta: int, reason: str | None) -> None:
-        """Buy (delta > 0) or sell (< 0) at the last price, if the runner's limits allow it."""
-        if delta == 0 or self.last_price is None:
+        """Buy (delta > 0) or sell (< 0) at the last price. Exits always go through; new
+        exposure needs the equity to pay for it and must stay within orders per day."""
+        if self.last_price is None:
+            return
+        if delta == 0:  # buy() / sell() when the equity can't pay for a single unit
+            self.blocked += 1
             return
         new = self.position + delta
         reduces_only = abs(new) < abs(self.position) and new * self.position >= 0
         day = self.now.astimezone(IST).date()
         if day != self._orders_day:
             self._orders_day, self._orders_count = day, 0
-        if not reduces_only and (abs(delta) > self.max_order_qty or abs(new) > self.max_position
+        if not reduces_only and (abs(new) > max(self.quantity, abs(self.position))
                                  or self._orders_count >= self.max_orders_per_day):
             self.blocked += 1
             return
@@ -177,6 +190,7 @@ class Simulation:
                 t.exit_at, t.exit_price, t.exit_reason = self.now, price, reason
                 self.trades.append(t)
                 self._open = None
+            self.realized += self.trades[-1].pnl
         self.position += delta
         if self.position and self._open is None:
             self._open = SimTrade("LONG" if self.position > 0 else "SHORT", abs(self.position),
@@ -279,11 +293,12 @@ def trade_rows(trades: list[SimTrade]) -> list[dict]:
 
 @dataclass
 class Run:
-    """One simulation over a range; reports for any capital are made from it."""
+    """One simulation over a range, with its capital and order size."""
     deployment_key: str
     symbol: str
     timeframe: str
-    quantity: int
+    capital: float
+    size_pct: float
     start: date
     end: date
     candles: int
@@ -293,14 +308,15 @@ class Run:
     trades: list[SimTrade]
     closes: list[tuple[datetime, float]]  # last price of each day, for buy & hold
 
-    def report(self, capital: float) -> dict:
+    def report(self) -> dict:
+        capital = self.capital
         longs = [t for t in self.trades if t.long]
         shorts = [t for t in self.trades if not t.long]
         first = self.closes[0][1] if self.closes else None
         units = capital / first if first else 0
         return {
             "deployment_key": self.deployment_key, "symbol": self.symbol, "timeframe": self.timeframe,
-            "quantity": self.quantity, "capital": capital,
+            "capital": capital, "size_pct": self.size_pct,
             "start": self.start.isoformat(), "end": self.end.isoformat(),
             "data_from": self.data_from.isoformat(), "data_to": self.data_to.isoformat(),
             "candles": self.candles, "blocked_signals": self.blocked, "assumptions": ASSUMPTIONS,
@@ -371,9 +387,9 @@ class Backtester:
         return start, end
 
     async def run(self, account_id: int, broker: Broker, dep: Deployment, symbol: str, timeframe: str,
-                  start: date, end: date) -> Run:
+                  start: date, end: date, capital: float = DEFAULT_CAPITAL, size_pct: float = DEFAULT_SIZE_PCT) -> Run:
         today = datetime.now(IST).date()
-        key = (account_id, dep.key, repr(dep.settings()), symbol, timeframe, start, end, today)
+        key = (account_id, dep.key, repr(dep.settings()), symbol, timeframe, start, end, capital, size_pct, today)
         if key in self._results:
             self._results.move_to_end(key)
             return self._results[key]
@@ -384,7 +400,7 @@ class Backtester:
         try:
             async with self._lock:
                 history = await self._history(account_id, broker, symbol, today, start)
-                result = await asyncio.to_thread(_run_sync, dep, symbol, timeframe, history, start, end)
+                result = await asyncio.to_thread(_run_sync, dep, symbol, timeframe, history, start, end, capital, size_pct)
             self._results[key] = result
             while len(self._results) > self.max_results:
                 self._results.popitem(last=False)
@@ -417,14 +433,15 @@ class Backtester:
         return h
 
 
-def _run_sync(dep: Deployment, symbol: str, timeframe: str, history: History, start: date, end: date) -> Run:
+def _run_sync(dep: Deployment, symbol: str, timeframe: str, history: History, start: date, end: date,
+              capital: float, size_pct: float) -> Run:
     candles = [c for c in history.minutes if start <= c.start.astimezone(IST).date() <= end]
     if not candles:
         raise BacktestError(f"No 1-minute history for {symbol} between {start} and {end}")
-    sim = Simulation(dep, symbol, timeframe, history.daily)
+    sim = Simulation(dep, symbol, timeframe, history.daily, capital, size_pct)
     asyncio.run(sim.run(candles))
     closes: dict[date, tuple[datetime, float]] = {}
     for c in candles:
         closes[c.start.astimezone(IST).date()] = (c.start, c.close)
-    return Run(dep.key, symbol, timeframe, sim.quantity, start, end, len(candles), candles[0].start,
+    return Run(dep.key, symbol, timeframe, capital, size_pct, start, end, len(candles), candles[0].start,
                candles[-1].start, sim.blocked, sim.trades, list(closes.values()))

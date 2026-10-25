@@ -21,7 +21,7 @@ from app.auth.models import User
 from app.brokers import OrderError
 from app.core import db
 from app.core.http import broker_errors, broker_or_503
-from app.strategies.backtest import DEFAULT_CAPITAL, Backtester, BacktestError, Run
+from app.strategies.backtest import DEFAULT_CAPITAL, DEFAULT_SIZE_PCT, Backtester, BacktestError, Run
 from app.strategies.deployment import Deployment
 from app.strategies.models import StrategyInstance, StrategySignal
 from app.strategies.runner import StrategyError, StrategyRunner, signal_dict
@@ -168,7 +168,7 @@ def _deployment(runner: StrategyRunner, key: str) -> Deployment:
 
 
 async def _backtest(request: Request, user: User, key: str, account_id: int, symbol: str, timeframe: str,
-                    start: date | None, end: date | None) -> Run:
+                    start: date | None, end: date | None, capital: float, size_pct: float) -> Run:
     runner = _runner(request)
     dep = _deployment(runner, key)
     if not owns(user, await store.get_account(account_id)):
@@ -181,7 +181,8 @@ async def _backtest(request: Request, user: User, key: str, account_id: int, sym
     async with broker_errors():
         try:
             start, end = Backtester.check_range(start, end)
-            return await runner.backtester.run(account_id, broker, dep, symbol.strip(), timeframe, start, end)
+            return await runner.backtester.run(account_id, broker, dep, symbol.strip(), timeframe, start, end,
+                                               capital, size_pct)
         except BacktestError as e:
             raise HTTPException(status.HTTP_422_UNPROCESSABLE_ENTITY, str(e))
 
@@ -200,24 +201,29 @@ async def get_catalog(request: Request, key: str, user: User = Depends(require_u
 @router.get("/catalog/{key}/performance")
 async def performance(request: Request, key: str, account_id: int, symbol: str = Query(min_length=1),
                       timeframe: str = Query(), start: date | None = None, end: date | None = None,
-                      capital: float = Query(DEFAULT_CAPITAL, gt=0), user: User = Depends(require_user)):
-    """Strategy tester: backtest on one timeframe over a date range (default: the last 3 months)
-    of the account's broker history. Summary for all / long / short trades, every simulated
-    trade with its run-up and drawdown, and buy & hold for comparison. Cached for the IST day."""
-    run = await _backtest(request, user, key, account_id, symbol, timeframe, start, end)
-    return run.report(capital)
+                      capital: float = Query(DEFAULT_CAPITAL, gt=0),
+                      size_pct: float = Query(DEFAULT_SIZE_PCT, gt=0, le=100, description="Order size, % of equity"),
+                      user: User = Depends(require_user)):
+    """Strategy tester: backtest on one timeframe over a date range (default: the last year) of
+    the account's broker history, each trade sized at `size_pct` of the equity. Summary for all /
+    long / short trades, every simulated trade with its run-up and drawdown, and buy & hold for
+    comparison. Cached for the IST day."""
+    run = await _backtest(request, user, key, account_id, symbol, timeframe, start, end, capital, size_pct)
+    return run.report()
 
 
 @router.get("/catalog/{key}/performance/matrix")
 async def performance_matrix(request: Request, key: str, account_id: int, symbol: str = Query(min_length=1),
                              start: date | None = None, end: date | None = None,
-                             capital: float = Query(DEFAULT_CAPITAL, gt=0), user: User = Depends(require_user)):
+                             capital: float = Query(DEFAULT_CAPITAL, gt=0),
+                             size_pct: float = Query(DEFAULT_SIZE_PCT, gt=0, le=100),
+                             user: User = Depends(require_user)):
     """The same range on every timeframe the strategy supports: summaries only."""
     dep = _deployment(_runner(request), key)
     out = {}
     for tf in dep.strategy.timeframes:
-        run = await _backtest(request, user, key, account_id, symbol, tf, start, end)
-        out[tf] = run.report(capital)["summary"]["all"]
+        run = await _backtest(request, user, key, account_id, symbol, tf, start, end, capital, size_pct)
+        out[tf] = run.report()["summary"]["all"]
     return {"symbol": symbol.strip(), "timeframes": out}
 
 

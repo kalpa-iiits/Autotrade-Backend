@@ -37,9 +37,10 @@ def candles(closes, start=datetime(2026, 10, 20, 4, 0, tzinfo=timezone.utc)):
     return [Candle(start + timedelta(minutes=i), c, c, c, c) for i, c in enumerate(closes)]
 
 
-def simulate(strategy=EveryBar, closes=(100, 101, 102, 103, 104, 105), **dep_fields):
-    dep = Deployment(**{"key": "t", "strategy": strategy, "symbol": SYM, "quantity": 2} | dep_fields)
-    sim = Simulation(dep, SYM, "1m", daily=[])
+def simulate(strategy=EveryBar, closes=(100, 101, 102, 103, 104, 105), capital=250, size_pct=100, **dep_fields):
+    """₹250 at ~₹100 a unit: 2 units a trade."""
+    dep = Deployment(**{"key": "t", "strategy": strategy, "symbol": SYM, "quantity": 1} | dep_fields)
+    sim = Simulation(dep, SYM, "1m", daily=[], capital=capital, size_pct=size_pct)
     asyncio.run(sim.run(candles(closes)))
     return sim
 
@@ -51,6 +52,16 @@ def test_fills_at_the_triggering_price_and_closes_at_the_end():
         (101, 102, 2), (103, 104, 2), (105, 105, 2)]
     assert sim.trades[-1].exit_reason == "end of backtest"
     assert sim.position == 0
+
+
+def test_size_comes_from_equity_and_compounds():
+    sim = simulate(closes=(100, 100, 200, 100, 100), capital=1000)
+    # 1000 buys 10 at 100; sold at 200 (+1000). The next entry at 100 has 2000: 20 units.
+    assert [t.quantity for t in sim.trades][:2] == [10, 20]
+    half = simulate(closes=(100, 100, 200, 200), capital=1000, size_pct=50)
+    assert half.trades[0].quantity == 5
+    broke = simulate(capital=50)  # can't pay for one unit
+    assert broke.trades == [] and broke.blocked > 0
 
 
 def test_risk_limits_apply_but_never_block_exits():
@@ -73,8 +84,8 @@ def test_trade_excursions():
     # Long at the second candle's open (101); that candle dips to 95 and spikes to 110.
     c = candles((100, 101, 101, 101))
     c[1] = Candle(c[1].start, 101, 110, 95, 101)
-    dep = Deployment(key="t", strategy=EveryBar, symbol=SYM, quantity=2)
-    sim = Simulation(dep, SYM, "1m", daily=[])
+    dep = Deployment(key="t", strategy=EveryBar, symbol=SYM, quantity=1)
+    sim = Simulation(dep, SYM, "1m", daily=[], capital=250)
     asyncio.run(sim.run(c))
     first = sim.trades[0]
     assert (first.entry_price, first.run_up, first.drawdown) == (101, 18, 12)
@@ -97,7 +108,9 @@ def test_catalog_and_performance(deploy):
     s = body["summary"]
     assert s["all"]["trades"] == len(body["trades"]) == s["long"]["trades"] + s["short"]["trades"] > 0
     assert body["trades"][-1]["cum_pnl"] == s["all"]["net_pnl"]
-    assert body["capital"] == 100000 and body["buy_hold"][0]["pnl"] == 0
+    assert body["capital"] == 100000 and body["size_pct"] == 100 and body["buy_hold"][0]["pnl"] == 0
+    # Sized from the capital, not the deployment's quantity of 1.
+    assert body["trades"][0]["quantity"] == int(100000 // body["trades"][0]["entry_price"])
     assert all(t["entry_at"] >= body["start"] for t in body["trades"])
 
     m = c.get(f"/api/strategies/catalog/sma/performance/matrix?{q}&capital=100000", headers=AUTH).json()
