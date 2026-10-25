@@ -1,17 +1,18 @@
 from datetime import datetime
+from decimal import Decimal
 
 from sqlalchemy import JSON, Float, ForeignKey, Index, Integer, String, UniqueConstraint
 from sqlalchemy.orm import Mapped, mapped_column
 
-from app.core.db import Base, UTCDateTime, utcnow
+from app.core.db import Base, Money, UTCDateTime, utcnow
 
 
 class StrategyInstance(Base):
     """One run of a deployment from app/strategies/deployments.py on one broker account,
     symbol and timeframe.
 
-    Account, symbol and timeframe are chosen in the app by the account's owner. Everything else
-    (strategy, params, size, limits, mode) is copied from code at startup. Status and history
+    Account, symbol, timeframe and position sizing are chosen in the app by the account's owner.
+    Everything else (strategy, params, default size, limits, mode) is copied from code at startup. Status and history
     live here.
     """
 
@@ -34,6 +35,12 @@ class StrategyInstance(Base):
     # stopped / running / error / removed (deployment no longer in code) / archived (removed in app)
     status: Mapped[str] = mapped_column(String(8), default="stopped")
     quantity: Mapped[int] = mapped_column(Integer)  # default size of buy()/sell()
+    # Position sizing, chosen by the user: "fixed" trades `fixed_quantity` units (None = the
+    # code's quantity); "capital" buys as many units as `capital_per_trade` pays for at entry.
+    # Either way max_order_qty and max_position (from code) cap it.
+    size_mode: Mapped[str] = mapped_column(String(8), default="fixed", server_default="fixed")
+    fixed_quantity: Mapped[int | None] = mapped_column(Integer, nullable=True)
+    capital_per_trade: Mapped[Decimal | None] = mapped_column(Money, nullable=True)
     max_order_qty: Mapped[int] = mapped_column(Integer)
     max_position: Mapped[int] = mapped_column(Integer)  # absolute net quantity
     max_orders_per_day: Mapped[int] = mapped_column(Integer)

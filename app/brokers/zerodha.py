@@ -133,7 +133,7 @@ class ZerodhaBroker(Broker):
         self._symbol_of: dict[int, str] = {}
         self._subscribed: set[int] = set()
         self._instrument_cache: tuple[date, list[Instrument]] | None = None
-        self._tick_cache: dict[str, tuple[date, dict[str, float]]] = {}  # exchange -> symbol -> tick
+        self._spec_cache: dict[str, tuple[date, dict[str, tuple[float, int]]]] = {}  # exchange -> symbol -> (tick, lot)
 
     # ---------- lifecycle ----------
 
@@ -255,21 +255,29 @@ class ZerodhaBroker(Broker):
         self._instrument_cache = today, instruments
         return instruments
 
-    async def get_tick_size(self, symbol: str) -> float | None:
+    async def _symbol_spec(self, symbol: str) -> tuple[float, int] | None:
         exchange, tradingsymbol = split_symbol(symbol)
         today = datetime.now().date()
-        cached = self._tick_cache.get(exchange)
+        cached = self._spec_cache.get(exchange)
         if cached is None or cached[0] != today:
             try:
                 rows = await asyncio.to_thread(self._kite.instruments, exchange)
             except KiteException as e:
-                log.warning("tick sizes for %s unavailable: %s", exchange, e)
+                log.warning("symbol details for %s unavailable: %s", exchange, e)
                 return None
-            cached = self._tick_cache[exchange] = today, {
-                str(row.get("tradingsymbol")): float(row["tick_size"])
+            cached = self._spec_cache[exchange] = today, {
+                str(row.get("tradingsymbol")): (float(row["tick_size"]), max(int(row.get("lot_size") or 1), 1))
                 for row in rows if row.get("tick_size")
             }
         return cached[1].get(tradingsymbol)
+
+    async def get_tick_size(self, symbol: str) -> float | None:
+        spec = await self._symbol_spec(symbol)
+        return spec[0] if spec else None
+
+    async def get_lot_size(self, symbol: str) -> int | None:
+        spec = await self._symbol_spec(symbol)
+        return spec[1] if spec else None
 
     # ---------- orders ----------
 

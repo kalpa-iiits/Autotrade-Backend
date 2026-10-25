@@ -18,9 +18,11 @@ from app.strategies.builtin.sma_crossover import SmaCrossover
 from app.strategies.deployment import Deployment
 
 DEPLOYMENTS: list[Deployment] = [
-    # Intraday breakout (ported from the TradingView script). Live trading uses one futures
-    # lot (65), while Strategy Tester sizes entries from its selected capital and equity
-    # percentage. The user chooses the instrument and timeframe for each instance in the app.
+    # Intraday breakout (ported from the TradingView script). By default an instance trades one
+    # futures lot (65); users can pick another fixed quantity or capital per trade in the app,
+    # up to 5,000 units per order and position (room for capital sizing on stocks, e.g. ₹5L of
+    # a ₹100 share). Strategy Tester sizes entries from its own capital / order-size settings.
+    # The user chooses the instrument and timeframe for each instance in the app.
     # 8 trades/day = up to 16 orders plus square-off, so the order cap is 20.
     Deployment(
         key="nifty-1m-breakout",
@@ -33,7 +35,8 @@ DEPLOYMENTS: list[Deployment] = [
             entries_from="10:30", entries_until="14:45", square_off="15:15",
         ),
         quantity=65,
-        max_position=65,
+        max_order_qty=5_000,
+        max_position=5_000,
         max_orders_per_day=20,
         mode="signal",
         # The reference TradingView report has commission overridden to zero: its trade-level

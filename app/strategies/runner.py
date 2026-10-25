@@ -23,6 +23,7 @@ import asyncio
 import logging
 from collections import OrderedDict
 from datetime import date, datetime, time
+from decimal import Decimal
 from typing import TYPE_CHECKING
 from zoneinfo import ZoneInfo
 
@@ -67,6 +68,20 @@ def signal_dict(s: StrategySignal) -> dict:
     }
 
 
+def sized_quantity(config: StrategyInstance, price: float | None, lot: int = 1) -> int:
+    """Units per trade under the instance's sizing: its fixed quantity (default: the code's),
+    or as many whole lots as `capital_per_trade` pays for at `price`. Never above the code's
+    max_order_qty / max_position. 0 when capital sizing has no price yet or can't pay for a lot."""
+    if config.size_mode == "capital":
+        if not config.capital_per_trade or not price or price <= 0:
+            return 0
+        units = int(Decimal(config.capital_per_trade) / Decimal(str(price)))
+        units -= units % max(lot, 1)
+    else:
+        units = config.fixed_quantity or config.quantity
+    return max(0, min(units, config.max_order_qty, config.max_position))
+
+
 class StrategyContext:
     """What a running strategy can see and do."""
 
@@ -93,14 +108,22 @@ class StrategyContext:
 
     @property
     def quantity(self) -> int:
-        """The instance's configured trade size."""
-        return self._inst.config.quantity
+        """The instance's trade size at the last price (see sized_quantity)."""
+        return sized_quantity(self._inst.config, self._inst.last_price, self._inst.lot_size)
 
     async def buy(self, quantity: int | None = None, reason: str | None = None) -> None:
-        await self._runner.request(self._inst, Side.BUY, quantity or self.quantity, reason)
+        await self._runner.request(self._inst, Side.BUY, quantity or self._sized(reason), reason)
 
     async def sell(self, quantity: int | None = None, reason: str | None = None) -> None:
-        await self._runner.request(self._inst, Side.SELL, quantity or self.quantity, reason)
+        await self._runner.request(self._inst, Side.SELL, quantity or self._sized(reason), reason)
+
+    def _sized(self, reason: str | None) -> int:
+        quantity = self.quantity
+        cfg = self._inst.config
+        if quantity == 0 and cfg.size_mode == "capital":
+            self.log(f"skipped ({reason or 'entry'}): ₹{cfg.capital_per_trade} per trade doesn't buy one lot "
+                     f"of {self.symbol} at {self._inst.last_price}")
+        return quantity
 
     async def exit(self, reason: str | None = None) -> None:
         """Flatten the position."""
@@ -134,6 +157,7 @@ class RunningInstance:
         self.strategy: Strategy | None = None
         self.position = 0
         self.last_price: float | None = None
+        self.lot_size = 1  # the instrument's trading lot, for capital sizing
         self.pending_order_id: str | None = None
         self.filled: dict[str, int] = {}  # order id -> filled qty already counted
         self._orders_day = _today_ist()
@@ -250,6 +274,8 @@ class StrategyRunner:
             raise StrategyError("Its broker account is not available (deleted?)")
 
         inst = RunningInstance(config, self.settings.strategy_queue_size)
+        if config.size_mode == "capital" and service.broker is not None:
+            inst.lot_size = await service.broker.get_lot_size(config.symbol) or 1
         inst.position, inst.filled, inst.pending_order_id = await self._load_position(config)
         inst.orders_today = await self._orders_today(instance_id)
         inst.strategy = dep.strategy(dep.params, StrategyContext(self, inst), TIMEFRAMES[config.timeframe])

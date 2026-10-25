@@ -34,8 +34,8 @@ FYERS_NSE_MASTER = "https://public.fyers.in/sym_details/NSE_CM.csv"
 FYERS_NSE_FO_MASTER = "https://public.fyers.in/sym_details/NSE_FO.csv"
 _nse_instruments: tuple[date, list[Instrument]] | None = None
 _nse_instruments_lock = asyncio.Lock()
-_tick_sizes: dict[str, tuple[date, dict[str, float]]] = {}  # master URL -> (day, symbol -> tick)
-_tick_sizes_lock = asyncio.Lock()
+_specs: dict[str, tuple[date, dict[str, tuple[float, int]]]] = {}  # master URL -> (day, symbol -> (tick, lot))
+_specs_lock = asyncio.Lock()
 
 # Fyers numeric codes -> our enums.
 FYERS_STATUS = {
@@ -69,19 +69,20 @@ def parse_nse_instruments(text: str) -> list[Instrument]:
     return sorted(instruments.values(), key=lambda item: (item.kind != "index", item.ticker))
 
 
-def parse_tick_sizes(text: str) -> dict[str, float]:
-    """Symbol -> minimum price step from a FYERS symbol master (column 4 is the tick size)."""
-    ticks: dict[str, float] = {}
+def parse_symbol_specs(text: str) -> dict[str, tuple[float, int]]:
+    """Symbol -> (minimum price step, lot size) from a FYERS symbol master (columns 4 and 3).
+    Indexes list a lot of 0: they trade in units of 1."""
+    specs: dict[str, tuple[float, int]] = {}
     for row in csv.reader(io.StringIO(text)):
         if len(row) < 10:
             continue
         try:
-            tick = float(row[4])
+            tick, lot = float(row[4]), int(float(row[3]))
         except ValueError:
             continue
         if tick > 0:
-            ticks[row[9].strip()] = tick
-    return ticks
+            specs[row[9].strip()] = tick, max(lot, 1)
+    return specs
 
 
 async def _download_master(url: str) -> str:
@@ -109,18 +110,29 @@ async def _load_nse_instruments() -> list[Instrument]:
         return instruments
 
 
-async def _load_tick_sizes(url: str) -> dict[str, float]:
+async def _load_specs(url: str) -> dict[str, tuple[float, int]]:
     today = datetime.now(timezone.utc).date()
-    cached = _tick_sizes.get(url)
+    cached = _specs.get(url)
     if cached is not None and cached[0] == today:
         return cached[1]
-    async with _tick_sizes_lock:
-        cached = _tick_sizes.get(url)
+    async with _specs_lock:
+        cached = _specs.get(url)
         if cached is not None and cached[0] == today:
             return cached[1]
-        ticks = parse_tick_sizes(await _download_master(url))
-        _tick_sizes[url] = today, ticks
-        return ticks
+        specs = parse_symbol_specs(await _download_master(url))
+        _specs[url] = today, specs
+        return specs
+
+
+async def _symbol_spec(symbol: str) -> tuple[float, int] | None:
+    if not symbol.startswith("NSE:"):
+        return None
+    url = FYERS_NSE_FO_MASTER if _is_derivative(symbol) else FYERS_NSE_MASTER
+    try:
+        return (await _load_specs(url)).get(symbol)
+    except RuntimeError as e:
+        log.warning("symbol details for %s unavailable: %s", symbol, e)
+        return None
 
 
 def _is_derivative(symbol: str) -> bool:
@@ -328,14 +340,12 @@ class FyersBroker(Broker):
         return await _load_nse_instruments()
 
     async def get_tick_size(self, symbol: str) -> float | None:
-        if not symbol.startswith("NSE:"):
-            return None
-        url = FYERS_NSE_FO_MASTER if _is_derivative(symbol) else FYERS_NSE_MASTER
-        try:
-            return (await _load_tick_sizes(url)).get(symbol)
-        except RuntimeError as e:
-            log.warning("tick size for %s unavailable: %s", symbol, e)
-            return None
+        spec = await _symbol_spec(symbol)
+        return spec[0] if spec else None
+
+    async def get_lot_size(self, symbol: str) -> int | None:
+        spec = await _symbol_spec(symbol)
+        return spec[1] if spec else None
 
     # ---------- orders ----------
 

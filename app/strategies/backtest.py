@@ -29,11 +29,12 @@ DEFAULT_DAYS = 365  # range when none is given: the last year
 MAX_RANGE_DAYS = 730
 DEFAULT_CAPITAL = 500_000.0
 DEFAULT_SIZE_PCT = 100.0
+DEPLOYMENT_SIZE = -1  # fixed_quantity default: the deployment's backtest_fixed_quantity (None = % sizing)
 CHUNK_DAYS = 55  # 1-minute history per broker request (Kite allows 60, Fyers 100)
 ASSUMPTIONS = [
     "Replayed from 1-minute candles: each candle is four ticks (open, low/high, close)",
     "Market fills at the triggering price; deployment-configured commission is included; taxes and slippage are not",
-    "Entries use the deployment's fixed backtest quantity when configured, otherwise the order size % of equity",
+    "Entries use the chosen fixed quantity, or the order size % of equity",
     "A position still open at the end is closed at the last price",
 ]
 
@@ -167,6 +168,7 @@ class Simulation:
     capital: float = DEFAULT_CAPITAL
     size_pct: float = DEFAULT_SIZE_PCT
     tick_size: float | None = None
+    fixed_quantity: int | None = DEPLOYMENT_SIZE  # units per entry; None sizes from `size_pct` of equity
     position: int = 0
     last_price: float | None = None
     now: datetime = field(default_factory=lambda: datetime.now(timezone.utc))
@@ -180,12 +182,15 @@ class Simulation:
         self.max_orders_per_day = self.deployment.settings()["max_orders_per_day"]
         self.commission_per_unit = self.deployment.backtest_commission_per_unit
         self.realized = 0.0
+        if self.fixed_quantity == DEPLOYMENT_SIZE:
+            self.fixed_quantity = self.deployment.backtest_fixed_quantity
 
     @property
     def quantity(self) -> int:
-        """Units `size_pct` of the current equity buys at the last price (what buy() and sell() use)."""
-        if self.deployment.backtest_fixed_quantity is not None:
-            return self.deployment.backtest_fixed_quantity
+        """The fixed quantity, or units `size_pct` of the current equity buys at the last price
+        (what buy() and sell() use)."""
+        if self.fixed_quantity is not None:
+            return self.fixed_quantity
         if not self.last_price:
             return 0
         return max(0, int((self.capital + self.realized) * self.size_pct / 100 // self.last_price))
@@ -482,11 +487,15 @@ class Backtester:
         return start, end
 
     async def run(self, account_id: int, broker: Broker, dep: Deployment, symbol: str, timeframe: str,
-                  start: date, end: date, capital: float = DEFAULT_CAPITAL, size_pct: float = DEFAULT_SIZE_PCT) -> Run:
+                  start: date, end: date, capital: float = DEFAULT_CAPITAL, size_pct: float = DEFAULT_SIZE_PCT,
+                  fixed_quantity: int | None = DEPLOYMENT_SIZE) -> Run:
+        """`fixed_quantity` units per entry, or None to size from `size_pct` of equity
+        (default: the deployment's backtest_fixed_quantity)."""
         today = datetime.now(IST).date()
-        backtest_settings = (dep.backtest_fixed_quantity, dep.backtest_commission_per_unit)
-        key = (account_id, dep.key, repr(dep.settings()), backtest_settings,
-               symbol, timeframe, start, end, capital, size_pct, today)
+        if fixed_quantity == DEPLOYMENT_SIZE:
+            fixed_quantity = dep.backtest_fixed_quantity
+        key = (account_id, dep.key, repr(dep.settings()), dep.backtest_commission_per_unit,
+               symbol, timeframe, start, end, capital, size_pct, fixed_quantity, today)
         if key in self._results:
             self._results.move_to_end(key)
             return self._results[key]
@@ -497,7 +506,8 @@ class Backtester:
         try:
             async with self._lock:
                 history = await self._history(account_id, broker, symbol, today, start)
-                result = await asyncio.to_thread(_run_sync, dep, symbol, timeframe, history, start, end, capital, size_pct)
+                result = await asyncio.to_thread(_run_sync, dep, symbol, timeframe, history, start, end, capital, size_pct,
+                                                 fixed_quantity)
             self._results[key] = result
             while len(self._results) > self.max_results:
                 self._results.popitem(last=False)
@@ -531,15 +541,15 @@ class Backtester:
 
 
 def _run_sync(dep: Deployment, symbol: str, timeframe: str, history: History, start: date, end: date,
-              capital: float, size_pct: float) -> Run:
+              capital: float, size_pct: float, fixed_quantity: int | None = DEPLOYMENT_SIZE) -> Run:
     candles = [c for c in history.minutes if start <= c.start.astimezone(IST).date() <= end]
     if not candles:
         raise BacktestError(f"No 1-minute history for {symbol} between {start} and {end}")
-    sim = Simulation(dep, symbol, timeframe, history.daily, capital, size_pct, history.tick_size)
+    sim = Simulation(dep, symbol, timeframe, history.daily, capital, size_pct, history.tick_size, fixed_quantity)
     asyncio.run(sim.run(candles))
     closes: dict[date, tuple[datetime, float]] = {}
     for c in candles:
         closes[c.start.astimezone(IST).date()] = (c.start, c.close)
     return Run(dep.key, symbol, timeframe, capital, size_pct, start, end, len(candles), candles[0].start,
                candles[-1].start, sim.blocked, sim.trades, list(closes.values()),
-               dep.backtest_fixed_quantity, dep.backtest_commission_per_unit)
+               sim.fixed_quantity, dep.backtest_commission_per_unit)

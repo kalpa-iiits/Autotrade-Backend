@@ -8,6 +8,8 @@ start/stop them, and see their signals. Users only ever see and touch their own 
 """
 
 from datetime import date, datetime, timedelta
+from decimal import Decimal
+from typing import Literal
 from zoneinfo import ZoneInfo
 
 from fastapi import APIRouter, Depends, HTTPException, Query, Request, status
@@ -21,27 +23,51 @@ from app.auth.models import User
 from app.brokers import OrderError
 from app.core import db
 from app.core.http import broker_errors, broker_or_503
-from app.strategies.backtest import DEFAULT_CAPITAL, DEFAULT_SIZE_PCT, Backtester, BacktestError, Run
+from app.strategies.backtest import DEFAULT_CAPITAL, DEFAULT_SIZE_PCT, DEPLOYMENT_SIZE, Backtester, BacktestError, Run
 from app.strategies.deployment import Deployment
 from app.strategies.instruments import search_instruments
 from app.strategies.models import StrategyInstance, StrategySignal
-from app.strategies.runner import StrategyError, StrategyRunner, signal_dict
+from app.strategies.runner import StrategyError, StrategyRunner, signal_dict, sized_quantity
 
 router = APIRouter(prefix="/strategies", tags=["strategies"])
 IST = ZoneInfo("Asia/Kolkata")
 HIDDEN = ("archived", "removed")
 
 
-class InstanceCreate(BaseModel):
+class Sizing(BaseModel):
+    """Position sizing: `fixed_quantity` units per trade (None = the strategy's default), or
+    `capital_per_trade` rupees' worth at entry. The strategy's code limits cap both."""
+    size_mode: Literal["fixed", "capital"] | None = None
+    fixed_quantity: int | None = Field(default=None, gt=0)
+    capital_per_trade: Decimal | None = Field(default=None, gt=0, max_digits=14, decimal_places=2)
+
+
+class InstanceCreate(Sizing):
     deployment_key: str
     account_id: int
     symbol: str = Field(min_length=1, max_length=64)
     timeframe: str
 
 
-class InstanceUpdate(BaseModel):
+class InstanceUpdate(Sizing):
     symbol: str | None = Field(default=None, min_length=1, max_length=64)
     timeframe: str | None = None
+
+
+def _sizing(body: Sizing, current: StrategyInstance | None, limits: dict) -> dict:
+    """The sizing columns after applying `body` to `current` (None: a new instance), checked
+    against the strategy's limits."""
+    mode = body.size_mode or (current.size_mode if current else "fixed")
+    fields = body.model_fields_set
+    fixed = body.fixed_quantity if "fixed_quantity" in fields else (current.fixed_quantity if current else None)
+    capital = body.capital_per_trade if "capital_per_trade" in fields else (current.capital_per_trade if current else None)
+    cap = min(limits["max_order_qty"], limits["max_position"])
+    if mode == "fixed" and fixed is not None and fixed > cap:
+        raise HTTPException(status.HTTP_422_UNPROCESSABLE_ENTITY,
+                            f"This strategy allows at most {cap} units per trade")
+    if mode == "capital" and not capital:
+        raise HTTPException(status.HTTP_422_UNPROCESSABLE_ENTITY, "Capital sizing needs an amount per trade")
+    return {"size_mode": mode, "fixed_quantity": fixed, "capital_per_trade": capital}
 
 
 def _runner(request: Request) -> StrategyRunner:
@@ -58,6 +84,11 @@ def _instance_dict(row: StrategyInstance, runner: StrategyRunner) -> dict:
         "timeframes": list(dep.strategy.timeframes) if dep else [],
         "params": row.params, "mode": row.mode, "status": row.status,
         "quantity": row.quantity, "max_order_qty": row.max_order_qty,
+        "size_mode": row.size_mode, "fixed_quantity": row.fixed_quantity,
+        "capital_per_trade": float(row.capital_per_trade) if row.capital_per_trade is not None else None,
+        # Units the next entry would trade at the last price (None while it has no price).
+        "sized_quantity": (sized_quantity(row, live.last_price if live else None, live.lot_size if live else 1)
+                           if row.size_mode != "capital" or (live and live.last_price) else None),
         "max_position": row.max_position, "max_orders_per_day": row.max_orders_per_day,
         "last_error": row.last_error,
         "position": live.position if live else None,
@@ -172,12 +203,16 @@ def _deployment(runner: StrategyRunner, key: str) -> Deployment:
 
 
 async def _backtest(request: Request, user: User, key: str, account_id: int, symbol: str, timeframe: str,
-                    start: date | None, end: date | None, capital: float, size_pct: float) -> Run:
+                    start: date | None, end: date | None, capital: float, size_pct: float,
+                    size_mode: str | None = None, quantity: int | None = None) -> Run:
     runner = _runner(request)
     dep = _deployment(runner, key)
     if not owns(user, await store.get_account(account_id)):
         raise HTTPException(status.HTTP_404_NOT_FOUND, "No such broker account")
     _check_timeframe(runner, key, timeframe)
+    if size_mode == "fixed" and not quantity:
+        raise HTTPException(status.HTTP_422_UNPROCESSABLE_ENTITY, "A fixed order size needs a quantity")
+    fixed = quantity if size_mode == "fixed" else None if size_mode == "pct" else DEPLOYMENT_SIZE
     service = runner.service(account_id)
     if service is None:
         raise HTTPException(status.HTTP_503_SERVICE_UNAVAILABLE, "Broker account not available")
@@ -186,7 +221,7 @@ async def _backtest(request: Request, user: User, key: str, account_id: int, sym
         try:
             start, end = Backtester.check_range(start, end)
             return await runner.backtester.run(account_id, broker, dep, symbol.strip(), timeframe, start, end,
-                                               capital, size_pct)
+                                               capital, size_pct, fixed)
         except BacktestError as e:
             raise HTTPException(status.HTTP_422_UNPROCESSABLE_ENTITY, str(e))
 
@@ -222,12 +257,16 @@ async def performance(request: Request, key: str, account_id: int, symbol: str =
                       timeframe: str = Query(), start: date | None = None, end: date | None = None,
                       capital: float = Query(DEFAULT_CAPITAL, gt=0),
                       size_pct: float = Query(DEFAULT_SIZE_PCT, gt=0, le=100, description="Order size, % of equity"),
+                      size_mode: Literal["pct", "fixed"] | None = Query(
+                          None, description="pct: size_pct of equity; fixed: `quantity` units (default: the strategy's)"),
+                      quantity: int | None = Query(None, gt=0, description="Units per entry when size_mode=fixed"),
                       user: User = Depends(require_user)):
     """Strategy tester: backtest on one timeframe over a date range (default: the last year) of
-    the account's broker history. Trades use `size_pct` of equity unless the deployment defines
-    a fixed tester quantity. Summary for all / long / short trades, every simulated trade with
+    the account's broker history. Entries use a fixed `quantity` or `size_pct` of equity
+    (`size_mode`; by default the deployment's fixed tester quantity, if it has one). Summary for all / long / short trades, every simulated trade with
     its run-up and drawdown, and buy & hold for comparison. Cached for the IST day."""
-    run = await _backtest(request, user, key, account_id, symbol, timeframe, start, end, capital, size_pct)
+    run = await _backtest(request, user, key, account_id, symbol, timeframe, start, end, capital, size_pct,
+                          size_mode, quantity)
     return run.report()
 
 
@@ -236,12 +275,15 @@ async def performance_matrix(request: Request, key: str, account_id: int, symbol
                              start: date | None = None, end: date | None = None,
                              capital: float = Query(DEFAULT_CAPITAL, gt=0),
                              size_pct: float = Query(DEFAULT_SIZE_PCT, gt=0, le=100),
+                             size_mode: Literal["pct", "fixed"] | None = None,
+                             quantity: int | None = Query(None, gt=0),
                              user: User = Depends(require_user)):
     """The same range on every timeframe the strategy supports: summaries only."""
     dep = _deployment(_runner(request), key)
     out = {}
     for tf in dep.strategy.timeframes:
-        run = await _backtest(request, user, key, account_id, symbol, tf, start, end, capital, size_pct)
+        run = await _backtest(request, user, key, account_id, symbol, tf, start, end, capital, size_pct,
+                              size_mode, quantity)
         out[tf] = run.report()["summary"]["all"]
     return {"symbol": symbol.strip(), "timeframes": out}
 
@@ -262,13 +304,16 @@ async def add_instance(request: Request, body: InstanceCreate, user: User = Depe
         raise HTTPException(status.HTTP_409_CONFLICT,
                             f"{body.deployment_key} already runs on {symbol} {body.timeframe} (#{existing.id})")
     dep = runner.deployments[body.deployment_key]
+    sizing = _sizing(body, None, dep.settings())
     async with db.session() as s, s.begin():
         if existing is not None:  # bring the archived one back, with its history
             row = await s.get(StrategyInstance, existing.id)
             row.status, row.last_error = "stopped", None
+            for k, v in sizing.items():
+                setattr(row, k, v)
         else:
             row = StrategyInstance(account_id=body.account_id, deployment_key=dep.key, symbol=symbol,
-                                   timeframe=body.timeframe, status="stopped", **dep.settings())
+                                   timeframe=body.timeframe, status="stopped", **dep.settings(), **sizing)
             s.add(row)
     return _instance_dict(row, runner) | {"warning": warning}
 
@@ -287,7 +332,7 @@ async def get_instance(request: Request, instance_id: int, user: User = Depends(
 @router.patch("/{instance_id}")
 async def update_instance(request: Request, instance_id: int, body: InstanceUpdate,
                           user: User = Depends(require_user)):
-    """Change an instance's symbol and/or timeframe. It must be stopped."""
+    """Change an instance's symbol, timeframe and/or position sizing. It must be stopped."""
     runner = _runner(request)
     row = await _get(instance_id, user)
     if instance_id in runner.running:
@@ -302,8 +347,11 @@ async def update_instance(request: Request, instance_id: int, body: InstanceUpda
     if other is not None:
         raise HTTPException(status.HTTP_409_CONFLICT,
                             f"Instance #{other.id} ({other.status}) already uses {symbol} {timeframe}")
+    sizing = _sizing(body, row, {"max_order_qty": row.max_order_qty, "max_position": row.max_position})
     async with db.session() as s, s.begin():
         row = await s.get(StrategyInstance, instance_id)
+        for k, v in sizing.items():
+            setattr(row, k, v)
         if (row.symbol, row.timeframe) != (symbol, timeframe):
             # Its position history belongs to the old symbol: a different instrument now.
             row.symbol, row.timeframe, row.last_error = symbol, timeframe, None

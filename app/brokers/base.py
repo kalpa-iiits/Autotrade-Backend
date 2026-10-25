@@ -146,6 +146,10 @@ class Broker(ABC):
         """The exchange's minimum price step for `symbol`, or None if unknown."""
         return None
 
+    async def get_lot_size(self, symbol: str) -> int | None:
+        """The exchange's trading lot for `symbol` (1 for cash equities), or None if unknown."""
+        return None
+
     async def get_history(
         self, symbol: str, resolution: Resolution, start: date, end: date
     ) -> list[Candle]:

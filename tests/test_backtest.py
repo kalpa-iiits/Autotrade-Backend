@@ -172,6 +172,11 @@ def test_catalog_and_performance(deploy):
     assert body["capital"] == 100000 and body["size_pct"] == 100 and body["buy_hold"][0]["pnl"] == 0
     # Sized from the capital, not the deployment's quantity of 1.
     assert body["trades"][0]["quantity"] == int(100000 // body["trades"][0]["entry_price"])
+
+    fixed = c.get(f"/api/strategies/catalog/sma/performance?{q}&timeframe=15m&size_mode=fixed&quantity=7", headers=AUTH)
+    assert fixed.status_code == 200, fixed.text
+    assert fixed.json()["fixed_quantity"] == 7 and {t["quantity"] for t in fixed.json()["trades"]} == {7}
+    assert c.get(f"/api/strategies/catalog/sma/performance?{q}&timeframe=15m&size_mode=fixed", headers=AUTH).status_code == 422
     assert all(t["entry_at"] >= body["start"] for t in body["trades"])
 
     m = c.get(f"/api/strategies/catalog/sma/performance/matrix?{q}&capital=100000", headers=AUTH).json()

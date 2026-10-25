@@ -482,3 +482,59 @@ def test_orders_per_day_starts_again_the_next_day(deploy, monkeypatch):
     tick(quiet)
     assert signals(quiet, inst["id"])[0]["outcome"] == "signal_only"
     assert instance(quiet, inst["id"])["orders_today"] == 1
+
+
+# ---------- position sizing chosen in the app ----------
+
+def test_sizing_fixed_quantity_or_capital_per_trade(deploy):
+    c = deploy(dep("a", quantity=1, max_order_qty=10, max_position=10, max_orders_per_day=20))
+    inst = by_key(c, "a")
+    assert (inst["size_mode"], inst["fixed_quantity"], inst["sized_quantity"]) == ("fixed", None, 1)  # code's quantity
+
+    def patch(**body):
+        return c.patch(f"/api/strategies/{inst['id']}", json=body, headers=AUTH)
+
+    assert patch(fixed_quantity=11).status_code == 422  # above max_order_qty
+    assert patch(size_mode="capital").status_code == 422  # needs an amount
+    assert patch(fixed_quantity=3).json()["sized_quantity"] == 3
+
+    start_strategy(c, "a")
+    SCRIPT.extend([("buy",), ("exit",)])
+    tick(c)
+    tick(c)
+    c.post(f"/api/strategies/{inst['id']}/stop", headers=AUTH)
+
+    r = patch(size_mode="capital", capital_per_trade=450)
+    assert r.status_code == 200, r.text
+    assert (r.json()["size_mode"], r.json()["capital_per_trade"], r.json()["sized_quantity"]) == ("capital", 450, None)
+    start_strategy(c, "a")
+    SCRIPT.extend([("buy",), ("exit",)])
+    tick(c, price=100.0)  # ₹450 buys 4 at 100
+    tick(c, price=100.0)
+    c.post(f"/api/strategies/{inst['id']}/stop", headers=AUTH)
+
+    r = patch(capital_per_trade=5000)
+    start_strategy(c, "a")
+    SCRIPT.extend([("buy",)])
+    tick(c, price=100.0)  # 50 units, capped at max_order_qty 10
+
+    got = [(s["side"], s["quantity"]) for s in reversed(signals(c, inst["id"]))]
+    assert got == [("BUY", 3), ("SELL", 3), ("BUY", 4), ("SELL", 4), ("BUY", 10)]
+    assert instance(c, inst["id"])["sized_quantity"] == 10
+
+
+def test_sized_quantity_rounds_to_lots_and_caps():
+    from decimal import Decimal
+
+    from app.strategies.models import StrategyInstance
+    from app.strategies.runner import sized_quantity
+
+    row = StrategyInstance(quantity=65, max_order_qty=650, max_position=650, size_mode="capital",
+                           capital_per_trade=Decimal("5000000"))
+    assert sized_quantity(row, 26000.0, lot=65) == 130  # 192 units -> 2 lots
+    assert sized_quantity(row, 26000.0, lot=1) == 192
+    assert sized_quantity(row, None) == 0
+    row.capital_per_trade = Decimal("1000000")
+    assert sized_quantity(row, 26000.0, lot=65) == 0  # can't pay for one lot
+    row.size_mode, row.fixed_quantity = "fixed", None
+    assert sized_quantity(row, 26000.0) == 65
