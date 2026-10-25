@@ -1,16 +1,16 @@
 """Backtests (the strategy tester): run a deployment's strategy over past candles from the broker,
-the way the runner runs it in signal mode, and report how it would have done.
+the way the runner runs it in signal mode, and report how it would have done. Strategy ports may
+provide a candle replay hook when their source platform has materially different bar semantics.
 
 The broker only gives daily and 1-minute candles, so every timeframe is replayed from
 1-minute candles: each one becomes four ticks (open, then low and high in the order the candle
 most likely took, then close), which the strategy's own BarBuilder groups into its bars, as it
-does with live ticks. Fills are at the price of the tick that asked for them. Charges and
-slippage are not modelled.
+does with live ticks. Generic fills are at the price of the tick that asked for them. A deployment
+may configure commission; taxes and slippage are not modelled.
 
 A test covers a date range (up to MAX_RANGE_DAYS) and starting capital. Trades are sized from
-the capital like TradingView's "% of equity" order size: each entry buys as many units as
-`size_pct` of the current equity (capital plus closed P&L) pays for, so results compound. The
-deployment's max_orders_per_day still applies; its fixed quantity and position limits don't.
+the capital like TradingView's "% of equity" order size unless the deployment specifies a fixed
+backtest quantity. The deployment's max_orders_per_day still applies; live position limits don't.
 """
 
 import asyncio
@@ -32,8 +32,8 @@ DEFAULT_SIZE_PCT = 100.0
 CHUNK_DAYS = 55  # 1-minute history per broker request (Kite allows 60, Fyers 100)
 ASSUMPTIONS = [
     "Replayed from 1-minute candles: each candle is four ticks (open, low/high, close)",
-    "Market fills at the triggering price; no brokerage, taxes or slippage",
-    "Each entry is sized at the order size % of current equity (compounding); orders per day as deployed",
+    "Market fills at the triggering price; deployment-configured commission is included; taxes and slippage are not",
+    "Entries use the deployment's fixed backtest quantity when configured, otherwise the order size % of equity",
     "A position still open at the end is closed at the last price",
 ]
 
@@ -54,6 +54,8 @@ class SimTrade:
     exit_reason: str | None = None
     high: float = 0.0  # best and worst prices while it was open
     low: float = 0.0
+    entry_fees: float = 0.0
+    exit_fees: float = 0.0
 
     def __post_init__(self) -> None:
         self.high = self.high or self.entry_price
@@ -65,7 +67,12 @@ class SimTrade:
 
     @property
     def pnl(self) -> float:
-        return (1 if self.long else -1) * (self.exit_price - self.entry_price) * self.quantity
+        gross = (1 if self.long else -1) * (self.exit_price - self.entry_price) * self.quantity
+        return gross - self.entry_fees - self.exit_fees
+
+    @property
+    def commission(self) -> float:
+        return self.entry_fees + self.exit_fees
 
     @property
     def run_up(self) -> float:
@@ -104,6 +111,10 @@ class BacktestContext:
     def quantity(self) -> int:
         return self._sim.quantity
 
+    @property
+    def average_entry_price(self) -> float | None:
+        return self._sim._open.entry_price if self._sim._open else None
+
     async def buy(self, quantity: int | None = None, reason: str | None = None) -> None:
         self._sim.request(quantity or self.quantity, reason)
 
@@ -113,6 +124,21 @@ class BacktestContext:
     async def exit(self, reason: str | None = None) -> None:
         if self.position:
             self._sim.request(-self.position, reason)
+
+    # Exact-price helpers are intentionally backtest-only. A strategy port can use them to
+    # emulate resting stop orders from its source platform without changing live execution.
+    async def buy_at(self, price: float, at: datetime, reason: str | None = None) -> None:
+        self._sim.request_at(self.quantity, price, at, reason)
+
+    async def sell_at(self, price: float, at: datetime, reason: str | None = None) -> None:
+        self._sim.request_at(-self.quantity, price, at, reason)
+
+    async def exit_at(self, price: float, at: datetime, reason: str | None = None) -> None:
+        if self.position:
+            self._sim.request_at(-self.position, price, at, reason)
+
+    def mark(self, price: float, at: datetime) -> None:
+        self._sim.mark(price, at)
 
     async def history(self, resolution: str = "D", days: int = 30) -> list:
         """Daily candles before the simulated day (never the day itself: its high and low
@@ -146,11 +172,14 @@ class Simulation:
 
     def __post_init__(self) -> None:
         self.max_orders_per_day = self.deployment.settings()["max_orders_per_day"]
+        self.commission_per_unit = self.deployment.backtest_commission_per_unit
         self.realized = 0.0
 
     @property
     def quantity(self) -> int:
         """Units `size_pct` of the current equity buys at the last price (what buy() and sell() use)."""
+        if self.deployment.backtest_fixed_quantity is not None:
+            return self.deployment.backtest_fixed_quantity
         if not self.last_price:
             return 0
         return max(0, int((self.capital + self.realized) * self.size_pct / 100 // self.last_price))
@@ -177,28 +206,49 @@ class Simulation:
         self._orders_count += 1
         self._fill(delta, self.last_price, reason)
 
+    def request_at(self, delta: int, price: float, at: datetime, reason: str | None) -> None:
+        """The same risk-checked request, filled at an emulated resting-order price/time."""
+        old_now, old_price = self.now, self.last_price
+        self.now, self.last_price = at, price
+        try:
+            self.request(delta, reason)
+        finally:
+            self.now, self.last_price = old_now, old_price
+
+    def mark(self, price: float, at: datetime) -> None:
+        self.now, self.last_price = at, price
+        if self._open:
+            self._open.high = max(self._open.high, price)
+            self._open.low = min(self._open.low, price)
+
     def _fill(self, delta: int, price: float, reason: str | None) -> None:
         pos = self.position
         if pos and (pos > 0) != (delta > 0):  # closes some or all of the open trade
             closing = min(abs(delta), abs(pos))
             t = self._open
             if closing < t.quantity:
+                fee_share = t.entry_fees * closing / t.quantity
                 self.trades.append(SimTrade(t.direction, closing, t.entry_at, t.entry_price, t.entry_reason,
-                                            self.now, price, reason, t.high, t.low))
+                                            self.now, price, reason, t.high, t.low, fee_share,
+                                            closing * self.commission_per_unit))
                 t.quantity -= closing
+                t.entry_fees -= fee_share
             else:
                 t.exit_at, t.exit_price, t.exit_reason = self.now, price, reason
+                t.exit_fees = closing * self.commission_per_unit
                 self.trades.append(t)
                 self._open = None
             self.realized += self.trades[-1].pnl
         self.position += delta
         if self.position and self._open is None:
             self._open = SimTrade("LONG" if self.position > 0 else "SHORT", abs(self.position),
-                                  self.now, price, reason)
+                                  self.now, price, reason,
+                                  entry_fees=abs(self.position) * self.commission_per_unit)
         elif self.position and abs(self.position) > self._open.quantity:  # added to it
             t, added = self._open, abs(self.position) - self._open.quantity
             t.entry_price = (t.entry_price * t.quantity + price * added) / abs(self.position)
             t.quantity = abs(self.position)
+            t.entry_fees += added * self.commission_per_unit
 
     # ---------- replay ----------
 
@@ -207,12 +257,16 @@ class Simulation:
         strategy = dep.strategy(dep.params, BacktestContext(self), TIMEFRAMES[self.timeframe])
         try:
             await strategy.on_start()
-            for c in candles:
-                for at, price in _ticks(c):
-                    self.now, self.last_price = at, price
-                    if t := self._open:
-                        t.high, t.low = max(t.high, price), min(t.low, price)
-                    await strategy.on_tick(Tick(self.symbol, price, at))
+            candle_replay = getattr(strategy, "on_backtest_candle", None)
+            if candle_replay is not None:
+                for c in _aggregate(candles, TIMEFRAMES[self.timeframe]):
+                    self.now, self.last_price = c.start, c.open
+                    await candle_replay(c)
+            else:
+                for c in candles:
+                    for at, price in _ticks(c):
+                        self.mark(price, at)
+                        await strategy.on_tick(Tick(self.symbol, price, at))
             await strategy.on_stop()
         except Exception as e:
             raise BacktestError(f"{dep.strategy.name} raised {type(e).__name__}: {e}") from e
@@ -227,6 +281,29 @@ def _ticks(c: Candle) -> list[tuple[datetime, float]]:
     s = c.start
     return [(s, c.open), (s + timedelta(seconds=20), first), (s + timedelta(seconds=40), second),
             (s + timedelta(seconds=59), c.close)]
+
+
+def _aggregate(candles: list[Candle], seconds: int) -> list[Candle]:
+    """Aggregate chronological 1-minute candles into epoch-aligned strategy candles."""
+    if seconds == 60:
+        return candles
+    out: list[Candle] = []
+    bucket: int | None = None
+    current: Candle | None = None
+    for c in candles:
+        next_bucket = int(c.start.timestamp()) // seconds
+        if next_bucket != bucket:
+            if current is not None:
+                out.append(current)
+            bucket = next_bucket
+            start = datetime.fromtimestamp(next_bucket * seconds, tz=c.start.tzinfo)
+            current = Candle(start, c.open, c.high, c.low, c.close)
+        else:
+            current = Candle(current.start, current.open, max(current.high, c.high),
+                             min(current.low, c.low), c.close, current.volume + c.volume)
+    if current is not None:
+        out.append(current)
+    return out
 
 
 # ---------- report ----------
@@ -244,7 +321,13 @@ def summarize(trades: list[SimTrade], capital: float = DEFAULT_CAPITAL) -> dict:
     cum = peak = drawdown = drawdown_pct = run_up = 0.0
     trough = 0.0
     streak = worst_streak = 0
-    for p in pnls:
+    for trade, p in zip(trades, pnls):
+        # TradingView measures each trade against the greatest *closed* equity seen
+        # before it opened, then adds that trade's maximum adverse excursion.
+        # It does not promote an unrealized intratrade high to the equity peak.
+        intrabar_drawdown = peak - cum + trade.drawdown + trade.commission
+        drawdown = max(drawdown, intrabar_drawdown)
+        drawdown_pct = max(drawdown_pct, intrabar_drawdown / (capital + peak) * 100)
         cum += p
         peak = max(peak, cum)
         drawdown = max(drawdown, peak - cum)
@@ -285,6 +368,7 @@ def trade_rows(trades: list[SimTrade]) -> list[dict]:
             "entry_at": t.entry_at.isoformat(), "entry_price": round(t.entry_price, 4),
             "exit_at": t.exit_at.isoformat(), "exit_price": round(t.exit_price, 4),
             "notional": _r(notional), "pnl": _r(t.pnl), "return_pct": _r(t.pnl / notional * 100) if notional else None,
+            "commission": _r(t.commission),
             "run_up": _r(t.run_up), "drawdown": _r(t.drawdown), "cum_pnl": _r(cum),
             "entry_reason": t.entry_reason, "exit_reason": t.exit_reason,
         })
@@ -307,6 +391,8 @@ class Run:
     blocked: int
     trades: list[SimTrade]
     closes: list[tuple[datetime, float]]  # last price of each day, for buy & hold
+    fixed_quantity: int | None = None
+    commission_per_unit: float = 0.0
 
     def report(self) -> dict:
         capital = self.capital
@@ -317,6 +403,8 @@ class Run:
         return {
             "deployment_key": self.deployment_key, "symbol": self.symbol, "timeframe": self.timeframe,
             "capital": capital, "size_pct": self.size_pct,
+            "fixed_quantity": self.fixed_quantity,
+            "commission_per_unit": self.commission_per_unit,
             "start": self.start.isoformat(), "end": self.end.isoformat(),
             "data_from": self.data_from.isoformat(), "data_to": self.data_to.isoformat(),
             "candles": self.candles, "blocked_signals": self.blocked, "assumptions": ASSUMPTIONS,
@@ -389,7 +477,9 @@ class Backtester:
     async def run(self, account_id: int, broker: Broker, dep: Deployment, symbol: str, timeframe: str,
                   start: date, end: date, capital: float = DEFAULT_CAPITAL, size_pct: float = DEFAULT_SIZE_PCT) -> Run:
         today = datetime.now(IST).date()
-        key = (account_id, dep.key, repr(dep.settings()), symbol, timeframe, start, end, capital, size_pct, today)
+        backtest_settings = (dep.backtest_fixed_quantity, dep.backtest_commission_per_unit)
+        key = (account_id, dep.key, repr(dep.settings()), backtest_settings,
+               symbol, timeframe, start, end, capital, size_pct, today)
         if key in self._results:
             self._results.move_to_end(key)
             return self._results[key]
@@ -444,4 +534,5 @@ def _run_sync(dep: Deployment, symbol: str, timeframe: str, history: History, st
     for c in candles:
         closes[c.start.astimezone(IST).date()] = (c.start, c.close)
     return Run(dep.key, symbol, timeframe, capital, size_pct, start, end, len(candles), candles[0].start,
-               candles[-1].start, sim.blocked, sim.trades, list(closes.values()))
+               candles[-1].start, sim.blocked, sim.trades, list(closes.values()),
+               dep.backtest_fixed_quantity, dep.backtest_commission_per_unit)

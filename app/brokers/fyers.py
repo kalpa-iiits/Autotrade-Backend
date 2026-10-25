@@ -8,7 +8,7 @@ the sockets delivered them, as with the other brokers.
 
 import asyncio
 import logging
-from datetime import date, datetime, timezone
+from datetime import date, datetime, timedelta, timezone
 from pathlib import Path
 
 from fyers_apiv3 import fyersModel
@@ -312,6 +312,19 @@ class FyersBroker(Broker):
         return {"cash": limits.get("Available Balance"), "limits": limits}
 
     async def get_history(
+        self, symbol: str, resolution: Resolution, start: date, end: date
+    ) -> list[Candle]:
+        # Fyers rejects daily/weekly/monthly history windows longer than 366 calendar days.
+        # The strategy tester asks for extra daily warm-up data, so split it transparently.
+        chunks: list[Candle] = []
+        chunk_start = start
+        while chunk_start <= end:
+            chunk_end = min(end, chunk_start + timedelta(days=365))
+            chunks.extend(await self._get_history_chunk(symbol, resolution, chunk_start, chunk_end))
+            chunk_start = chunk_end + timedelta(days=1)
+        return chunks
+
+    async def _get_history_chunk(
         self, symbol: str, resolution: Resolution, start: date, end: date
     ) -> list[Candle]:
         resp = await asyncio.to_thread(self._model.history, {

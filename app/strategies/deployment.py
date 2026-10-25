@@ -34,6 +34,11 @@ class Deployment:
     max_orders_per_day: int = 20
     label: str | None = None
     timeframe: str | None = None  # default for the first instance; None = strategy's default
+    # Optional Strategy Tester settings for ports whose source has fixed backtest properties.
+    # They do not affect live/signal execution.
+    backtest_initial_capital: float | None = None
+    backtest_fixed_quantity: int | None = None
+    backtest_commission_per_unit: float = 0.0
 
     def __post_init__(self) -> None:
         if not KEY_PATTERN.match(self.key):
@@ -46,6 +51,12 @@ class Deployment:
             value = getattr(self, name)
             if value is not None and value <= 0:
                 raise ValueError(f"{self.key}: {name} must be positive")
+        if self.backtest_initial_capital is not None and self.backtest_initial_capital <= 0:
+            raise ValueError(f"{self.key}: backtest_initial_capital must be positive")
+        if self.backtest_fixed_quantity is not None and self.backtest_fixed_quantity <= 0:
+            raise ValueError(f"{self.key}: backtest_fixed_quantity must be positive")
+        if self.backtest_commission_per_unit < 0:
+            raise ValueError(f"{self.key}: backtest_commission_per_unit cannot be negative")
         # Validate params against the strategy's Params model (dicts are converted).
         params = self.params
         if isinstance(params, dict):

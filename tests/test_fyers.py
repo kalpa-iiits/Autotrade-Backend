@@ -3,6 +3,7 @@
 import asyncio
 import threading
 import time
+from datetime import date, timedelta
 
 import pytest
 
@@ -16,6 +17,7 @@ class FakeModel:
     def __init__(self):
         self.placed = []
         self.cancel_ok = True
+        self.history_requests = []
 
     def place_order(self, data):
         self.placed.append(data)
@@ -45,6 +47,10 @@ class FakeModel:
             {"title": "Total Balance", "equityAmount": 50000.0},
             {"title": "Available Balance", "equityAmount": 42000.0},
         ]}
+
+    def history(self, data):
+        self.history_requests.append(data)
+        return {"s": "ok", "candles": []}
 
 
 class FakeSocket:
@@ -180,6 +186,21 @@ def test_ticks_subscriptions_and_account_data():
         positions = await broker.get_positions()
         assert [(p.symbol, p.quantity) for p in positions] == [("NSE:SBIN-EQ", 10)]
         assert (await broker.get_funds())["cash"] == 42000.0
+
+    asyncio.run(run())
+
+
+def test_long_history_ranges_are_chunked_for_fyers_limit():
+    async def run():
+        broker, model = make_broker()
+        assert await broker.get_history("NSE:NIFTY50-INDEX", "D", date(2023, 1, 1), date(2025, 1, 5)) == []
+        assert len(model.history_requests) == 3
+        ranges = [(date.fromisoformat(r["range_from"]), date.fromisoformat(r["range_to"]))
+                  for r in model.history_requests]
+        assert ranges[0][0] == date(2023, 1, 1) and ranges[-1][1] == date(2025, 1, 5)
+        assert all((end - start).days <= 365 for start, end in ranges)
+        assert all(ranges[i][1] + timedelta(days=1) == ranges[i + 1][0]
+                   for i in range(len(ranges) - 1))
 
     asyncio.run(run())
 

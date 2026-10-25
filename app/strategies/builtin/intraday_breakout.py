@@ -10,6 +10,8 @@ All distances are fractions of the average daily range (high - low) of the previ
 so they widen and narrow with volatility.
 
 Differences from the Pine version (which simulates resting stop orders on bar data):
+  - The built-in 1-minute Strategy Tester uses a Pine-compatible candle replay, fixed size and
+    commission. The differences below describe live/signal execution only.
   - Entries and exits are market orders sent when a tick reaches the level, so live fills
     include slippage; the stop is measured from the price of the triggering tick.
   - The stop and trail are checked on every tick instead of once per bar.
@@ -24,6 +26,7 @@ from zoneinfo import ZoneInfo
 from pydantic import BaseModel, Field, model_validator
 
 from app.brokers import OrderError
+from app.brokers.base import Candle
 from app.strategies.base import Bar, Strategy, Tick
 
 IST = ZoneInfo("Asia/Kolkata")
@@ -37,7 +40,7 @@ class IntradayBreakout(Strategy):
         "Breakout of the last N candles' high/low (built for 1m), wide trailing stop scaled to "
         "the average daily range, intraday only (square-off at 15:15)."
     )
-    timeframes = ("1m", "3m", "5m", "10m", "15m")  # intraday; longer bars leave too few per day
+    timeframes = ("1m", "3m", "5m", "10m", "15m")  # Pine-parity replay is used on the built-for 1m
     tags = ("Intraday", "Breakout", "Long & short", "Trailing stop")
 
     @classmethod
@@ -121,6 +124,110 @@ class IntradayBreakout(Strategy):
         if bar := self._bars.add(tick):
             await self.on_bar(bar)
         await self._on_price(tick.price, now)
+
+    async def on_backtest_candle(self, candle: Candle) -> None:
+        """Replay one broker candle with TradingView's bar-close strategy semantics.
+
+        Live trading deliberately reacts to real ticks. The tester, however, is compared with
+        the Pine source: its stop orders rest for the following bar, fill at their stop price
+        (or the open after a gap), and its trailing stop is recalculated only at bar close.
+        ``Simulation`` detects this hook and uses it instead of the generic four-tick replay.
+        """
+        start = candle.start.astimezone(IST)
+        if start.date() != self.day:
+            self._new_day(start.date())
+        await self._load_day_range(start)
+
+        # TradingView's default broker-emulator path: whichever extreme is nearer the open is
+        # visited first. Ties take the open -> low -> high -> close path.
+        first, second = ((candle.high, candle.low)
+                         if abs(candle.open - candle.high) < abs(candle.open - candle.low)
+                         else (candle.low, candle.high))
+        seconds = self.bar_seconds
+        # TradingView labels every historical fill with the containing bar's start time. The
+        # list order still models its assumed open/extreme/extreme/close path.
+        points = [(start, candle.open), (start, first), (start, second), (start, candle.close)]
+        entered = False
+        previous: float | None = None
+        for at, price in points:
+            # A resting stop fills while the emulator travels toward this point. Do not
+            # mark the still-open position at the later extreme: it was already closed at
+            # the stop. This matters for TradingView-style mark-to-market drawdown.
+            if self.ctx.position > 0 and self.stop is not None and price <= self.stop:
+                fill = price if previous is None else self.stop
+                self.ctx.mark(fill, at)
+                await self.ctx.exit_at(fill, at, f"stop {self.stop:.2f} hit at {fill:.2f}")
+                self.ctx.mark(price, at)
+            elif self.ctx.position < 0 and self.stop is not None and price >= self.stop:
+                fill = price if previous is None else self.stop
+                self.ctx.mark(fill, at)
+                await self.ctx.exit_at(fill, at, f"stop {self.stop:.2f} hit at {fill:.2f}")
+                self.ctx.mark(price, at)
+            else:
+                self.ctx.mark(price, at)
+
+            if self.ctx.position == 0 and self.levels is not None:
+                buy_at, sell_at, rng = self.levels
+                long_hit = price >= buy_at and (previous is None or previous < buy_at)
+                short_hit = price <= sell_at and (previous is None or previous > sell_at)
+                if long_hit or short_hit:
+                    self.levels = None  # OCA: the other entry is cancelled
+                    self.trades_today += 1
+                    self.trade_range = rng
+                    if long_hit:
+                        fill = price if previous is None else buy_at
+                        self.stop = buy_at - self.params.stop_k * rng
+                        self.best = fill
+                        await self.ctx.buy_at(fill, at, f"broke above {buy_at:.2f}; stop {self.stop:.2f}")
+                    else:
+                        fill = price if previous is None else sell_at
+                        self.stop = sell_at + self.params.stop_k * rng
+                        self.best = fill
+                        await self.ctx.sell_at(fill, at, f"broke below {sell_at:.2f}; stop {self.stop:.2f}")
+                    entered = self.ctx.position != 0
+                    self.ctx.mark(price, at)  # include the rest of this path leg in excursion
+            previous = price
+
+        self.bars_today.append(Bar(
+            self.ctx.symbol, candle.start, seconds, candle.open, candle.high, candle.low, candle.close, 4))
+        end = start + timedelta(seconds=seconds)
+        p = self.params
+        square_off = end.time() >= p.square_off
+
+        if self.ctx.position != 0:
+            long = self.ctx.position > 0
+            if square_off:
+                await self.ctx.exit_at(candle.close, points[-1][0], f"square-off at {p.square_off:%H:%M}")
+                self._clear_trade()
+                self.levels = None
+                return
+            if entered:
+                # On its first calculation after the fill Pine replaces the pre-placed stop
+                # (which was based on the breakout level) with one based on the actual fill.
+                entry = self.ctx.average_entry_price
+                self.stop = entry - p.stop_k * self.trade_range if long else entry + p.stop_k * self.trade_range
+                self.best = candle.high if long else candle.low
+            else:
+                self.best = max(self.best, candle.high) if long else min(self.best, candle.low)
+            if p.trail_k > 0:
+                trail = self.best - p.trail_k * self.trade_range if long else self.best + p.trail_k * self.trade_range
+                self.stop = max(self.stop, trail) if long else min(self.stop, trail)
+            return
+
+        # Flat at the close: Pine may arm a fresh pair even after a stop-out in this candle.
+        self._clear_trade()
+        self.levels = None
+        if self.day_range is None or len(self.bars_today) < p.lookback or square_off:
+            return
+        if not (p.entries_from <= end.time() <= p.entries_until):
+            return
+        if p.max_trades_per_day and self.trades_today >= p.max_trades_per_day:
+            return
+        high = max(b.high for b in self.bars_today)
+        low = min(b.low for b in self.bars_today)
+        if p.max_width and high - low > p.max_width * self.day_range:
+            return
+        self.levels = (high, low, self.day_range)
 
     async def on_bar(self, bar: Bar) -> None:
         """A 1-minute candle closed: arm or clear the breakout levels for the next one."""

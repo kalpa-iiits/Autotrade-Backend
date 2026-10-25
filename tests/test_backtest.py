@@ -5,9 +5,10 @@ from zoneinfo import ZoneInfo
 from pydantic import BaseModel
 
 from app.brokers.base import Candle
-from app.strategies.backtest import Simulation, summarize
+from app.strategies.backtest import Simulation, _aggregate, summarize
 from app.strategies.base import Bar, Strategy
 from app.strategies.builtin.sma_crossover import SmaCrossover
+from app.strategies.builtin.intraday_breakout import IntradayBreakout
 from app.strategies.deployment import Deployment
 from tests.test_strategies import AUTH, SYM, deploy  # noqa: F401  (fixture)
 from tests.conftest import ACCOUNT
@@ -89,6 +90,37 @@ def test_trade_excursions():
     asyncio.run(sim.run(c))
     first = sim.trades[0]
     assert (first.entry_price, first.run_up, first.drawdown) == (101, 18, 12)
+
+
+def test_minute_candles_aggregate_to_selected_timeframe():
+    source = candles(range(100, 116), start=datetime(2026, 10, 20, 4, 0, tzinfo=timezone.utc))
+    grouped = _aggregate(source, 15 * 60)
+    assert len(grouped) == 2
+    assert (grouped[0].open, grouped[0].high, grouped[0].low, grouped[0].close) == (100, 114, 100, 114)
+    assert (grouped[1].open, grouped[1].close) == (115, 115)
+
+
+def test_intraday_breakout_matches_pine_stop_fills_fixed_size_and_commission():
+    day = datetime(2026, 10, 26, tzinfo=IST)
+    daily = [Candle(day - timedelta(days=i), 1000, 1100, 1000, 1050) for i in range(20, 0, -1)]
+    minute_bars = []
+    for minute in range(25, 30):
+        at = day.replace(hour=10, minute=minute)
+        minute_bars.append(Candle(at, 1000.5, 1001, 1000, 1000.5))
+    # The resting buy-stop fills at 1001 (not this candle's 1005 high). TradingView's
+    # open->high->low path then hits the pre-placed 976 stop in the same candle.
+    minute_bars.append(Candle(day.replace(hour=10, minute=30), 1000.5, 1005, 970, 980))
+    dep = Deployment(
+        key="pine-breakout", strategy=IntradayBreakout, symbol=SYM, timeframe="1m", quantity=65,
+        backtest_fixed_quantity=65, backtest_commission_per_unit=1,
+    )
+    sim = Simulation(dep, SYM, "1m", daily=daily, capital=100_000)
+    asyncio.run(sim.run(minute_bars))
+
+    first = sim.trades[0]
+    assert (first.direction, first.quantity, first.entry_price, first.exit_price) == ("LONG", 65, 1001, 976)
+    assert first.commission == 130
+    assert first.pnl == (976 - 1001) * 65 - 130
 
 
 def test_catalog_and_performance(deploy):

@@ -155,6 +155,9 @@ def _catalog_dict(dep: Deployment) -> dict:
         "rules": strategy.rules(dep.params), "params": params,
         "mode": dep.mode, "default_symbol": dep.symbol, "default_timeframe": dep.timeframe,
         "timeframes": list(strategy.timeframes),
+        "backtest_initial_capital": dep.backtest_initial_capital,
+        "backtest_fixed_quantity": dep.backtest_fixed_quantity,
+        "backtest_commission_per_unit": dep.backtest_commission_per_unit,
         **{k: v for k, v in dep.settings().items() if k in
            ("quantity", "max_order_qty", "max_position", "max_orders_per_day")},
     }
@@ -205,9 +208,9 @@ async def performance(request: Request, key: str, account_id: int, symbol: str =
                       size_pct: float = Query(DEFAULT_SIZE_PCT, gt=0, le=100, description="Order size, % of equity"),
                       user: User = Depends(require_user)):
     """Strategy tester: backtest on one timeframe over a date range (default: the last year) of
-    the account's broker history, each trade sized at `size_pct` of the equity. Summary for all /
-    long / short trades, every simulated trade with its run-up and drawdown, and buy & hold for
-    comparison. Cached for the IST day."""
+    the account's broker history. Trades use `size_pct` of equity unless the deployment defines
+    a fixed tester quantity. Summary for all / long / short trades, every simulated trade with
+    its run-up and drawdown, and buy & hold for comparison. Cached for the IST day."""
     run = await _backtest(request, user, key, account_id, symbol, timeframe, start, end, capital, size_pct)
     return run.report()
 
