@@ -76,8 +76,8 @@ class FyersBroker(Broker):
         super().__init__()
         if not client_id or not access_token:
             raise MissingCredentials(
-                "Not logged in to Fyers today: start the broker login for this account "
-                "(GET /api/accounts/{id}/broker-login) or paste an access token"
+                "Not logged in to Fyers today: log in to the broker for this account "
+                "(broker-login) or paste today's access token"
             )
         # Accept either the raw token or the "CLIENT_ID:token" form the sockets want.
         if ":" in access_token:
