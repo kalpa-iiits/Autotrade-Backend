@@ -1,0 +1,404 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <title>AutoTrade test client</title>
+  <style>
+    :root { color-scheme: light dark; }
+    body { font-family: system-ui, sans-serif; margin: 24px; max-width: 900px; }
+    fieldset { margin-bottom: 12px; }
+    input, select, button { margin: 2px 4px; padding: 4px 6px; }
+    #log { background: #111; color: #9f9; height: 360px; overflow-y: auto; padding: 8px;
+           font: 12px/1.4 ui-monospace, monospace; white-space: pre-wrap; }
+    #tickerSymbols { width: min(520px, 100%); }
+    #prices { border-collapse: collapse; margin-top: 8px; min-width: 420px; }
+    #prices th, #prices td { padding: 4px 10px; border-bottom: 1px solid #8884; text-align: left; }
+    #prices td.num, #prices th.num { text-align: right; font-variant-numeric: tabular-nums; }
+    #prices .up { color: #1a9e4b; }
+    #prices .down { color: #d93636; }
+    #prices .muted { color: #888; }
+    #prices button { margin: 0; padding: 0 6px; }
+    #strategies table { border-collapse: collapse; margin-top: 8px; width: 100%; }
+    #strategies th, #strategies td { padding: 4px 8px; border-bottom: 1px solid #8884; text-align: left; }
+    #strategies td.num { text-align: right; font-variant-numeric: tabular-nums; }
+    #strategies td input { width: 150px; margin: 0; }
+    #strategies td select { margin: 0; }
+    .banner { padding: 6px 10px; border-radius: 6px; margin: 4px 0 8px; font-size: 14px; }
+    .banner.off { background: #8882; }
+    .banner.on { background: #d9363633; color: #d93636; font-weight: 600; }
+    .status-running { color: #1a9e4b; font-weight: 600; }
+    .status-error { color: #d93636; font-weight: 600; }
+    .table-scroll { overflow-x: auto; }
+  </style>
+</head>
+<body>
+  <h2>AutoTrade WebSocket test client</h2>
+
+  <fieldset>
+    <legend>Connection</legend>
+    <button onclick="connect()">Connect</button>
+    <button onclick="disconnect()">Disconnect</button>
+    orders: <span id="state-orders">disconnected</span> ·
+    tickers: <span id="state-tickers">disconnected</span>
+    <br>
+    <button onclick="authStatus()">Broker status</button>
+    <button onclick="login('fyers')">Fyers login</button>
+    <button onclick="login('zerodha')">Zerodha login</button>
+    <form method="post" action="/logout" style="display:inline">
+      <button type="submit">Sign out</button>
+    </form>
+  </fieldset>
+
+  <fieldset>
+    <legend>Order</legend>
+    <!-- Paper/Fyers use NSE:SBIN-EQ; Zerodha uses NSE:SBIN. Type any symbol. -->
+    <input id="symbol" list="symbols" value="NSE:SBIN-EQ" style="width:160px">
+    <datalist id="symbols">
+      <option>NSE:RELIANCE-EQ</option><option>NSE:TCS-EQ</option><option>NSE:INFY-EQ</option>
+      <option>NSE:HDFCBANK-EQ</option><option>NSE:SBIN-EQ</option>
+      <option>NSE:RELIANCE</option><option>NSE:SBIN</option><option>NSE:INFY</option>
+    </datalist>
+    <select id="side"><option>BUY</option><option>SELL</option></select>
+    Qty <input id="qty" type="number" value="1" min="1" style="width:70px">
+    <select id="otype"><option>MARKET</option><option>LIMIT</option></select>
+    Limit <input id="limit" type="number" step="0.05" style="width:90px">
+    <button onclick="placeOrder()">Place</button>
+    <br>
+    Order id <input id="cancelId" style="width:140px">
+    <button onclick="send('orders', {action: 'cancel_order', order_id: val('cancelId')})">Cancel</button>
+  </fieldset>
+
+  <fieldset>
+    <legend>Tickers</legend>
+    <input id="tickerSymbols" value="NSE:SBIN-EQ, NSE:RELIANCE-EQ, NSE:INFY-EQ"
+           placeholder="Comma-separated, e.g. NSE:SBIN-EQ, NSE:TCS-EQ" aria-label="Symbols">
+    <button onclick="tickers('subscribe')">Subscribe</button>
+    <button onclick="tickers('unsubscribe')">Unsubscribe</button>
+    <label><input type="checkbox" id="logTicks"> log ticks</label>
+    <table id="prices" hidden>
+      <thead>
+        <tr><th>Symbol</th><th class="num">LTP</th><th class="num">Change</th>
+            <th class="num">Updated</th><th></th></tr>
+      </thead>
+      <tbody></tbody>
+    </table>
+  </fieldset>
+
+  <fieldset id="strategies">
+    <legend>Strategies</legend>
+    <div id="liveBanner" class="banner off">Loading…</div>
+    <div class="muted" style="font-size:13px">
+      Strategy logic, size, limits and mode are defined in code (app/strategies/deployments.py).
+      Choose symbol and timeframe here (while stopped).
+    </div>
+    <div style="margin:6px 0">
+      Add <select id="addDeployment" aria-label="Strategy"></select>
+      on <input id="addSymbol" aria-label="Symbol" placeholder="NSE:BANKNIFTY26NOVFUT" style="width:180px">
+      <select id="addTimeframe" aria-label="Timeframe"></select>
+      <button onclick="addInstance()">Add</button>
+    </div>
+    <div class="table-scroll">
+      <table>
+        <thead>
+          <tr><th>#</th><th>Strategy</th><th>Symbol</th><th>Timeframe</th><th>Mode</th><th>Status</th>
+              <th class="num">Position</th><th class="num">Last</th><th class="num">Orders today</th><th></th></tr>
+        </thead>
+        <tbody id="stRows"><tr><td colspan="10" class="muted">No strategies in deployments.py.</td></tr></tbody>
+      </table>
+    </div>
+    <button onclick="api('POST', '/api/strategies/stop-all').then(refreshStrategies)">Stop all</button>
+    <button onclick="refreshStrategies()">Refresh</button>
+  </fieldset>
+
+  <fieldset>
+    <legend>Account</legend>
+    <button onclick="send('orders', {action: 'get_orders'})">Orders</button>
+    <button onclick="send('orders', {action: 'get_positions'})">Positions</button>
+    <button onclick="send('orders', {action: 'get_funds'})">Funds</button>
+  </fieldset>
+
+  <div id="log"></div>
+
+  <script>
+    const sockets = {};  // one per app: "orders" and "tickers"
+    const val = id => document.getElementById(id).value;
+    const log = msg => {
+      const el = document.getElementById('log');
+      el.textContent += msg + '\n';
+      el.scrollTop = el.scrollHeight;
+    };
+
+    function connect() {
+      const proto = location.protocol === 'https:' ? 'wss' : 'ws';
+      for (const name of ['orders', 'tickers']) {
+        // The session cookie authenticates the socket; no token in the URL.
+        const ws = new WebSocket(`${proto}://${location.host}/api/ws/${name}`);
+        const state = document.getElementById('state-' + name);
+        ws.onopen = () => state.textContent = 'connected';
+        ws.onclose = e => {
+          state.textContent = `closed (${e.code} ${e.reason})`;
+          if (name === 'tickers') syncPriceRows([]);  // subscriptions end with the socket
+          if (e.code === 1008) toLogin();
+        };
+        ws.onmessage = e => {
+          const msg = JSON.parse(e.data);
+          if (name === 'tickers') onTickerMessage(msg);
+          if (msg.type === 'strategy_status' || msg.type === 'strategy_signal') scheduleStrategyRefresh();
+          if (msg.type !== 'tick' || document.getElementById('logTicks').checked) {
+            log(`← [${name}] ` + e.data);
+          }
+        };
+        sockets[name] = ws;
+      }
+    }
+
+    function disconnect() {
+      Object.values(sockets).forEach(ws => ws.close());
+    }
+
+    function send(name, msg) {
+      const ws = sockets[name];
+      if (!ws || ws.readyState !== WebSocket.OPEN) return log(`! ${name} not connected`);
+      msg.request_id = crypto.randomUUID().slice(0, 8);
+      log(`→ [${name}] ` + JSON.stringify(msg));
+      ws.send(JSON.stringify(msg));
+    }
+
+    function toLogin() {
+      location.href = '/login?next=' + encodeURIComponent(location.pathname);
+    }
+
+    function login(broker) {
+      location.href = `/api/auth/${broker}/login`;
+    }
+
+    async function authStatus() {
+      const r = await fetch('/api/auth/status');
+      if (r.status === 401) return toLogin();
+      log('← [auth] ' + await r.text());
+    }
+
+    // ---------- tickers: subscribe to a list, show the latest price per symbol ----------
+
+    const priceRows = new Map();  // symbol -> {row, ltp}
+
+    function parseSymbols(text) {
+      return [...new Set(text.split(/[\s,]+/).map(s => s.trim()).filter(Boolean))];
+    }
+
+    function tickers(action, symbols = parseSymbols(val('tickerSymbols'))) {
+      if (!symbols.length) return log('! enter at least one symbol');
+      send('tickers', { action, symbols });
+    }
+
+    function onTickerMessage(msg) {
+      // Every subscribe/unsubscribe ack carries this socket's full symbol list.
+      if (msg.type === 'ack' && Array.isArray(msg.symbols)) syncPriceRows(msg.symbols);
+      if (msg.type === 'tick') updatePrice(msg.symbol, msg.ltp);
+    }
+
+    function syncPriceRows(symbols) {
+      const body = document.querySelector('#prices tbody');
+      for (const [symbol, entry] of priceRows) {
+        if (!symbols.includes(symbol)) { entry.row.remove(); priceRows.delete(symbol); }
+      }
+      for (const symbol of symbols) {
+        if (priceRows.has(symbol)) continue;
+        const row = document.createElement('tr');
+        row.innerHTML = '<td></td><td class="num muted">—</td><td class="num muted">—</td>' +
+                        '<td class="num muted">waiting…</td><td><button title="Unsubscribe">✕</button></td>';
+        row.cells[0].textContent = symbol;  // textContent: never inject symbol text as HTML
+        const remove = row.querySelector('button');
+        remove.setAttribute('aria-label', `Unsubscribe ${symbol}`);
+        remove.onclick = () => tickers('unsubscribe', [symbol]);
+        body.appendChild(row);
+        priceRows.set(symbol, { row, ltp: null });
+      }
+      document.getElementById('prices').hidden = priceRows.size === 0;
+    }
+
+    function updatePrice(symbol, ltp) {
+      const entry = priceRows.get(symbol);
+      if (!entry) return;
+      const [, ltpCell, changeCell, timeCell] = entry.row.cells;
+      const diff = entry.ltp === null ? 0 : ltp - entry.ltp;
+      ltpCell.textContent = ltp.toFixed(2);
+      ltpCell.className = 'num' + (diff > 0 ? ' up' : diff < 0 ? ' down' : '');
+      changeCell.textContent = entry.ltp === null ? '—'
+        : (diff > 0 ? '▲ +' : diff < 0 ? '▼ ' : '') + diff.toFixed(2);
+      changeCell.className = 'num' + (diff > 0 ? ' up' : diff < 0 ? ' down' : ' muted');
+      timeCell.textContent = new Date().toLocaleTimeString();
+      timeCell.className = 'num';
+      entry.ltp = ltp;
+    }
+
+    // ---------- strategies ----------
+
+    let refreshTimer = null;
+
+    async function api(method, path, body) {
+      const r = await fetch(path, {
+        method, headers: body ? { 'Content-Type': 'application/json' } : {},
+        body: body ? JSON.stringify(body) : undefined,
+      });
+      if (r.status === 401) { toLogin(); throw new Error('not logged in'); }
+      const data = r.status === 204 ? null : await r.json();
+      if (!r.ok) {
+        log(`! ${method} ${path} → ${r.status} ${JSON.stringify(data)}`);
+        throw new Error(String(r.status));
+      }
+      return data;
+    }
+
+    function scheduleStrategyRefresh() {
+      clearTimeout(refreshTimer);
+      refreshTimer = setTimeout(() => refreshStrategies(false).catch(() => {}), 300);
+    }
+
+    function actionButton(label, onclick) {
+      const b = document.createElement('button');
+      b.textContent = label;
+      b.onclick = onclick;
+      return b;
+    }
+
+    async function showSignals(inst) {
+      const rows = await api('GET', `/api/strategies/${inst.id}/signals?limit=20`);
+      log(`← [strategy ${inst.id}] last ${rows.length} signals (newest first):`);
+      for (const s of rows) {
+        log(`   ${s.at.slice(11, 19)} ${s.side} ${s.quantity} @ ${s.price ?? '—'} → ${s.outcome}` +
+            `${s.message ? ' (' + s.message + ')' : ''}${s.reason ? ' · ' + s.reason : ''}`);
+      }
+    }
+
+    let deployments = [];
+
+    function timeframeSelect(options, selected) {
+      const sel = document.createElement('select');
+      sel.setAttribute('aria-label', 'Timeframe');
+      sel.replaceChildren(...options.map(tf => new Option(tf, tf, false, tf === selected)));
+      return sel;
+    }
+
+    function fillAddForm() {
+      const select = document.getElementById('addDeployment');
+      const chosen = select.value;
+      select.replaceChildren(...deployments.map(d => new Option(d.key, d.key)));
+      if (chosen) select.value = chosen;
+      const dep = deployments.find(d => d.key === select.value);
+      if (!dep) return;
+      const tf = document.getElementById('addTimeframe');
+      const keep = tf.value;
+      tf.replaceChildren(...dep.timeframes.map(t => new Option(t, t)));
+      tf.value = dep.timeframes.includes(keep) ? keep : dep.default_timeframe;
+      const symbol = document.getElementById('addSymbol');
+      symbol.placeholder = dep.default_symbol;
+      select.onchange = () => { tf.value = ''; fillAddForm(); };
+    }
+
+    async function addInstance() {
+      const symbol = val('addSymbol').trim();
+      if (!symbol) return log('! enter a symbol');
+      const res = await api('POST', '/api/strategies', {
+        deployment_key: val('addDeployment'), symbol, timeframe: val('addTimeframe'),
+      });
+      if (res.warning) log('! ' + res.warning);
+      document.getElementById('addSymbol').value = '';
+      refreshStrategies();
+    }
+
+    // Don't rebuild the table under someone who is editing a row.
+    const isEditing = () => !!document.querySelector('#stRows [data-dirty]') ||
+                            document.getElementById('stRows').contains(document.activeElement);
+
+    async function refreshStrategies(force = true) {
+      if (!force && isEditing()) return;
+      const data = await api('GET', '/api/strategies');
+      const banner = document.getElementById('liveBanner');
+      banner.className = 'banner ' + (data.live_trading_enabled ? 'on' : 'off');
+      banner.textContent = data.live_trading_enabled
+        ? 'Live strategy trading is ON: strategies in live mode place real orders.'
+        : 'Live strategy trading is off: live-mode strategies are blocked (AUTOTRADE_STRATEGIES_LIVE).';
+      deployments = data.deployments;
+      fillAddForm();
+
+      const body = document.getElementById('stRows');
+      if (!data.strategies.length) {
+        body.innerHTML = '<tr><td colspan="10" class="muted">No strategies in deployments.py.</td></tr>';
+        return;
+      }
+      body.replaceChildren(...data.strategies.map(inst => {
+        const tr = document.createElement('tr');
+        tr.title = `${inst.description || inst.strategy}\nparams: ${JSON.stringify(inst.params)}\n` +
+                   `qty ${inst.quantity}, max position ${inst.max_position}, max orders/day ${inst.max_orders_per_day}`;
+        const stopped = inst.status !== 'running';
+        const cell = (value, cls) => {
+          const td = document.createElement('td');
+          if (value instanceof Node) td.append(value); else td.textContent = value;  // never HTML
+          if (cls) td.className = cls;
+          return td;
+        };
+
+        let symbolInput = null, tfSelect = null;
+        if (stopped) {
+          symbolInput = document.createElement('input');
+          symbolInput.value = inst.symbol;
+          symbolInput.setAttribute('aria-label', `Symbol for #${inst.id}`);
+          tfSelect = timeframeSelect(inst.timeframes, inst.timeframe);
+          tfSelect.setAttribute('aria-label', `Timeframe for #${inst.id}`);
+          const markDirty = () => tr.dataset.dirty = '1';
+          symbolInput.oninput = markDirty;
+          tfSelect.onchange = markDirty;
+        }
+        const status = cell(inst.status, 'status-' + inst.status);
+        if (inst.last_error) status.title = inst.last_error;
+        tr.append(
+          cell(inst.id), cell(inst.deployment_key),
+          cell(symbolInput || inst.symbol), cell(tfSelect || inst.timeframe),
+          cell(inst.mode), status,
+          cell(inst.position ?? '—', 'num'), cell(inst.last_price?.toFixed(2) ?? '—', 'num'),
+          cell(inst.orders_today ?? '—', 'num'),
+        );
+
+        const actions = document.createElement('td');
+        if (!stopped) {
+          actions.append(actionButton('Stop', () => api('POST', `/api/strategies/${inst.id}/stop`).then(refreshStrategies)));
+        } else {
+          actions.append(
+            actionButton('Save', async () => {
+              const res = await api('PATCH', `/api/strategies/${inst.id}`, {
+                symbol: symbolInput.value.trim(), timeframe: tfSelect.value,
+              }).catch(() => null);
+              if (res?.warning) log('! ' + res.warning);
+              delete tr.dataset.dirty;
+              refreshStrategies();
+            }),
+            actionButton('Start', () => {
+              if (tr.dataset.dirty) return log('! save the symbol/timeframe change first');
+              if (inst.mode === 'live' &&
+                  !confirm(`Start ${inst.deployment_key} on ${inst.symbol} ${inst.timeframe} in LIVE mode? It can place real orders.`)) return;
+              api('POST', `/api/strategies/${inst.id}/start`).then(refreshStrategies);
+            }),
+            actionButton('Remove', () =>
+              confirm(`Remove ${inst.deployment_key} on ${inst.symbol} ${inst.timeframe}? Its signal history is kept.`) &&
+              api('DELETE', `/api/strategies/${inst.id}`).then(refreshStrategies)),
+          );
+        }
+        actions.append(actionButton('Signals', () => showSignals(inst)));
+        tr.appendChild(actions);
+        return tr;
+      }));
+    }
+
+    refreshStrategies().catch(() => {});
+    setInterval(() => document.hidden || refreshStrategies(false).catch(() => {}), 5000);
+
+    function placeOrder() {
+      const msg = { action: 'place_order', symbol: val('symbol'), side: val('side'),
+                    quantity: Number(val('qty')), order_type: val('otype') };
+      if (msg.order_type === 'LIMIT') msg.limit_price = Number(val('limit'));
+      send('orders', msg);
+    }
+  </script>
+</body>
+</html>

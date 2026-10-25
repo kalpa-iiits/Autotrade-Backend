@@ -1,0 +1,79 @@
+"""JSON sign-in for a separate frontend (React etc.), mounted under /api/auth.
+
+Same session cookie, lockout and checks as the HTML /login page. The browser keeps the cookie;
+call these with `credentials: "include"` from another origin listed in AUTOTRADE_CORS_ORIGINS.
+"""
+
+from fastapi import APIRouter, Depends, HTTPException, Request, Response, status
+from pydantic import BaseModel, Field
+
+from app.auth.dependencies import session_user
+from app.auth.models import User
+from app.auth.pages import SignInFailed, sign_in
+from app.auth.users import UserError, check_password, get_user, password_fingerprint, set_password
+
+router = APIRouter(prefix="/auth", tags=["auth"])
+
+
+class Credentials(BaseModel):
+    username: str = Field(min_length=1, max_length=64)
+    password: str = Field(min_length=1, max_length=256)
+
+
+class PasswordChange(BaseModel):
+    current_password: str = Field(min_length=1, max_length=256)
+    new_password: str = Field(min_length=1, max_length=256)
+
+
+class Me(BaseModel):
+    username: str
+    last_login_at: str | None
+
+
+async def signed_in_user(request: Request) -> User:
+    """Dependency: the session's user, or 401 (checked before the request body)."""
+    user = await session_user(request)
+    if user is None:
+        raise HTTPException(status.HTTP_401_UNAUTHORIZED, "Not signed in")
+    return user
+
+
+def _me(user) -> Me:
+    return Me(username=user.username,
+              last_login_at=user.last_login_at.isoformat() if user.last_login_at else None)
+
+
+@router.post("/login", response_model=Me)
+async def login(request: Request, body: Credentials, response: Response):
+    """Sign in. Sets the session cookie. 401 wrong credentials, 429 locked out (Retry-After)."""
+    try:
+        user = await sign_in(request, body.username, body.password)
+    except SignInFailed as e:
+        headers = {"Retry-After": str(e.retry_after)} if e.retry_after else None
+        raise HTTPException(e.status_code, e.message, headers=headers)
+    response.headers["Cache-Control"] = "no-store"
+    return _me(user)
+
+
+@router.post("/logout", status_code=status.HTTP_204_NO_CONTENT)
+async def logout(request: Request):
+    request.session.clear()
+
+
+@router.get("/me", response_model=Me)
+async def me(user: User = Depends(signed_in_user)):
+    """The signed-in user, or 401. Use it on app load to decide whether to show the login form."""
+    return _me(user)
+
+
+@router.post("/password", status_code=status.HTTP_204_NO_CONTENT)
+async def change_password(request: Request, body: PasswordChange,
+                          user: User = Depends(signed_in_user)):
+    """Change your own password. Other sessions are signed out; this one stays signed in."""
+    if not await check_password(user.username, body.current_password):
+        raise HTTPException(status.HTTP_403_FORBIDDEN, "Current password is wrong")
+    try:
+        await set_password(user.username, body.new_password)
+    except UserError as e:
+        raise HTTPException(status.HTTP_422_UNPROCESSABLE_ENTITY, str(e))
+    request.session["pw"] = password_fingerprint(await get_user(user.id))
