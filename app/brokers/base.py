@@ -27,6 +27,16 @@ class Candle:
     volume: float = 0.0
 
 
+@dataclass(frozen=True)
+class Instrument:
+    """One broker-native cash-market instrument shown by symbol search."""
+
+    symbol: str
+    ticker: str
+    name: str
+    kind: Literal["stock", "index"]
+
+
 class OrderError(Exception):
     """An order request the broker refused (unknown symbol, cannot cancel, ...)."""
 
@@ -127,6 +137,10 @@ class Broker(ABC):
     async def get_quotes(self, symbols: list[str]) -> dict[str, float]:
         """Last traded price per symbol. Unknown symbols are left out."""
         raise OrderError(f"{type(self).__name__} does not provide quotes")
+
+    async def get_instruments(self, exchange: str = "NSE") -> list[Instrument]:
+        """Tradable cash-market instruments, using this broker's exact symbol spelling."""
+        raise OrderError(f"{type(self).__name__} does not provide an instrument catalogue")
 
     async def get_history(
         self, symbol: str, resolution: Resolution, start: date, end: date

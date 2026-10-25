@@ -20,7 +20,7 @@ from kiteconnect.exceptions import KiteException
 from websockets.asyncio.client import connect as ws_connect
 from websockets.exceptions import ConnectionClosed, InvalidStatus
 
-from app.brokers.base import Broker, Candle, MissingCredentials, OrderError, Resolution
+from app.brokers.base import Broker, Candle, Instrument, MissingCredentials, OrderError, Resolution
 from app.orders.schemas import Order, OrderStatus, OrderType, PlaceOrder, Position, Product, Side
 
 log = logging.getLogger(__name__)
@@ -132,6 +132,7 @@ class ZerodhaBroker(Broker):
         self._token_of: dict[str, int] = {}
         self._symbol_of: dict[int, str] = {}
         self._subscribed: set[int] = set()
+        self._instrument_cache: tuple[date, list[Instrument]] | None = None
 
     # ---------- lifecycle ----------
 
@@ -225,6 +226,33 @@ class ZerodhaBroker(Broker):
             self._subscribed.difference_update(tokens)
             if self._ws is not None:
                 await self._ws.send(json.dumps({"a": "unsubscribe", "v": tokens}))
+
+    async def get_instruments(self, exchange: str = "NSE") -> list[Instrument]:
+        exchange = exchange.upper()
+        today = datetime.now().date()
+        if self._instrument_cache is not None and self._instrument_cache[0] == today:
+            return self._instrument_cache[1]
+        try:
+            rows = await asyncio.to_thread(self._kite.instruments, exchange)
+        except KiteException as e:
+            raise OrderError(str(e)) from e
+        instruments: list[Instrument] = []
+        for row in rows:
+            segment = str(row.get("segment", "")).upper()
+            instrument_type = str(row.get("instrument_type", "")).upper()
+            if row.get("exchange") != exchange or (instrument_type != "EQ" and segment != "INDICES"):
+                continue
+            ticker = str(row.get("tradingsymbol", "")).strip()
+            if not ticker:
+                continue
+            kind = "index" if segment == "INDICES" else "stock"
+            instruments.append(Instrument(
+                symbol=f"{exchange}:{ticker}", ticker=ticker,
+                name=str(row.get("name") or ticker).strip(), kind=kind,
+            ))
+        instruments.sort(key=lambda item: (item.kind != "index", item.ticker))
+        self._instrument_cache = today, instruments
+        return instruments
 
     # ---------- orders ----------
 

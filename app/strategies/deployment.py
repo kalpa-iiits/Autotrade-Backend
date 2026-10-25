@@ -15,16 +15,16 @@ class Deployment:
     (app/strategies/deployments.py). The app runs it as one or more *instances*, each on its own
     symbol and timeframe, chosen in the app.
 
-    `key` identifies it in the database across restarts: keep it stable. `symbol` and
-    `timeframe` are only the defaults for the first instance, created automatically; after
-    that the app owns them. Changing any other field takes effect on the next server start, for
-    every instance; instances that were running then come back stopped.
+    `key` identifies it in the database across restarts: keep it stable. `symbol` is an optional
+    suggestion for new instances and `timeframe` is the initial selection; after creation the
+    app owns both. Changing any other field takes effect on the next server start, for every
+    instance; instances that were running then come back stopped.
     """
 
     key: str
     strategy: type[Strategy]
-    symbol: str  # default for the first instance
     quantity: int  # default size of buy()/sell()
+    symbol: str | None = None  # optional suggestion for a new instance
     params: BaseModel | dict = field(default_factory=dict)
     # "signal": record what it would trade, place nothing. "live": place real orders
     # (also needs AUTOTRADE_STRATEGIES_LIVE=true).

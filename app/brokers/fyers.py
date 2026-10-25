@@ -7,14 +7,18 @@ the sockets delivered them, as with the other brokers.
 """
 
 import asyncio
+import csv
+import io
 import logging
 from datetime import date, datetime, timedelta, timezone
 from pathlib import Path
 
+import httpx
+
 from fyers_apiv3 import fyersModel
 from fyers_apiv3.FyersWebsocket import data_ws, order_ws
 
-from app.brokers.base import Broker, Candle, MissingCredentials, OrderError, Resolution
+from app.brokers.base import Broker, Candle, Instrument, MissingCredentials, OrderError, Resolution
 from app.orders.schemas import (
     Order,
     OrderStatus,
@@ -26,6 +30,9 @@ from app.orders.schemas import (
 )
 
 log = logging.getLogger(__name__)
+FYERS_NSE_MASTER = "https://public.fyers.in/sym_details/NSE_CM.csv"
+_nse_instruments: tuple[date, list[Instrument]] | None = None
+_nse_instruments_lock = asyncio.Lock()
 
 # Fyers numeric codes -> our enums.
 FYERS_STATUS = {
@@ -37,6 +44,47 @@ FYERS_STATUS = {
 }
 FYERS_ORDER_TYPE = {OrderType.LIMIT: 1, OrderType.MARKET: 2, OrderType.SL_M: 3, OrderType.SL: 4}
 FYERS_ORDER_TYPE_OF = {code: t for t, code in FYERS_ORDER_TYPE.items()}
+
+
+def parse_nse_instruments(text: str) -> list[Instrument]:
+    """Parse the FYERS NSE cash-market master.
+
+    Security type 0 is equity (including the exchange's active EQ/BE/SM/ST series) and
+    type 10 is an index. Other cash-market products such as ETFs are intentionally omitted.
+    """
+    instruments: dict[str, Instrument] = {}
+    for row in csv.reader(io.StringIO(text)):
+        if len(row) < 14 or row[2] not in {"0", "10"}:
+            continue
+        symbol = row[9].strip()
+        if not symbol.startswith("NSE:"):
+            continue
+        ticker = row[13].strip() or symbol.removeprefix("NSE:").rsplit("-", 1)[0]
+        name = row[1].strip() or ticker
+        kind = "index" if row[2] == "10" else "stock"
+        instruments[symbol] = Instrument(symbol=symbol, ticker=ticker, name=name, kind=kind)
+    return sorted(instruments.values(), key=lambda item: (item.kind != "index", item.ticker))
+
+
+async def _load_nse_instruments() -> list[Instrument]:
+    global _nse_instruments
+    today = datetime.now(timezone.utc).date()
+    if _nse_instruments is not None and _nse_instruments[0] == today:
+        return _nse_instruments[1]
+    async with _nse_instruments_lock:
+        if _nse_instruments is not None and _nse_instruments[0] == today:
+            return _nse_instruments[1]
+        try:
+            async with httpx.AsyncClient(timeout=15, follow_redirects=True) as client:
+                response = await client.get(FYERS_NSE_MASTER)
+                response.raise_for_status()
+        except httpx.HTTPError as e:
+            raise RuntimeError(f"Could not load the FYERS NSE instrument list: {e}") from e
+        instruments = parse_nse_instruments(response.text)
+        if not instruments:
+            raise RuntimeError("FYERS returned an empty NSE instrument list")
+        _nse_instruments = today, instruments
+        return instruments
 
 
 def _is_derivative(symbol: str) -> bool:
@@ -237,6 +285,11 @@ class FyersBroker(Broker):
         await asyncio.to_thread(
             self._data_socket.unsubscribe, symbols=sorted(gone), data_type="SymbolUpdate"
         )
+
+    async def get_instruments(self, exchange: str = "NSE") -> list[Instrument]:
+        if exchange.upper() != "NSE":
+            raise OrderError(f"Fyers instrument search does not support {exchange!r}")
+        return await _load_nse_instruments()
 
     # ---------- orders ----------
 

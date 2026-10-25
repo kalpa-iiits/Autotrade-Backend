@@ -1,7 +1,7 @@
-"""Intraday 1-minute breakout, ported from the TradingView script "NIFTY 1-minute breakout".
+"""Intraday breakout, ported from a TradingView breakout strategy.
 
-From 10:30, at each 1-minute close it arms a buy level at the high and a sell level at the low
-of the last 5 one-minute candles (today's only). Whichever breaks first during the next candle
+From 10:30, at each candle close it arms a buy level at the high and a sell level at the low
+of the last 5 candles (today's only). Whichever breaks first during the next candle
 is traded and the other is dropped; levels live for one candle. The stop is wide and trails
 behind the best price; there is no target. After a stop-out the next breakout is taken again,
 up to the daily cap. Everything is squared off at 15:15.
@@ -10,8 +10,8 @@ All distances are fractions of the average daily range (high - low) of the previ
 so they widen and narrow with volatility.
 
 Differences from the Pine version (which simulates resting stop orders on bar data):
-  - The built-in 1-minute Strategy Tester uses a Pine-compatible candle replay, fixed size and
-    commission. The differences below describe live/signal execution only.
+  - Strategy Tester uses a Pine-compatible candle replay. The differences below describe
+    live/signal execution only.
   - Entries and exits are market orders sent when a tick reaches the level, so live fills
     include slippage; the stop is measured from the price of the triggering tick.
   - The stop and trail are checked on every tick instead of once per bar.
@@ -37,10 +37,10 @@ EXIT_RETRY = timedelta(seconds=5)  # don't repeat an exit request while it's bei
 class IntradayBreakout(Strategy):
     name = "intraday_breakout"
     description = (
-        "Breakout of the last N candles' high/low (built for 1m), wide trailing stop scaled to "
+        "Breakout of the last N candles' high/low, with a wide trailing stop scaled to "
         "the average daily range, intraday only (square-off at 15:15)."
     )
-    timeframes = ("1m", "3m", "5m", "10m", "15m")  # Pine-parity replay is used on the built-for 1m
+    timeframes = ("1m", "3m", "5m", "10m", "15m")
     tags = ("Intraday", "Breakout", "Long & short", "Trailing stop")
 
     @classmethod
@@ -77,7 +77,7 @@ class IntradayBreakout(Strategy):
         ]
 
     class Params(BaseModel):
-        lookback: int = Field(5, ge=2, description="Breakout lookback (1-minute candles)")
+        lookback: int = Field(5, ge=2, description="Breakout lookback (candles)")
         max_width: float = Field(
             0.4, ge=0, description="Skip if the lookback range is wider than this x avg daily range (0 = off)")
         avg_days: int = Field(14, ge=2, description="Days in the average daily range")
@@ -230,7 +230,7 @@ class IntradayBreakout(Strategy):
         self.levels = (high, low, self.day_range)
 
     async def on_bar(self, bar: Bar) -> None:
-        """A 1-minute candle closed: arm or clear the breakout levels for the next one."""
+        """A candle closed: arm or clear the breakout levels for the next one."""
         closed_at = (bar.start + timedelta(seconds=bar.seconds)).astimezone(IST)
         if bar.start.astimezone(IST).date() != self.day:
             return  # yesterday's last candle; the lookback only uses today's

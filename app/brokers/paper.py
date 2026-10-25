@@ -5,7 +5,7 @@ import random
 from datetime import date, datetime, time, timedelta
 from zoneinfo import ZoneInfo
 
-from app.brokers.base import Broker, Candle, OrderError, Resolution
+from app.brokers.base import Broker, Candle, Instrument, OrderError, Resolution
 from app.orders.schemas import (
     Order,
     OrderStatus,
@@ -49,6 +49,19 @@ class PaperBroker(Broker):
             except asyncio.CancelledError:
                 pass
             self._task = None
+
+    async def get_instruments(self, exchange: str = "NSE") -> list[Instrument]:
+        if exchange.upper() != "NSE":
+            raise OrderError(f"Paper instrument search does not support {exchange!r}")
+        return [
+            Instrument(
+                symbol=symbol,
+                ticker=symbol.removeprefix("NSE:").removesuffix("-EQ").removesuffix("-INDEX"),
+                name=symbol.removeprefix("NSE:"),
+                kind="index" if symbol.endswith("-INDEX") else "stock",
+            )
+            for symbol in sorted(self.prices)
+        ]
 
     # ---------- price simulation ----------
 

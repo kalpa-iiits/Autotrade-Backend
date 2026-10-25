@@ -23,6 +23,7 @@ from app.core import db
 from app.core.http import broker_errors, broker_or_503
 from app.strategies.backtest import DEFAULT_CAPITAL, DEFAULT_SIZE_PCT, Backtester, BacktestError, Run
 from app.strategies.deployment import Deployment
+from app.strategies.instruments import search_instruments
 from app.strategies.models import StrategyInstance, StrategySignal
 from app.strategies.runner import StrategyError, StrategyRunner, signal_dict
 
@@ -194,6 +195,21 @@ async def _backtest(request: Request, user: User, key: str, account_id: int, sym
 async def list_catalog(request: Request, user: User = Depends(require_user)):
     """Every strategy defined in code, with its description, rules and settings."""
     return [_catalog_dict(d) for d in _runner(request).deployments.values()]
+
+
+@router.get("/instruments/search")
+async def instrument_search(request: Request, account_id: int, q: str = Query(min_length=1, max_length=64),
+                            limit: int = Query(12, ge=1, le=30), user: User = Depends(require_user)):
+    """NSE stocks and indexes in the selected broker's exact symbol format."""
+    if not owns(user, await store.get_account(account_id)):
+        raise HTTPException(status.HTTP_404_NOT_FOUND, "No such broker account")
+    service = _runner(request).service(account_id)
+    if service is None:
+        raise HTTPException(status.HTTP_503_SERVICE_UNAVAILABLE, "Broker account not available")
+    broker = broker_or_503(service)
+    async with broker_errors():
+        instruments = await broker.get_instruments("NSE")
+    return [item.__dict__ for item in search_instruments(instruments, q, limit)]
 
 
 @router.get("/catalog/{key}")

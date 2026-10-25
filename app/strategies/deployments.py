@@ -2,8 +2,8 @@
 
 Each Deployment is a strategy with its parameters, size, limits and mode. Which symbol and
 timeframe it runs on is chosen in the app, where you can also add more instances of it (e.g.
-the same breakout on NIFTY and BANKNIFTY). `symbol` and `timeframe` here are only the defaults
-for the first instance, created the first time the server sees the deployment.
+the same breakout on NIFTY and BANKNIFTY). `symbol`, when present, is only a suggestion in the
+deployment form; `timeframe` is its initial selection.
 
 Changes take effect when the server restarts (with --reload, on save) and apply to every
 instance; running instances come back stopped after a change. Removing a deployment here marks
@@ -18,14 +18,14 @@ from app.strategies.builtin.sma_crossover import SmaCrossover
 from app.strategies.deployment import Deployment
 
 DEPLOYMENTS: list[Deployment] = [
-    # NIFTY 1-minute breakout (ported from the TradingView script). Trades one futures lot
-    # (65). Futures expire monthly (last Tuesday): roll the instance's symbol to the next
-    # contract in the app before expiry, e.g. NSE:NIFTY26NOVFUT -> NSE:NIFTY26DECFUT.
+    # Intraday breakout (ported from the TradingView script). Live trading uses one futures
+    # lot (65), while Strategy Tester sizes entries from its selected capital and equity
+    # percentage. The user chooses the instrument and timeframe for each instance in the app.
     # 8 trades/day = up to 16 orders plus square-off, so the order cap is 20.
     Deployment(
         key="nifty-1m-breakout",
+        label="Intraday Breakout",
         strategy=IntradayBreakout,
-        symbol="NSE:NIFTY26NOVFUT",
         timeframe="1m",
         params=IntradayBreakout.Params(
             lookback=5, max_width=0.4, avg_days=14,
@@ -36,8 +36,6 @@ DEPLOYMENTS: list[Deployment] = [
         max_position=65,
         max_orders_per_day=20,
         mode="signal",
-        backtest_initial_capital=100_000,
-        backtest_fixed_quantity=65,
         # The reference TradingView report has commission overridden to zero: its trade-level
         # "Net P&L" equals raw price P&L (for example, 78.15 points × 65 = ₹5,079.75).
         backtest_commission_per_unit=0,
