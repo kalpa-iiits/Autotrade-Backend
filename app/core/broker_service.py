@@ -2,13 +2,17 @@
 
 import asyncio
 import logging
+from datetime import datetime
+from decimal import Decimal
 from typing import Awaitable, Callable
 
 from app.brokers import Broker, MissingCredentials, OrderError, create_broker
 from app.brokers.base import OrderListener, TickListener
 from app.core.config import Settings
-from app.orders.history import find_by_client_order_id
-from app.orders.schemas import Order, PlaceOrder, new_client_order_id
+from app.core.db import utcnow
+from app.core.ratelimit import RateLimiter
+from app.orders.history import find_by_client_order_id, recorded_states
+from app.orders.schemas import Order, OrderStatus, PlaceOrder, moves_backwards, new_client_order_id
 
 
 log = logging.getLogger(__name__)
@@ -18,13 +22,28 @@ class BrokerNotConnected(OrderError):
     pass
 
 
+def _state(order: Order) -> tuple[str, int, Decimal | None]:
+    """What the ledger records about an order, normalised the way the ledger stores it."""
+    filled = order.filled_quantity
+    if order.status == OrderStatus.FILLED and not filled:
+        filled = order.quantity
+    price = Decimal(str(order.filled_price)).quantize(Decimal("0.0001")) if order.filled_price else None
+    return order.status.value, filled, price
+
+
 class BrokerService:
     def __init__(
-        self, settings: Settings, token_loader: Callable[[], Awaitable[str | None]]
+        self,
+        settings: Settings,
+        token_loader: Callable[[], Awaitable[str | None]],
+        records_reliable: Callable[[], bool] = lambda: True,
     ) -> None:
         self.settings = settings
         self.name = settings.broker
         self._token_loader = token_loader
+        # False while the trade ledger has updates it could not save: then the database can't
+        # be trusted to say whether an order was already placed, so the broker is asked.
+        self.records_reliable = records_reliable
         self.broker: Broker | None = None
         self.not_connected_reason = "Broker not started"
         self._order_listeners: list[OrderListener] = []
@@ -35,6 +54,12 @@ class BrokerService:
         self._placing: dict[str, asyncio.Future[Order]] = {}
         # Client order ids whose placement failed without an answer: it may have gone through.
         self._unknown_outcome: set[str] = set()
+        self._orders_limit = RateLimiter(settings.broker_orders_per_second)
+        self._resync_lock = asyncio.Lock()
+        self._resync_task: asyncio.Task | None = None
+        self.last_resync_at: datetime | None = None
+        self.last_resync_error: str | None = None
+        self.resynced_orders = 0  # updates replayed because a socket never delivered them
 
     def on_order_update(self, listener: OrderListener) -> None:
         self._order_listeners.append(listener)
@@ -58,7 +83,7 @@ class BrokerService:
             raise BrokerNotConnected(self.not_connected_reason)
         return self.broker
 
-    async def start(self) -> None:
+    async def start(self, resync: bool = True) -> None:
         try:
             broker = create_broker(self.settings, access_token=await self._token_loader())
         except MissingCredentials as e:
@@ -68,14 +93,23 @@ class BrokerService:
             broker.on_order_update(listener)
         for listener in self._tick_listeners:
             broker.on_tick(listener)
+        if hasattr(broker, "on_reconnect"):
+            broker.on_reconnect(self.resync)
         await broker.start()
         self.broker = broker
         if symbols := self.watched_symbols():
             await broker.subscribe(sorted(symbols))
+        if resync:
+            await self.resync()
+        if self.settings.resync_interval > 0 and self._resync_task is None:
+            self._resync_task = asyncio.create_task(self._resync_loop())
 
     async def stop(self, reason: str = "Broker stopped") -> None:
         broker, self.broker = self.broker, None
         self.not_connected_reason = reason
+        if self._resync_task is not None:
+            self._resync_task.cancel()
+            self._resync_task = None
         if broker is not None:
             # Drop it first: even if shutting down fails, a restart must still bring up a
             # fresh broker rather than keep a half-closed one.
@@ -87,6 +121,59 @@ class BrokerService:
     async def restart(self) -> None:
         await self.stop()
         await self.start()
+
+    # ---------- reconciliation ----------
+
+    async def resync(self) -> int:
+        """Compare the broker's order book with what we recorded and replay every order whose
+        state we missed (a socket down, an update dropped) to the order listeners: ledger,
+        running strategies, clients. Runs after every (re)connect and every resync_interval.
+        Returns how many orders were replayed. Never raises."""
+        broker = self.broker
+        if broker is None:
+            return 0
+        async with self._resync_lock:
+            try:
+                orders = await broker.get_orders()
+                known = await recorded_states(self.name, [o.id for o in orders])
+                replayed = 0
+                for order in orders:
+                    state = _state(order)
+                    prev = known.get(order.id)
+                    if prev == state:
+                        continue
+                    if prev is not None and moves_backwards(OrderStatus(prev[0]), prev[1],
+                                                            order.status, state[1]):
+                        continue  # our record is newer than the order book row
+                    replayed += 1
+                    for listener in self._order_listeners:
+                        await listener(order)
+            except Exception as e:
+                self.last_resync_error = f"{type(e).__name__}: {e}"
+                log.warning("Order resync with %s failed: %s", self.name, self.last_resync_error)
+                return 0
+            self.last_resync_at, self.last_resync_error = utcnow(), None
+            self.resynced_orders += replayed
+            if replayed:
+                log.warning("Resync: %d order update(s) from %s had been missed; applied now",
+                            replayed, self.name)
+            return replayed
+
+    async def _resync_loop(self) -> None:
+        while True:
+            await asyncio.sleep(self.settings.resync_interval)
+            await self.resync()
+
+    def health(self) -> dict:
+        return {
+            "name": self.name,
+            "connected": self.connected,
+            "reason": None if self.connected else self.not_connected_reason,
+            "last_resync_at": self.last_resync_at.isoformat() if self.last_resync_at else None,
+            "last_resync_error": self.last_resync_error,
+            "resynced_orders": self.resynced_orders,
+            **(self.broker.health() if self.broker is not None and hasattr(self.broker, "health") else {}),
+        }
 
     # ---------- orders ----------
 
@@ -111,10 +198,12 @@ class BrokerService:
         # Already placed: the trade ledger recorded it when the broker reported it.
         if (order := await find_by_client_order_id(self.name, cid)) is not None:
             return order
-        if cid in self._unknown_outcome:
-            # The last try got no answer, so it may have reached the broker: look for it there.
+        if cid in self._unknown_outcome or not self.records_reliable():
+            # The last try got no answer (or the ledger missed updates), so it may have
+            # reached the broker: look for it there.
             if found := next((o for o in await broker.get_orders() if o.client_order_id == cid), None):
                 return found
+        await self._orders_limit.acquire()
         try:
             order = await broker.place_order(req)
         except OrderError:
@@ -124,3 +213,9 @@ class BrokerService:
             raise
         self._unknown_outcome.discard(cid)
         return order
+
+    async def cancel_order(self, order_id: str) -> Order:
+        """Every cancel goes through here (rate-limited like placements)."""
+        broker = self.require()
+        await self._orders_limit.acquire()
+        return await broker.cancel_order(order_id)

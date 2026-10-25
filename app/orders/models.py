@@ -1,9 +1,10 @@
 from datetime import datetime
+from decimal import Decimal
 
-from sqlalchemy import Float, Index, Integer, String
+from sqlalchemy import Index, Integer, String
 from sqlalchemy.orm import Mapped, mapped_column
 
-from app.core.db import Base, UTCDateTime
+from app.core.db import Base, Money, UTCDateTime
 
 
 class OrderRecord(Base):
@@ -21,10 +22,10 @@ class OrderRecord(Base):
     side: Mapped[str] = mapped_column(String(4))
     quantity: Mapped[int] = mapped_column(Integer)
     order_type: Mapped[str] = mapped_column(String(16))
-    limit_price: Mapped[float | None] = mapped_column(Float, nullable=True)
+    limit_price: Mapped[Decimal | None] = mapped_column(Money, nullable=True)
     status: Mapped[str] = mapped_column(String(16))
     filled_quantity: Mapped[int] = mapped_column(Integer, default=0)
-    filled_price: Mapped[float | None] = mapped_column(Float, nullable=True)
+    filled_price: Mapped[Decimal | None] = mapped_column(Money, nullable=True)
     reason: Mapped[str | None] = mapped_column(String(512), nullable=True)
     created_at: Mapped[datetime] = mapped_column(UTCDateTime)
     updated_at: Mapped[datetime] = mapped_column(UTCDateTime)
@@ -41,6 +42,6 @@ class OrderEvent(Base):
     order_id: Mapped[str] = mapped_column(String(64))
     status: Mapped[str] = mapped_column(String(16))
     filled_quantity: Mapped[int] = mapped_column(Integer)
-    filled_price: Mapped[float | None] = mapped_column(Float, nullable=True)
+    filled_price: Mapped[Decimal | None] = mapped_column(Money, nullable=True)
     reason: Mapped[str | None] = mapped_column(String(512), nullable=True)
     at: Mapped[datetime] = mapped_column(UTCDateTime)

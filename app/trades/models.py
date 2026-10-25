@@ -1,9 +1,10 @@
 from datetime import datetime
+from decimal import Decimal
 
-from sqlalchemy import Float, ForeignKey, Index, Integer, String
+from sqlalchemy import ForeignKey, Index, Integer, String
 from sqlalchemy.orm import Mapped, mapped_column
 
-from app.core.db import Base, UTCDateTime
+from app.core.db import Base, Money, UTCDateTime
 
 
 class Fill(Base):
@@ -20,7 +21,7 @@ class Fill(Base):
     symbol: Mapped[str] = mapped_column(String(64))
     side: Mapped[str] = mapped_column(String(4))
     quantity: Mapped[int] = mapped_column(Integer)
-    price: Mapped[float] = mapped_column(Float)
+    price: Mapped[Decimal] = mapped_column(Money)
     filled_at: Mapped[datetime] = mapped_column(UTCDateTime)
 
 
@@ -38,10 +39,10 @@ class Position(Base):
     status: Mapped[str] = mapped_column(String(6))  # OPEN / CLOSED
     quantity: Mapped[int] = mapped_column(Integer)  # still open
     entry_quantity: Mapped[int] = mapped_column(Integer)
-    avg_entry_price: Mapped[float] = mapped_column(Float)
+    avg_entry_price: Mapped[Decimal] = mapped_column(Money)
     exit_quantity: Mapped[int] = mapped_column(Integer, default=0)
-    avg_exit_price: Mapped[float | None] = mapped_column(Float, nullable=True)
-    realized_pnl: Mapped[float] = mapped_column(Float, default=0.0)  # before charges/taxes
+    avg_exit_price: Mapped[Decimal | None] = mapped_column(Money, nullable=True)
+    realized_pnl: Mapped[Decimal] = mapped_column(Money, default=Decimal(0))  # before charges/taxes
     opened_at: Mapped[datetime] = mapped_column(UTCDateTime)
     closed_at: Mapped[datetime | None] = mapped_column(UTCDateTime, nullable=True)
 

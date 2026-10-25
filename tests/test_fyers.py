@@ -281,7 +281,8 @@ def test_login_callback_restarts_running_fyers_broker(client, monkeypatch):
     client.portal.call(brokers.restart)  # now running a Fyers broker, like the real server
     old = brokers.broker
 
-    login = client.get(f"/api/auth/fyers/login?token={settings.api_token}", follow_redirects=False)
+    login = client.get("/api/auth/fyers/login", headers={"Authorization": f"Bearer {settings.api_token}"},
+                       follow_redirects=False)
     assert login.status_code == 307
     state = next(iter(client.app.state.login_states))  # FakeSession doesn't put it in the URL
     r = client.get(f"/api/auth/fyers/callback?s=ok&code=200&auth_code=abc&state={state}")

@@ -34,6 +34,20 @@ class Settings(BaseSettings):
     # Seconds between simulated price ticks from the paper broker.
     tick_interval: float = 1.0
 
+    # Only one server process may run strategies and place orders: it holds this lock file
+    # (flock) while running, and a second one refuses to start. Empty = next to the SQLite file,
+    # or ./autotrade.lock for other databases.
+    lock_file: str = ""
+    # Order placements + cancels sent to the broker per second (Fyers and Kite allow 10).
+    broker_orders_per_second: float = 8.0
+    # Seconds between checks of the broker's order book against our records (0 = only on
+    # (re)connect). Catches order updates a socket never delivered.
+    resync_interval: float = 60.0
+    # Ticks queued per running strategy (and messages per WebSocket client) before the oldest
+    # ticks are dropped (the client is disconnected) so one slow consumer can't stall the rest.
+    strategy_queue_size: int = 1000
+    ws_queue_size: int = 1000
+
     # Fyers API v3. Log in daily at /auth/fyers/login; the token is saved in the database.
     fyers_client_id: str = ""  # app id, e.g. "XB12345-100"
     fyers_secret_key: str = ""  # app secret, needed for the login flow

@@ -54,6 +54,7 @@ def _instance_dict(row: StrategyInstance, runner: StrategyRunner) -> dict:
         "last_price": live.last_price if live else None,
         "orders_today": live.orders_today if live else None,
         "pending_order_id": live.pending_order_id if live else None,
+        "dropped_ticks": live.dropped_ticks if live else None,
     }
 
 

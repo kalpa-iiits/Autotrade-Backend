@@ -7,7 +7,13 @@ Safety rules, applied to every buy/sell before anything reaches the broker:
   - one open order at a time per instance
   - max order quantity, max absolute position, max orders per day (IST) — except for orders
     that only shrink the position (exits are never blocked by limits)
+  - live orders also pause while the trade ledger has updates it couldn't save
 A strategy that raises an exception is stopped with status "error".
+
+Each running instance has its own tick queue and worker task, so a strategy that is slow
+(placing an order, loading history) only delays itself: the broker feed, other strategies and
+clients keep going. If an instance falls `strategy_queue_size` ticks behind, its oldest ticks
+are dropped (counted in /health). Order updates are applied straight away, never queued.
 """
 
 import asyncio
@@ -113,7 +119,7 @@ class StrategyContext:
 
 
 class RunningInstance:
-    def __init__(self, config: StrategyInstance) -> None:
+    def __init__(self, config: StrategyInstance, queue_size: int = 1000) -> None:
         self.config = config
         self.id = config.id
         self.symbol = config.symbol
@@ -125,6 +131,19 @@ class RunningInstance:
         self._orders_day = _today_ist()
         self._orders_count = 0
         self.lock = asyncio.Lock()
+        self.ticks: asyncio.Queue[Tick] = asyncio.Queue(queue_size)
+        self.worker: asyncio.Task | None = None
+        self.dropped_ticks = 0
+
+    def enqueue(self, tick: Tick) -> None:
+        if self.ticks.full():
+            # Behind: the oldest tick matters least.
+            self.ticks.get_nowait()
+            self.ticks.task_done()
+            self.dropped_ticks += 1
+            if self.dropped_ticks % 100 == 1:
+                log.warning("Strategy %s is falling behind; %d ticks dropped", self.id, self.dropped_ticks)
+        self.ticks.put_nowait(tick)
 
     @property
     def orders_today(self) -> int:
@@ -224,12 +243,13 @@ class StrategyRunner:
         except ValueError as e:
             raise StrategyError(str(e))
 
-        inst = RunningInstance(config)
+        inst = RunningInstance(config, self.settings.strategy_queue_size)
         inst.position, inst.filled, inst.pending_order_id = await self._load_position(config)
         inst.orders_today = await self._orders_today(instance_id)
         inst.strategy = dep.strategy(dep.params, StrategyContext(self, inst), TIMEFRAMES[config.timeframe])
         await inst.strategy.on_start()
         self.running[instance_id] = inst
+        inst.worker = asyncio.create_task(self._work(inst))
         await self._set_status(instance_id, "running", None)
 
         if self.brokers.connected:
@@ -241,11 +261,13 @@ class StrategyRunner:
 
     async def stop(self, instance_id: int, status: str = "stopped", error: str | None = None) -> None:
         inst = self.running.pop(instance_id, None)
-        if inst is not None and inst.strategy is not None:
-            try:
-                await inst.strategy.on_stop()
-            except Exception:
-                log.exception("Strategy %s on_stop failed", instance_id)
+        if inst is not None:
+            await self._end_worker(inst)
+            if inst.strategy is not None:
+                try:
+                    await inst.strategy.on_stop()
+                except Exception:
+                    log.exception("Strategy %s on_stop failed", instance_id)
         await self._set_status(instance_id, status, error)
         if inst is not None and self.brokers.connected and inst.symbol not in self.brokers.watched_symbols():
             try:
@@ -262,12 +284,56 @@ class StrategyRunner:
     async def shutdown(self) -> None:
         """Server stopping: leave statuses as "running" so they resume on the next start."""
         for inst in self.running.values():
+            await self._end_worker(inst)
             if inst.strategy is not None:
                 try:
                     await inst.strategy.on_stop()
                 except Exception:
                     log.exception("Strategy %s on_stop failed", inst.id)
         self.running.clear()
+
+    async def _work(self, inst: RunningInstance) -> None:
+        """The instance's worker: hands it its ticks one at a time, in order."""
+        while True:
+            tick = await inst.ticks.get()
+            try:
+                inst.last_price = tick.price
+                await inst.strategy.on_tick(tick)
+            except Exception as e:
+                log.exception("Strategy %s failed on tick", inst.id)
+                inst.ticks.task_done()
+                await self.stop(inst.id, "error", f"{type(e).__name__}: {e}")
+                return
+            inst.ticks.task_done()
+
+    async def _end_worker(self, inst: RunningInstance) -> None:
+        worker, inst.worker = inst.worker, None
+        if worker is not None and worker is not asyncio.current_task():
+            # request() holds the lock from placing an order until its signal is saved: wait
+            # for that, so stopping never leaves a placed order unrecorded.
+            async with inst.lock:
+                worker.cancel()
+            try:
+                await worker
+            except asyncio.CancelledError:
+                pass
+        while not inst.ticks.empty():  # unblock anyone waiting in drain()
+            inst.ticks.get_nowait()
+            inst.ticks.task_done()
+
+    async def drain(self) -> None:
+        """Wait until every running instance has handled the ticks queued so far."""
+        for inst in list(self.running.values()):
+            if inst.worker is not None and not inst.worker.done():
+                await inst.ticks.join()
+
+    def health(self) -> dict:
+        return {
+            "running": len(self.running),
+            "dropped_ticks": sum(i.dropped_ticks for i in self.running.values()),
+            "queued_ticks": sum(i.ticks.qsize() for i in self.running.values()),
+            "live_enabled": self.settings.strategies_live_enabled,
+        }
 
     # ---------- broker events ----------
 
@@ -276,13 +342,8 @@ class StrategyRunner:
         for inst in list(self.running.values()):
             if inst.symbol != symbol:
                 continue
-            inst.last_price = price
             tick = tick or Tick(symbol=symbol, price=price, at=utcnow())
-            try:
-                await inst.strategy.on_tick(tick)
-            except Exception as e:
-                log.exception("Strategy %s failed on tick", inst.id)
-                await self.stop(inst.id, "error", f"{type(e).__name__}: {e}")
+            inst.enqueue(tick)
 
     async def on_order(self, order: Order) -> None:
         self._recent_orders[order.id] = order
@@ -312,6 +373,8 @@ class StrategyRunner:
                 return "Live strategy trading is off (set AUTOTRADE_STRATEGIES_LIVE=true)"
             if not self.brokers.connected:
                 return f"Broker not connected: {self.brokers.not_connected_reason}"
+            if not self.brokers.records_reliable():
+                return "Trade ledger has unsaved order updates (see /health); live orders paused"
             if inst.pending_order_id:
                 return f"Order {inst.pending_order_id} is still open"
         new_position = inst.position + (quantity if side == Side.BUY else -quantity)

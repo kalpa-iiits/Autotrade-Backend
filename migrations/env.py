@@ -16,7 +16,7 @@ from sqlalchemy.ext.asyncio import create_async_engine
 
 from alembic import context
 from app.core.config import settings
-from app.core.db import Base, UTCDateTime, import_models
+from app.core.db import Base, Money, UTCDateTime, import_models
 
 config = context.config
 import_models()
@@ -24,9 +24,12 @@ target_metadata = Base.metadata
 
 
 def _render_item(type_, obj, autogen_context):
-    """Write our UTCDateTime as a plain DateTime in migration files (same column type)."""
+    """Write our UTCDateTime / Money as plain DateTime / BigInteger in migration files (same
+    column types)."""
     if type_ == "type" and isinstance(obj, UTCDateTime):
         return "sa.DateTime()"  # migration files already import sqlalchemy as sa
+    if type_ == "type" and isinstance(obj, Money):
+        return "sa.BigInteger()"
     return False
 
 

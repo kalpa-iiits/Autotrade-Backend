@@ -7,6 +7,7 @@ from pydantic import TypeAdapter, ValidationError
 
 from app.auth.dependencies import websocket_user
 from app.brokers import OrderError
+from app.core.connections import ConnectionManager
 from app.core.schemas import Ping
 
 
@@ -18,29 +19,30 @@ async def serve(
     ws: WebSocket,
     adapter: TypeAdapter,
     handle: Handler,
-    on_connect: Callable[[WebSocket], None] = lambda ws: None,
+    connections: ConnectionManager,
     on_disconnect: Callable[[WebSocket], Awaitable[None]] | None = None,
 ) -> None:
+    """Replies go through `connections` like pushed messages, so a client sees them in the
+    order they happened (e.g. an order's update before the ack of the request that placed it)."""
     if await websocket_user(ws) is None:
         await ws.close(code=status.WS_1008_POLICY_VIOLATION, reason="Not logged in")
         return
 
     await ws.accept()
-    on_connect(ws)
-    await ws.send_json({"type": "welcome", "broker": ws.app.state.brokers.name})
+    connections.add(ws)
+    send = connections.send
+    send(ws, {"type": "welcome", "broker": ws.app.state.brokers.name})
     try:
         while True:
             raw = await ws.receive_text()
             try:
                 msg = adapter.validate_json(raw)
             except ValidationError as e:
-                await ws.send_json(
-                    {"type": "error", "error": e.errors(include_url=False, include_context=False)}
-                )
+                send(ws, {"type": "error", "error": e.errors(include_url=False, include_context=False)})
                 continue
 
             if isinstance(msg, Ping):
-                await ws.send_json({"type": "pong", "request_id": msg.request_id})
+                send(ws, {"type": "pong", "request_id": msg.request_id})
                 continue
 
             reply = {"type": "ack", "action": msg.action, "request_id": msg.request_id}
@@ -51,9 +53,10 @@ async def serve(
                 # is still reported instead of killing the socket.
                 reply = {"type": "error", "action": msg.action, "request_id": msg.request_id,
                          "error": str(e) if isinstance(e, OrderError) else f"Broker error: {e}"}
-            await ws.send_json(reply)
+            send(ws, reply)
     except WebSocketDisconnect:
         pass
     finally:
         if on_disconnect is not None:
             await on_disconnect(ws)
+        connections.remove(ws)

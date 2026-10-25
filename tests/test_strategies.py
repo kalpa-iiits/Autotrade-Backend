@@ -77,7 +77,10 @@ def start_strategy(client, key):
 
 
 def tick(client, price=100.0, symbol=SYM):
-    run(client, client.app.state.strategy_runner.on_tick, symbol, price)
+    """Feed a tick and wait until the strategies have handled it (they run on their own tasks)."""
+    runner = client.app.state.strategy_runner
+    run(client, runner.on_tick, symbol, price)
+    run(client, runner.drain)
 
 
 def signals(client, instance_id):

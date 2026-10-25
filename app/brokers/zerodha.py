@@ -10,6 +10,7 @@ frames for ticks.
 
 import asyncio
 import json
+import logging
 import struct
 from datetime import date, datetime, time
 from urllib.parse import urlencode
@@ -22,6 +23,7 @@ from websockets.exceptions import ConnectionClosed, InvalidStatus
 from app.brokers.base import Broker, Candle, MissingCredentials, OrderError, Resolution
 from app.orders.schemas import Order, OrderStatus, OrderType, PlaceOrder, Position, Side
 
+log = logging.getLogger(__name__)
 KITE_WS_URL = "wss://ws.kite.trade"
 RECONNECT_DELAY = 1.0  # pause after a dropped connection before reconnecting
 VARIETY = "regular"
@@ -113,7 +115,6 @@ class ZerodhaBroker(Broker):
 
         self._ws = None
         self._task: asyncio.Task | None = None
-        self.ticker_error: str | None = None
         # Kite streams by numeric instrument token; keep both directions of the mapping.
         self._token_of: dict[str, int] = {}
         self._symbol_of: dict[int, str] = {}
@@ -136,23 +137,31 @@ class ZerodhaBroker(Broker):
 
     async def _run_socket(self) -> None:
         # Iterating connect() reconnects, with backoff when connecting fails.
+        connects = 0
         try:
             async for ws in self._connect(self._ws_url):
                 self._ws = ws
+                self.stream_error = None
+                connects += 1
                 try:
                     if self._subscribed:
                         await self._send_subscribe(sorted(self._subscribed))
+                    if connects > 1:
+                        # Order updates sent while we were disconnected are lost: reconcile.
+                        await self._emit_reconnect()
                     async for frame in ws:
                         await self._handle_frame(frame)
-                except ConnectionClosed:
-                    pass
+                except ConnectionClosed as e:
+                    self.stream_error = f"Kite WebSocket dropped: {e}"
+                    log.warning("%s; reconnecting", self.stream_error)
                 finally:
                     self._ws = None
                 # connect() only backs off on failed attempts, so pace reconnects after drops.
                 await asyncio.sleep(RECONNECT_DELAY)
         except InvalidStatus as e:
             # 403 = expired/invalid access token; retrying won't help until a new login.
-            self.ticker_error = f"Kite WebSocket refused the connection: {e}"
+            self.stream_error = f"Kite WebSocket refused the connection: {e}"
+            log.error("%s", self.stream_error)
 
     async def _handle_frame(self, frame) -> None:
         if isinstance(frame, bytes):

@@ -37,6 +37,37 @@ uvicorn app.main:app --reload
 
 Open http://127.0.0.1:8000, sign in, and use the built-in test client.
 
+Run **one** server process (no `--workers 2`): strategies, the broker connection and order
+de-duplication live in it, so a second process would place every order twice. The server
+holds a lock file while it runs (next to the SQLite file, or `AUTOTRADE_LOCK_FILE`) and a
+second one refuses to start.
+
+## Reliability
+
+- **Reconciliation.** After every broker (re)connect, at startup, and every
+  `AUTOTRADE_RESYNC_INTERVAL` seconds (60), the broker's order book is compared with the
+  `orders` table and every order whose state we missed (socket down, dropped update) is
+  replayed to the ledger, running strategies and clients. A strategy never stays stuck waiting
+  on a fill it was never told about.
+- **Slow consumers are isolated.** Each running strategy has its own tick queue and task, and
+  each WebSocket client its own send queue, so a strategy placing an order or a slow browser tab
+  never delays the broker feed or anyone else. A strategy that falls
+  `AUTOTRADE_STRATEGY_QUEUE_SIZE` ticks behind drops its oldest ticks; a client that falls
+  `AUTOTRADE_WS_QUEUE_SIZE` messages behind is disconnected (code 1013) and should reconnect.
+  Fyers' SDK callbacks (on its own threads) are delivered in order, one at a time, like the
+  other brokers'.
+- **Ledger failures are never dropped.** An order update the database can't save is kept and
+  retried (latest state per order) until it is. Meanwhile `/health` reports `failing`, order
+  placement double-checks the broker before sending, and live strategies are paused.
+- **Broker rate limit.** Placements and cancels are spaced to
+  `AUTOTRADE_BROKER_ORDERS_PER_SECOND` (8; Fyers and Kite allow 10).
+- **Exact money.** Prices and P&L are stored as exact decimals (whole 1/10000ths), so totals
+  don't drift the way float sums do.
+- **`GET /health`** (public, no secrets): `status` is `ok`, `degraded` (broker not connected or
+  its stream reports a problem: normal before the daily login) or `failing` with HTTP 503
+  (database unreachable or unsaved ledger updates). Also reports tick counts and the last tick
+  time, the last resync, dropped ticks, queued ticks and evicted WebSocket clients.
+
 ## Database
 
 SQLite at `./autotrade.db` for now (`AUTOTRADE_DATABASE_URL`). Moving to Postgres later is a
@@ -126,7 +157,8 @@ python -m app.auth.users list
   existing sessions. WebSockets use the same cookie and reject pages from other
   origins. Behind HTTPS, set `AUTOTRADE_SECURE_COOKIES=true`.
 - **API token (optional)** for scripts and bots: set `AUTOTRADE_API_TOKEN`, then send
-  `Authorization: Bearer ...` to REST endpoints or `?token=...` on WebSockets. Empty = disabled.
+  `Authorization: Bearer ...` to REST endpoints or `?token=...` on WebSockets (browsers can't
+  set WebSocket headers). REST does not accept `?token=`: URLs end up in logs. Empty = disabled.
 - Interactive API docs: `/api/docs` (and `/api/openapi.json`), for signed-in users only.
   Turn off with `AUTOTRADE_ENABLE_DOCS=false`.
 - **Broker login** (real money). Fyers and Zerodha tokens expire daily, so log in once each
@@ -345,8 +377,11 @@ app/
   core/
     config.py             settings from env / .env
     db.py                 SQLAlchemy async engine/session; runs migrations at startup
-    broker_service.py     owns the live broker; restarted after a Fyers login
-    connections.py        tracks sockets per app and what each one follows
+    broker_service.py     owns the live broker; restarted after a broker login; order
+                          de-duplication, rate limit, reconciliation with the order book
+    connections.py        tracks sockets per app, what each one follows, per-client send queues
+    instance_lock.py      one server process at a time
+    ratelimit.py          token bucket for broker order calls
     ws.py                 shared WebSocket loop (auth, parsing, ack/error replies)
     schemas.py            messages shared by all apps (ping)
   brokers/
@@ -372,7 +407,7 @@ app/
   static/                 test client page
 migrations/               Alembic env.py and versions/ (the schema history)
 alembic.ini
-tests/                    one file per app, plus test_fyers.py and test_zerodha.py
+tests/                    one file per app, test_fyers.py, test_zerodha.py, test_reliability.py
 ```
 
 ## Tests

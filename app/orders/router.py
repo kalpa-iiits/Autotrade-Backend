@@ -33,19 +33,14 @@ async def orders_socket(ws: WebSocket):
         if isinstance(msg, PlaceOrder):
             return {"order": (await brokers.place_order(msg)).model_dump(mode="json")}
         if isinstance(msg, CancelOrder):
-            return {"order": (await broker.cancel_order(msg.order_id)).model_dump(mode="json")}
+            return {"order": (await brokers.cancel_order(msg.order_id)).model_dump(mode="json")}
         if msg.action == "get_orders":
             return {"orders": [o.model_dump(mode="json") for o in await broker.get_orders()]}
         if msg.action == "get_positions":
             return {"positions": [p.model_dump(mode="json") for p in await broker.get_positions()]}
         return {"funds": await broker.get_funds()}
 
-    await serve(ws, _adapter, handle, on_connect=connections.add,
-                on_disconnect=lambda ws: _forget(connections, ws))
-
-
-async def _forget(connections: ConnectionManager, ws: WebSocket) -> None:
-    connections.remove(ws)
+    await serve(ws, _adapter, handle, connections)
 
 
 # ---------- REST (session cookie, or Authorization: Bearer <API token>) ----------
@@ -98,7 +93,7 @@ async def history(
 async def cancel_order(request: Request, order_id: str):
     """Cancel an open order."""
     async with broker_errors():
-        return await broker_or_503(request).cancel_order(order_id)
+        return await request.app.state.brokers.cancel_order(order_id)
 
 
 @rest.get("/{order_id}/events")

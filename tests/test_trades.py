@@ -1,3 +1,5 @@
+from decimal import Decimal
+
 import pytest
 from sqlalchemy import func, select
 
@@ -80,7 +82,7 @@ def test_partial_fills_and_duplicates(client, ledger):
         async with db.session() as s:
             return [(f.quantity, f.price) for f in await s.scalars(select(Fill).order_by(Fill.filled_at))]
     # Second fill's price is backed out of the averages: (10*101 - 4*100) / 6.
-    assert run(client, fills) == [(4, 100.0), (6, 101.6667)]
+    assert run(client, fills) == [(4, Decimal("100")), (6, Decimal("101.6667"))]  # exact
     assert count(client, OrderEvent, order_id="b1") == 3  # open, partial, filled (not the repeat)
     [p] = positions(client)
     assert (p.status, p.quantity, p.avg_entry_price) == ("OPEN", 10, 101.0)

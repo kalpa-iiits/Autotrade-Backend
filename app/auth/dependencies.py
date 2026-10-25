@@ -3,7 +3,7 @@
 import secrets
 from urllib.parse import urlparse
 
-from fastapi import Header, HTTPException, Query, Request, WebSocket, status
+from fastapi import Header, HTTPException, Request, WebSocket, status
 from starlette.requests import HTTPConnection
 
 from app.auth.models import User
@@ -37,16 +37,14 @@ def _same_origin(conn: HTTPConnection) -> bool:
 
 async def require_user(
     request: Request,
-    token: str | None = Query(default=None),
     authorization: str | None = Header(default=None),
 ) -> str:
-    """REST guard: a session cookie, or `Authorization: Bearer <API token>` / `?token=`.
-    Returns the username ("api" for token access)."""
+    """REST guard: a session cookie, or `Authorization: Bearer <API token>`. Returns the
+    username ("api" for token access). Not `?token=`: URLs end up in access logs, proxy logs
+    and browser history. (WebSockets still take ?token=, as browsers can't set their headers.)"""
     if user := await session_user(request):
         return user.username
-    if authorization and authorization.lower().startswith("bearer "):
-        token = authorization[7:]
-    if token_is_valid(token):
+    if authorization and authorization.lower().startswith("bearer ") and token_is_valid(authorization[7:]):
         return "api"
     raise HTTPException(status.HTTP_401_UNAUTHORIZED, "Log in at /login or send a valid API token")
 

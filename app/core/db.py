@@ -9,9 +9,10 @@ review the generated file in migrations/versions/, then restart the app.
 import logging
 import os
 from datetime import datetime, timezone
+from decimal import ROUND_HALF_EVEN, Decimal
 from pathlib import Path
 
-from sqlalchemy import DateTime, event, inspect
+from sqlalchemy import BigInteger, DateTime, event, inspect
 from sqlalchemy.engine import make_url
 from sqlalchemy.ext.asyncio import AsyncEngine, AsyncSession, async_sessionmaker, create_async_engine
 from sqlalchemy.orm import DeclarativeBase
@@ -37,6 +38,30 @@ class UTCDateTime(TypeDecorator):
 
     def process_result_value(self, value, dialect):
         return value.replace(tzinfo=timezone.utc) if value is not None else None
+
+
+class Money(TypeDecorator):
+    """Exact prices and P&L: stored as a whole number of 1/10000ths (BIGINT, exact on SQLite
+    and Postgres alike), handed back as Decimal. Accepts Decimal, int, float or str."""
+
+    impl = BigInteger
+    cache_ok = True
+    SCALE = Decimal("0.0001")
+
+    def process_bind_param(self, value, dialect):
+        if value is None:
+            return None
+        return int(to_decimal(value) / self.SCALE)
+
+    def process_result_value(self, value, dialect):
+        return None if value is None else (Decimal(value) * self.SCALE).quantize(self.SCALE)
+
+
+def to_decimal(value) -> Decimal:
+    """A price as an exact Decimal with 4 places. Floats go through str(), so 101.1 stays
+    101.1 instead of 101.0999999..."""
+    d = value if isinstance(value, Decimal) else Decimal(str(value))
+    return d.quantize(Money.SCALE, rounding=ROUND_HALF_EVEN)
 
 
 def utcnow() -> datetime:

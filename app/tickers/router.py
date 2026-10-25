@@ -46,7 +46,7 @@ async def tickers_socket(ws: WebSocket):
         if unwatched and brokers.connected:
             await brokers.broker.unsubscribe(sorted(unwatched))
 
-    await serve(ws, _adapter, handle, on_connect=connections.add, on_disconnect=on_disconnect)
+    await serve(ws, _adapter, handle, connections, on_disconnect=on_disconnect)
 
 
 

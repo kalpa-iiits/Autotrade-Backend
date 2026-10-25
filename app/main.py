@@ -7,7 +7,8 @@ from pathlib import Path
 from fastapi import APIRouter, Depends, FastAPI, Request
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.openapi.docs import get_swagger_ui_html
-from fastapi.responses import FileResponse
+from fastapi.responses import FileResponse, Response
+from sqlalchemy import text
 from starlette.middleware.sessions import SessionMiddleware
 
 from app.auth.api import router as auth_api_router
@@ -22,6 +23,7 @@ from app.core.broker_service import BrokerService
 from app.core import db
 from app.core.config import settings
 from app.core.connections import ConnectionManager
+from app.core.instance_lock import InstanceLock, lock_path
 from app.orders.router import publish_order
 from app.orders.router import router as orders_router
 from app.strategies import deployments
@@ -37,17 +39,28 @@ STATIC_DIR = Path(__file__).parent / "static"
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
+    lock = InstanceLock(lock_path(settings.lock_file, settings.database_url))
+    lock.acquire()  # one server process only: see app/core/instance_lock.py
+    try:
+        async with _services(app):
+            yield
+    finally:
+        lock.release()
+
+
+@asynccontextmanager
+async def _services(app: FastAPI):
     await db.init(settings.database_url)
     token_stores = {name: TokenStore(name) for name in ("fyers", "zerodha")}
-    order_connections = ConnectionManager()
-    ticker_connections = ConnectionManager()
+    order_connections = ConnectionManager(settings.ws_queue_size)
+    ticker_connections = ConnectionManager(settings.ws_queue_size)
 
     async def active_token() -> str | None:
         store = token_stores.get(settings.broker)
         return await store.load() if store else None
 
-    brokers = BrokerService(settings, token_loader=active_token)
     ledger = TradeLedger(settings.broker)
+    brokers = BrokerService(settings, token_loader=active_token, records_reliable=lambda: ledger.healthy)
     brokers.on_order_update(ledger.on_order)  # orders, order_events, fills, positions tables
     brokers.on_order_update(partial(publish_order, order_connections))
     brokers.on_tick(ledger.on_tick)
@@ -70,19 +83,25 @@ async def lifespan(app: FastAPI):
     app.state.order_connections = order_connections
     app.state.ticker_connections = ticker_connections
 
-    await brokers.start()  # stays disconnected (not an error) until the broker login
+    await ledger.start()
+    # Stays disconnected (not an error) until the broker login. The order book is checked
+    # against our records below, once running strategies own their open orders again.
+    await brokers.start(resync=False)
     try:
         await runner.sync(deployments.DEPLOYMENTS)  # strategies are defined in code only
         await runner.resume()  # ones that were running before the restart
+        await brokers.resync()  # fills / cancels that happened while we were down
     except BaseException:
         # Startup failed after the broker connected: close its sockets, or their threads
         # keep the process alive in a state that serves nothing.
         await brokers.stop()
+        await ledger.stop()
         await db.close()
         raise
     yield
     await runner.shutdown()
     await brokers.stop()
+    await ledger.stop()
     await db.close()
 
 
@@ -148,9 +167,44 @@ if settings.enable_docs:
         return get_swagger_ui_html(openapi_url="/api/openapi.json", title=f"{settings.app_name} API")
 
 
+async def _database_ok() -> bool:
+    try:
+        async with db.session() as s:
+            await s.execute(text("select 1"))
+        return True
+    except Exception:
+        return False
+
+
 @app.get("/health")
-async def health():
-    return {"status": "ok", "broker": settings.broker, "connected": app.state.brokers.connected}
+async def health(response: Response):
+    """For monitoring (public: no secrets, only states and counts).
+    status "ok"; "degraded" when the broker is not connected or its stream reports a problem
+    (normal before the daily broker login); "failing" with HTTP 503 when the database is
+    unreachable or the trade ledger has updates it couldn't save."""
+    state = app.state
+    brokers, ledger = state.brokers.health(), state.ledger.health()
+    database = await _database_ok()
+    if not database or not ledger["healthy"]:
+        status_ = "failing"
+        response.status_code = 503
+    elif not brokers["connected"] or brokers.get("stream_error") or brokers["last_resync_error"]:
+        status_ = "degraded"
+    else:
+        status_ = "ok"
+    return {
+        "status": status_,
+        "broker": settings.broker,
+        "connected": brokers["connected"],
+        "database": database,
+        "broker_detail": brokers,
+        "ledger": ledger,
+        "strategies": state.strategy_runner.health(),
+        "websockets": {
+            "orders": len(state.order_connections), "tickers": len(state.ticker_connections),
+            "evicted_slow_clients": state.order_connections.evicted + state.ticker_connections.evicted,
+        },
+    }
 
 
 @app.get("/", include_in_schema=False)

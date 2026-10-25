@@ -40,7 +40,7 @@ def fyers_login(client, monkeypatch):
 
 
 def start_login(client):
-    r = client.get(f"/api/auth/fyers/login?token={TOKEN}", follow_redirects=False)
+    r = client.get("/api/auth/fyers/login", headers={"Authorization": f"Bearer {TOKEN}"}, follow_redirects=False)
     assert r.status_code == 307
     return parse_qs(urlparse(r.headers["location"]).query)["state"][0]
 
@@ -128,7 +128,7 @@ def zerodha_login(client, monkeypatch):
 
 
 def start_zerodha_login(client):
-    r = client.get(f"/api/auth/zerodha/login?token={TOKEN}", follow_redirects=False)
+    r = client.get("/api/auth/zerodha/login", headers={"Authorization": f"Bearer {TOKEN}"}, follow_redirects=False)
     assert r.status_code == 307
     query = parse_qs(urlparse(r.headers["location"]).query)
     assert query["api_key"] == ["kitekey"]

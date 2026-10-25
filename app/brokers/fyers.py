@@ -1,8 +1,9 @@
 """Fyers API v3 broker: real orders via REST, live ticks and order updates via WebSockets.
 
 The Fyers SDK is synchronous and runs its sockets on its own threads, so REST calls go
-through asyncio.to_thread and socket callbacks hop back onto the event loop with
-run_coroutine_threadsafe.
+through asyncio.to_thread and socket callbacks hop back onto the event loop through one queue,
+handled by one task: ticks and order updates reach listeners one at a time and in the order
+the sockets delivered them, as with the other brokers.
 """
 
 import asyncio
@@ -93,14 +94,19 @@ class FyersBroker(Broker):
         self._order_socket_factory = order_socket_factory or order_ws.FyersOrderSocket
 
         self._loop: asyncio.AbstractEventLoop | None = None
+        self._events: asyncio.Queue | None = None
+        self._pump: asyncio.Task | None = None
         self._data_socket = None
         self._order_socket = None
         self._symbols: set[str] = set()
+        self._order_connects = 0
 
     # ---------- lifecycle ----------
 
     async def start(self) -> None:
         self._loop = asyncio.get_running_loop()
+        self._events = asyncio.Queue()
+        self._pump = asyncio.create_task(self._run_events())
         self._data_socket = self._data_socket_factory(
             access_token=self._socket_token,
             log_path=self._log_dir,
@@ -109,8 +115,8 @@ class FyersBroker(Broker):
             reconnect=True,
             on_connect=self._on_data_connect,
             on_message=self._on_tick_message,
-            on_error=lambda msg: None,
-            on_close=lambda msg: None,
+            on_error=lambda msg: self._on_socket_error("data", msg),
+            on_close=lambda msg: log.info("Fyers data socket closed: %s", msg),
         )
         self._order_socket = self._order_socket_factory(
             access_token=self._socket_token,
@@ -120,8 +126,8 @@ class FyersBroker(Broker):
             on_connect=self._on_order_connect,
             on_orders=self._on_order_message,
             on_general=lambda msg: None,  # otherwise the SDK print()s these
-            on_error=lambda msg: None,
-            on_close=lambda msg: None,
+            on_error=lambda msg: self._on_socket_error("order", msg),
+            on_close=lambda msg: log.info("Fyers order socket closed: %s", msg),
         )
         await asyncio.to_thread(self._data_socket.connect)
         await asyncio.to_thread(self._order_socket.connect)
@@ -138,16 +144,43 @@ class FyersBroker(Broker):
             except Exception:
                 log.warning("Error while closing %s", type(sock).__name__, exc_info=True)
         self._data_socket = self._order_socket = None
+        self._loop = None
+        if self._pump is not None:
+            self._pump.cancel()
+            try:
+                await self._pump
+            except asyncio.CancelledError:
+                pass
+            self._pump = None
+        while self._events is not None and not self._events.empty():
+            self._events.get_nowait().close()  # never-run coroutines: no "never awaited" warning
+
+    async def _run_events(self) -> None:
+        while True:
+            coro = await self._events.get()
+            try:
+                await coro
+            except Exception:
+                log.exception("Error handling a Fyers socket message")
 
     # ---------- socket callbacks (run on SDK threads) ----------
 
     def _on_data_connect(self) -> None:
         # Also fires after a reconnect, so re-subscribe everything we were watching.
+        self.stream_error = None
         if self._symbols:
             self._data_socket.subscribe(symbols=sorted(self._symbols), data_type="SymbolUpdate")
 
     def _on_order_connect(self) -> None:
         self._order_socket.subscribe(data_type="OnOrders")
+        self._order_connects += 1
+        if self._order_connects > 1:
+            # Order updates sent while the socket was down are lost: reconcile.
+            self._schedule(self._emit_reconnect())
+
+    def _on_socket_error(self, which: str, message) -> None:
+        self.stream_error = f"Fyers {which} socket: {message}"
+        log.warning("%s", self.stream_error)
 
     def _on_tick_message(self, message) -> None:
         if isinstance(message, dict) and "ltp" in message and "symbol" in message:
@@ -159,9 +192,13 @@ class FyersBroker(Broker):
             self._schedule(self._record(_order_from_fyers(data)))
 
     def _schedule(self, coro) -> None:
-        if self._loop is not None:
-            asyncio.run_coroutine_threadsafe(coro, self._loop)
-        else:
+        loop, events = self._loop, self._events
+        if loop is None or events is None:
+            coro.close()
+            return
+        try:
+            loop.call_soon_threadsafe(events.put_nowait, coro)
+        except RuntimeError:  # loop already closed (shutdown)
             coro.close()
 
     # ---------- market data ----------

@@ -9,6 +9,8 @@ from app.orders.schemas import Order, PlaceOrder, Position, _now, moves_backward
 OrderListener = Callable[[Order], Awaitable[None]]
 # Called on every price tick: (symbol, price).
 TickListener = Callable[[str, float], Awaitable[None]]
+# Called after a stream reconnected (not on the first connect): updates may have been missed.
+ReconnectListener = Callable[[], Awaitable[None]]
 
 
 # Candle sizes every broker supports: daily and 1-minute.
@@ -39,14 +41,33 @@ class Broker(ABC):
     def __init__(self) -> None:
         self._order_listeners: list[OrderListener] = []
         self._tick_listeners: list[TickListener] = []
+        self._reconnect_listeners: list[ReconnectListener] = []
         # Last known state per order id, for brokers that report orders via _record.
         self._orders: dict[str, Order] = {}
+        self.ticks_received = 0
+        self.last_tick_at: datetime | None = None
+        # Latest problem with the streaming connection (shown on /health); None when fine.
+        self.stream_error: str | None = None
 
     def on_order_update(self, listener: OrderListener) -> None:
         self._order_listeners.append(listener)
 
     def on_tick(self, listener: TickListener) -> None:
         self._tick_listeners.append(listener)
+
+    def on_reconnect(self, listener: ReconnectListener) -> None:
+        self._reconnect_listeners.append(listener)
+
+    async def _emit_reconnect(self) -> None:
+        for listener in self._reconnect_listeners:
+            await listener()
+
+    def health(self) -> dict:
+        return {
+            "ticks_received": self.ticks_received,
+            "last_tick_at": self.last_tick_at.isoformat() if self.last_tick_at else None,
+            "stream_error": self.stream_error,
+        }
 
     async def _emit_order(self, order: Order) -> None:
         for listener in self._order_listeners:
@@ -70,6 +91,9 @@ class Broker(ABC):
         return order
 
     async def _emit_tick(self, symbol: str, price: float) -> None:
+        # Listeners must be quick (record, enqueue): slow work runs on their own tasks.
+        self.ticks_received += 1
+        self.last_tick_at = _now()
         for listener in self._tick_listeners:
             await listener(symbol, price)
 

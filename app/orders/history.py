@@ -38,6 +38,18 @@ async def find_by_client_order_id(broker: str, client_order_id: str) -> Order | 
     return _to_order(row) if row is not None else None
 
 
+async def recorded_states(broker: str, order_ids: list[str]) -> dict[str, tuple]:
+    """order id -> (status, filled quantity, filled price) as recorded, for the given ids."""
+    if not order_ids:
+        return {}
+    async with db.session() as s:
+        rows = await s.execute(
+            select(OrderRecord.id, OrderRecord.status, OrderRecord.filled_quantity, OrderRecord.filled_price)
+            .where(OrderRecord.broker == broker, OrderRecord.id.in_(order_ids))
+        )
+        return {oid: (status, filled, price) for oid, status, filled, price in rows}
+
+
 async def list_events(order_id: str, broker: str | None = None) -> list[dict]:
     query = select(OrderEvent).where(OrderEvent.order_id == order_id).order_by(OrderEvent.id)
     if broker:
