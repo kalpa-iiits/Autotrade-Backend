@@ -31,8 +31,11 @@ from app.orders.schemas import (
 
 log = logging.getLogger(__name__)
 FYERS_NSE_MASTER = "https://public.fyers.in/sym_details/NSE_CM.csv"
+FYERS_NSE_FO_MASTER = "https://public.fyers.in/sym_details/NSE_FO.csv"
 _nse_instruments: tuple[date, list[Instrument]] | None = None
 _nse_instruments_lock = asyncio.Lock()
+_tick_sizes: dict[str, tuple[date, dict[str, float]]] = {}  # master URL -> (day, symbol -> tick)
+_tick_sizes_lock = asyncio.Lock()
 
 # Fyers numeric codes -> our enums.
 FYERS_STATUS = {
@@ -66,6 +69,31 @@ def parse_nse_instruments(text: str) -> list[Instrument]:
     return sorted(instruments.values(), key=lambda item: (item.kind != "index", item.ticker))
 
 
+def parse_tick_sizes(text: str) -> dict[str, float]:
+    """Symbol -> minimum price step from a FYERS symbol master (column 4 is the tick size)."""
+    ticks: dict[str, float] = {}
+    for row in csv.reader(io.StringIO(text)):
+        if len(row) < 10:
+            continue
+        try:
+            tick = float(row[4])
+        except ValueError:
+            continue
+        if tick > 0:
+            ticks[row[9].strip()] = tick
+    return ticks
+
+
+async def _download_master(url: str) -> str:
+    try:
+        async with httpx.AsyncClient(timeout=30, follow_redirects=True) as client:
+            response = await client.get(url)
+            response.raise_for_status()
+    except httpx.HTTPError as e:
+        raise RuntimeError(f"Could not load the FYERS symbol master {url}: {e}") from e
+    return response.text
+
+
 async def _load_nse_instruments() -> list[Instrument]:
     global _nse_instruments
     today = datetime.now(timezone.utc).date()
@@ -74,17 +102,25 @@ async def _load_nse_instruments() -> list[Instrument]:
     async with _nse_instruments_lock:
         if _nse_instruments is not None and _nse_instruments[0] == today:
             return _nse_instruments[1]
-        try:
-            async with httpx.AsyncClient(timeout=15, follow_redirects=True) as client:
-                response = await client.get(FYERS_NSE_MASTER)
-                response.raise_for_status()
-        except httpx.HTTPError as e:
-            raise RuntimeError(f"Could not load the FYERS NSE instrument list: {e}") from e
-        instruments = parse_nse_instruments(response.text)
+        instruments = parse_nse_instruments(await _download_master(FYERS_NSE_MASTER))
         if not instruments:
             raise RuntimeError("FYERS returned an empty NSE instrument list")
         _nse_instruments = today, instruments
         return instruments
+
+
+async def _load_tick_sizes(url: str) -> dict[str, float]:
+    today = datetime.now(timezone.utc).date()
+    cached = _tick_sizes.get(url)
+    if cached is not None and cached[0] == today:
+        return cached[1]
+    async with _tick_sizes_lock:
+        cached = _tick_sizes.get(url)
+        if cached is not None and cached[0] == today:
+            return cached[1]
+        ticks = parse_tick_sizes(await _download_master(url))
+        _tick_sizes[url] = today, ticks
+        return ticks
 
 
 def _is_derivative(symbol: str) -> bool:
@@ -290,6 +326,16 @@ class FyersBroker(Broker):
         if exchange.upper() != "NSE":
             raise OrderError(f"Fyers instrument search does not support {exchange!r}")
         return await _load_nse_instruments()
+
+    async def get_tick_size(self, symbol: str) -> float | None:
+        if not symbol.startswith("NSE:"):
+            return None
+        url = FYERS_NSE_FO_MASTER if _is_derivative(symbol) else FYERS_NSE_MASTER
+        try:
+            return (await _load_tick_sizes(url)).get(symbol)
+        except RuntimeError as e:
+            log.warning("tick size for %s unavailable: %s", symbol, e)
+            return None
 
     # ---------- orders ----------
 

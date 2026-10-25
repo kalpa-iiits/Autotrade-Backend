@@ -133,6 +133,7 @@ class ZerodhaBroker(Broker):
         self._symbol_of: dict[int, str] = {}
         self._subscribed: set[int] = set()
         self._instrument_cache: tuple[date, list[Instrument]] | None = None
+        self._tick_cache: dict[str, tuple[date, dict[str, float]]] = {}  # exchange -> symbol -> tick
 
     # ---------- lifecycle ----------
 
@@ -253,6 +254,22 @@ class ZerodhaBroker(Broker):
         instruments.sort(key=lambda item: (item.kind != "index", item.ticker))
         self._instrument_cache = today, instruments
         return instruments
+
+    async def get_tick_size(self, symbol: str) -> float | None:
+        exchange, tradingsymbol = split_symbol(symbol)
+        today = datetime.now().date()
+        cached = self._tick_cache.get(exchange)
+        if cached is None or cached[0] != today:
+            try:
+                rows = await asyncio.to_thread(self._kite.instruments, exchange)
+            except KiteException as e:
+                log.warning("tick sizes for %s unavailable: %s", exchange, e)
+                return None
+            cached = self._tick_cache[exchange] = today, {
+                str(row.get("tradingsymbol")): float(row["tick_size"])
+                for row in rows if row.get("tick_size")
+            }
+        return cached[1].get(tradingsymbol)
 
     # ---------- orders ----------
 

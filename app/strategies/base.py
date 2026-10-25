@@ -99,7 +99,7 @@ class Strategy(ABC):
 
     # Timeframes this strategy may run on, and the one new deployments get by default.
     timeframes: ClassVar[tuple[str, ...]] = tuple(TIMEFRAMES)
-    default_timeframe: ClassVar[str] = "1m"
+    default_timeframe: ClassVar[str] = "5m"
 
     def __init__(self, params: BaseModel, ctx: "StrategyContext", bar_seconds: int = 60) -> None:
         self.params = params

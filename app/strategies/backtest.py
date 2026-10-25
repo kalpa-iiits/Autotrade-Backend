@@ -115,6 +115,11 @@ class BacktestContext:
     def average_entry_price(self) -> float | None:
         return self._sim._open.entry_price if self._sim._open else None
 
+    @property
+    def tick_size(self) -> float | None:
+        """The instrument's minimum price step, or None if the broker doesn't say."""
+        return self._sim.tick_size
+
     async def buy(self, quantity: int | None = None, reason: str | None = None) -> None:
         self._sim.request(quantity or self.quantity, reason)
 
@@ -161,6 +166,7 @@ class Simulation:
     daily: list[Candle]
     capital: float = DEFAULT_CAPITAL
     size_pct: float = DEFAULT_SIZE_PCT
+    tick_size: float | None = None
     position: int = 0
     last_price: float | None = None
     now: datetime = field(default_factory=lambda: datetime.now(timezone.utc))
@@ -450,6 +456,7 @@ class History:
     daily: list[Candle]
     since: date  # minutes are complete from here
     exhausted: bool = False
+    tick_size: float | None = None
 
 
 class Backtester:
@@ -511,7 +518,7 @@ class Backtester:
             if not minutes:
                 raise BacktestError(f"The broker has no 1-minute history for {symbol}")
             daily = await broker.get_history(symbol, "D", today - timedelta(days=MAX_RANGE_DAYS + 60), today)
-            h = self._histories[key] = History(minutes, daily, start, exhausted)
+            h = self._histories[key] = History(minutes, daily, start, exhausted, await broker.get_tick_size(symbol))
             while len(self._histories) > self.max_histories:
                 self._histories.popitem(last=False)
         elif start < h.since and not h.exhausted:
@@ -528,7 +535,7 @@ def _run_sync(dep: Deployment, symbol: str, timeframe: str, history: History, st
     candles = [c for c in history.minutes if start <= c.start.astimezone(IST).date() <= end]
     if not candles:
         raise BacktestError(f"No 1-minute history for {symbol} between {start} and {end}")
-    sim = Simulation(dep, symbol, timeframe, history.daily, capital, size_pct)
+    sim = Simulation(dep, symbol, timeframe, history.daily, capital, size_pct, history.tick_size)
     asyncio.run(sim.run(candles))
     closes: dict[date, tuple[datetime, float]] = {}
     for c in candles:

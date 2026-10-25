@@ -26,7 +26,7 @@ DEPLOYMENTS: list[Deployment] = [
         key="nifty-1m-breakout",
         label="Intraday Breakout",
         strategy=IntradayBreakout,
-        timeframe="1m",
+        timeframe="5m",
         params=IntradayBreakout.Params(
             lookback=5, max_width=0.4, avg_days=14,
             stop_k=0.25, trail_k=0.40, max_trades_per_day=8,
@@ -44,7 +44,7 @@ DEPLOYMENTS: list[Deployment] = [
         key="sbin-sma-1m",
         strategy=SmaCrossover,
         symbol="NSE:SBIN-EQ",
-        timeframe="1m",
+        timeframe="5m",
         params=SmaCrossover.Params(fast=9, slow=21),
         quantity=1,
         max_position=1,

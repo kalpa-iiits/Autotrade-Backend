@@ -123,6 +123,35 @@ def test_intraday_breakout_matches_pine_stop_fills_fixed_size_and_commission():
     assert first.pnl == (976 - 1001) * 65 - 130
 
 
+def test_intraday_breakout_rounds_stops_to_the_tick_like_pine():
+    # Average range 99.9 puts the stop at 1001 - 24.975 = 976.025: off the 0.05 grid.
+    day = datetime(2026, 10, 26, tzinfo=IST)
+    daily = [Candle(day - timedelta(days=i), 1000, 1099.9, 1000, 1050) for i in range(20, 0, -1)]
+    minute_bars = [Candle(day.replace(hour=10, minute=m), 1000.5, 1001, 1000, 1000.5) for m in range(25, 30)]
+    minute_bars.append(Candle(day.replace(hour=10, minute=30), 1000.5, 1005, 970, 980))
+    dep = Deployment(key="pine-breakout", strategy=IntradayBreakout, symbol=SYM, timeframe="1m", quantity=65,
+                     backtest_fixed_quantity=65)
+
+    def exit_price(tick_size):
+        sim = Simulation(dep, SYM, "1m", daily=daily, capital=100_000, tick_size=tick_size)
+        asyncio.run(sim.run(minute_bars))
+        return sim.trades[0].exit_price
+
+    assert exit_price(None) == 976.025  # tick unknown: unrounded
+    assert exit_price(0.05) == 976.0  # long stop rounded down
+
+
+def test_tick_stop_rounds_against_the_position():
+    strategy = object.__new__(IntradayBreakout)
+    strategy.ctx = type("Ctx", (), {"tick_size": 0.05})()
+    assert strategy._tick_stop(706.852, long=True) == 706.85
+    assert strategy._tick_stop(689.74, long=True) == 689.7
+    assert strategy._tick_stop(685.43, long=False) == 685.45
+    assert strategy._tick_stop(697.85, long=False) == 697.85  # already on the grid
+    strategy.ctx.tick_size = None
+    assert strategy._tick_stop(685.43, long=False) == 685.43
+
+
 def test_catalog_and_performance(deploy):
     c = deploy(Deployment(key="sma", strategy=SmaCrossover, symbol=SYM, quantity=1,
                           params={"fast": 3, "slow": 8, "allow_short": True}))

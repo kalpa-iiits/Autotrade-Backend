@@ -142,6 +142,10 @@ class Broker(ABC):
         """Tradable cash-market instruments, using this broker's exact symbol spelling."""
         raise OrderError(f"{type(self).__name__} does not provide an instrument catalogue")
 
+    async def get_tick_size(self, symbol: str) -> float | None:
+        """The exchange's minimum price step for `symbol`, or None if unknown."""
+        return None
+
     async def get_history(
         self, symbol: str, resolution: Resolution, start: date, end: date
     ) -> list[Candle]:

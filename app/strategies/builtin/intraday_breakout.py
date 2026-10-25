@@ -10,7 +10,8 @@ All distances are fractions of the average daily range (high - low) of the previ
 so they widen and narrow with volatility.
 
 Differences from the Pine version (which simulates resting stop orders on bar data):
-  - Strategy Tester uses a Pine-compatible candle replay. The differences below describe
+  - Strategy Tester uses a Pine-compatible candle replay, including stops rounded to the
+    instrument's tick size (down for longs, up for shorts). The differences below describe
     live/signal execution only.
   - Entries and exits are market orders sent when a tick reaches the level, so live fills
     include slippage; the stop is measured from the price of the triggering tick.
@@ -19,6 +20,7 @@ Differences from the Pine version (which simulates resting stop orders on bar da
   - The daily cap counts entries requested, including ones a risk check blocks.
 """
 
+import math
 from collections import deque
 from datetime import date, datetime, time, timedelta
 from zoneinfo import ZoneInfo
@@ -176,12 +178,12 @@ class IntradayBreakout(Strategy):
                     self.trade_range = rng
                     if long_hit:
                         fill = price if previous is None else buy_at
-                        self.stop = buy_at - self.params.stop_k * rng
+                        self.stop = self._tick_stop(buy_at - self.params.stop_k * rng, long=True)
                         self.best = fill
                         await self.ctx.buy_at(fill, at, f"broke above {buy_at:.2f}; stop {self.stop:.2f}")
                     else:
                         fill = price if previous is None else sell_at
-                        self.stop = sell_at + self.params.stop_k * rng
+                        self.stop = self._tick_stop(sell_at + self.params.stop_k * rng, long=False)
                         self.best = fill
                         await self.ctx.sell_at(fill, at, f"broke below {sell_at:.2f}; stop {self.stop:.2f}")
                     entered = self.ctx.position != 0
@@ -205,12 +207,14 @@ class IntradayBreakout(Strategy):
                 # On its first calculation after the fill Pine replaces the pre-placed stop
                 # (which was based on the breakout level) with one based on the actual fill.
                 entry = self.ctx.average_entry_price
-                self.stop = entry - p.stop_k * self.trade_range if long else entry + p.stop_k * self.trade_range
+                stop = entry - p.stop_k * self.trade_range if long else entry + p.stop_k * self.trade_range
+                self.stop = self._tick_stop(stop, long)
                 self.best = candle.high if long else candle.low
             else:
                 self.best = max(self.best, candle.high) if long else min(self.best, candle.low)
             if p.trail_k > 0:
                 trail = self.best - p.trail_k * self.trade_range if long else self.best + p.trail_k * self.trade_range
+                trail = self._tick_stop(trail, long)
                 self.stop = max(self.stop, trail) if long else min(self.stop, trail)
             return
 
@@ -228,6 +232,16 @@ class IntradayBreakout(Strategy):
         if p.max_width and high - low > p.max_width * self.day_range:
             return
         self.levels = (high, low, self.day_range)
+
+    def _tick_stop(self, price: float, long: bool) -> float:
+        """A stop on the instrument's tick grid, rounded against the position (down for a long,
+        up for a short) like TradingView's broker emulator. Unchanged when the tick is unknown."""
+        tick = self.ctx.tick_size
+        if not tick:
+            return price
+        steps = price / tick
+        steps = math.floor(steps + 1e-9) if long else math.ceil(steps - 1e-9)
+        return round(steps * tick, 10)
 
     async def on_bar(self, bar: Bar) -> None:
         """A candle closed: arm or clear the breakout levels for the next one."""

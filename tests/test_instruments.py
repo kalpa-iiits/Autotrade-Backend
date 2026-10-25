@@ -1,5 +1,5 @@
 from app.brokers.base import Instrument
-from app.brokers.fyers import parse_nse_instruments
+from app.brokers.fyers import parse_nse_instruments, parse_tick_sizes
 from app.strategies.instruments import search_instruments
 from tests.conftest import AUTH
 
@@ -16,6 +16,13 @@ def test_fyers_nse_master_keeps_stocks_and_indexes_with_exact_symbols():
         ("NSE:NIFTY50-INDEX", "NIFTY", "index"),
         ("NSE:INFY-EQ", "INFY", "stock"),
     ]
+
+
+def test_fyers_master_tick_sizes():
+    fo = "201,NIFTY 23 Nov 26 FUT,11,65,0.1,,x,2026-10-23,1795428600,NSE:NIFTY26NOVFUT,10,11,61471,NIFTY\n"
+    assert parse_tick_sizes(FYERS_ROWS + fo) == {
+        "NSE:INFY-EQ": 0.05, "NSE:NIFTY50-INDEX": 0.05, "NSE:NIFTYBEES-EQ": 0.05, "NSE:NIFTY26NOVFUT": 0.1,
+    }
 
 
 def test_instrument_search_ranks_ticker_before_company_name():

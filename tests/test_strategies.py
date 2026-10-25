@@ -117,7 +117,7 @@ def test_deployments_come_from_code(deploy):
                              max_position=None))
     rows = c.get("/api/strategies", headers=AUTH).json()["strategies"]
     assert [(r["deployment_key"], r["symbol"], r["timeframe"]) for r in rows] == [
-        ("a", SYM, "1m"), ("b", SYM, "1m")]
+        ("a", SYM, "5m"), ("b", SYM, "5m")]
     b = rows[1]
     assert (b["strategy"], b["mode"], b["status"]) == ("sma_crossover", "signal", "stopped")
     assert (b["max_order_qty"], b["max_position"]) == (3, 3)  # default to quantity
@@ -384,7 +384,7 @@ def test_add_copies_on_other_symbols_and_timeframes(deploy):
     assert add(c, "a", "NSE:TCS-EQ", "2m").status_code == 422  # not a timeframe
 
     both = [i for i in c.get("/api/strategies", headers=AUTH).json()["strategies"] if i["deployment_key"] == "a"]
-    assert {(i["symbol"], i["timeframe"]) for i in both} == {(SYM, "1m"), ("NSE:TCS-EQ", "5m")}
+    assert {(i["symbol"], i["timeframe"]) for i in both} == {(SYM, "5m"), ("NSE:TCS-EQ", "5m")}
 
 
 def test_timeframe_sets_the_bar_length(deploy):
@@ -448,7 +448,7 @@ def test_code_changes_apply_to_every_instance(deploy):
     c = deploy(dep("a", quantity=2))  # admin edits the deployment
     rows = [i for i in c.get("/api/strategies", headers=AUTH).json()["strategies"] if i["deployment_key"] == "a"]
     assert {(i["symbol"], i["timeframe"], i["quantity"], i["status"]) for i in rows} == {
-        (SYM, "1m", 2, "stopped"), ("NSE:TCS-EQ", "5m", 2, "stopped")}  # app's choices kept
+        (SYM, "5m", 2, "stopped"), ("NSE:TCS-EQ", "5m", 2, "stopped")}  # app's choices kept
 
 
 def test_code_creates_no_instances(deploy, monkeypatch):
