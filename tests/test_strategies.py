@@ -257,53 +257,134 @@ def test_live_rejection_is_recorded(deploy, monkeypatch):
 
 
 OPT = "NSE:NIFTY26N0425000CE"  # an option, which the paper broker is taught a price for
+BOOK: dict = {}  # best "bid" / "ask" the paper broker reports for OPT; missing = last price
 
 
-def test_live_option_orders_are_limit_orders(deploy, monkeypatch):
+@pytest.fixture
+def options(deploy, monkeypatch):
+    """deploy() for option trading: live mode on, OPT priced at 200, market depth from BOOK,
+    and quick repricing checks (the defaults are seconds)."""
+    from app.brokers.base import Depth
+    from app.brokers.paper import PaperBroker
+
+    async def depth(self, symbol):
+        price = self.prices[symbol]
+        return Depth(bid=BOOK.get("bid", price), ask=BOOK.get("ask", price))
+
+    BOOK.clear()
+    monkeypatch.setattr(PaperBroker, "get_depth", depth)
     monkeypatch.setattr(settings, "strategies_live_enabled", True)
-    quiet = deploy(dep("a", mode="live"))
-    runtime(quiet).service.broker.prices[OPT] = 200.0
-    inst = start_strategy(quiet, "a")
+    monkeypatch.setattr(settings, "option_reprice_interval", 0.02)
+
+    def start(**overrides):
+        c = deploy(dep("a", mode="live", **overrides))
+        runtime(c).service.broker.prices[OPT] = 200.0
+        return c, start_strategy(c, "a")
+
+    return start
+
+
+def option_orders(client):
+    history = client.get("/api/accounts/1/orders/history", headers=AUTH).json()
+    return [(o["side"], o["limit_price"], o["status"]) for o in reversed(history)]
+
+
+def wait(client, seconds=0.15):
+    run(client, asyncio.sleep, seconds)
+
+
+def test_live_option_orders_are_priced_from_market_depth(options):
+    quiet, inst = options()
     SCRIPT.extend([("buy", None, "entry", OPT), ("sell", 1, "exit", OPT)])
     tick(quiet)
     assert instance(quiet, inst["id"])["position"] == 1  # filled straight away
     tick(quiet)
 
-    history = quiet.get("/api/accounts/1/orders/history", headers=AUTH).json()
-    assert [(o["side"], o["order_type"], o["limit_price"], o["status"]) for o in reversed(history)] == [
-        ("BUY", "LIMIT", 206.0, "FILLED"),   # 3% above the last price
-        ("SELL", "LIMIT", 194.0, "FILLED"),  # 3% below it
+    assert option_orders(quiet) == [
+        ("BUY", 201.0, "FILLED"),   # best ask 200 + 0.5%
+        ("SELL", 199.0, "FILLED"),  # best bid 200 - 0.5%
     ]
     assert [s["message"] for s in reversed(signals(quiet, inst["id"]))] == [
-        "Limit 206.00 (last 200)", "Limit 194.00 (last 200)"]
+        "Limit 201.00 (ask 200)", "Limit 199.00 (bid 200)"]
     assert instance(quiet, inst["id"])["position"] == 0
 
 
-def test_unfilled_option_order_is_cancelled(deploy, monkeypatch):
-    from app.strategies.runner import StrategyRunner
+def test_without_depth_option_orders_use_the_last_price(options, monkeypatch):
+    from app.brokers.paper import PaperBroker
 
-    async def stale_quote(self, account_id, symbol):
-        return 100.0  # the option has since moved to 200: a buy limit at 103 won't fill
+    async def no_depth(self, symbol):
+        return None
 
-    monkeypatch.setattr(settings, "strategies_live_enabled", True)
-    monkeypatch.setattr(settings, "option_order_timeout", 0.05)
-    monkeypatch.setattr(StrategyRunner, "_quote", stale_quote)
-    quiet = deploy(dep("a", mode="live"))
-    runtime(quiet).service.broker.prices[OPT] = 200.0
-    inst = start_strategy(quiet, "a")
+    monkeypatch.setattr(PaperBroker, "get_depth", no_depth)
+    quiet, inst = options()
     SCRIPT.append(("buy", None, "entry", OPT))
     tick(quiet)
-    [order] = quiet.get("/api/accounts/1/orders/history", headers=AUTH).json()
-    assert (order["limit_price"], order["status"]) == (103.0, "OPEN")
+    assert option_orders(quiet) == [("BUY", 206.0, "FILLED")]  # last 200 + 3%
+    assert signals(quiet, inst["id"])[0]["message"] == "Limit 206.00 (last 200)"
 
-    run(quiet, asyncio.sleep, 0.3)
-    [order] = quiet.get("/api/accounts/1/orders/history", headers=AUTH).json()
-    assert order["status"] == "CANCELLED"
+
+def test_unfilled_entry_is_repriced_to_the_new_ask(options, monkeypatch):
+    monkeypatch.setattr(settings, "option_entry_max_reprices", 1000)  # not what's tested here
+    quiet, inst = options()
+    BOOK["ask"] = 190.0  # stale book: the buy goes in at 190.95 while the option trades at 200
+    SCRIPT.append(("buy", None, "entry", OPT))
+    tick(quiet)
+    assert option_orders(quiet) == [("BUY", 190.95, "OPEN")]
+
+    BOOK["ask"] = 196.0  # within 5% of 190.95: chase it
+    wait(quiet)
+    assert option_orders(quiet) == [("BUY", 197.0, "OPEN")]  # 196.98 up to the tick; 200 is still above it
+    BOOK["ask"] = 199.0
+    wait(quiet)
+    assert option_orders(quiet) == [("BUY", 200.0, "FILLED")]  # 199.995 up to the tick: fills at 200
+    assert instance(quiet, inst["id"])["position"] == 1
+
+
+def test_entry_is_cancelled_rather_than_chase_too_far(options):
+    quiet, inst = options()
+    BOOK["ask"] = 190.0
+    SCRIPT.append(("buy", None, "entry", OPT))
+    tick(quiet)
+    BOOK["ask"] = 205.0  # 206.05 would be 7.9% above 190.95
+    wait(quiet)
+    assert option_orders(quiet) == [("BUY", 190.95, "CANCELLED")]
     assert quiet.app.state.strategy_runner.running[inst["id"]].pending_order_id is None
     assert instance(quiet, inst["id"])["position"] == 0
-    SCRIPT.append(("buy", None, "again", OPT))  # free to try again
+    SCRIPT.append(("buy", None, "again", OPT))  # free to place another order
     tick(quiet)
     assert signals(quiet, inst["id"])[0]["outcome"] == "placed"
+
+
+def test_entry_is_cancelled_after_max_reprices(options, monkeypatch):
+    monkeypatch.setattr(settings, "option_entry_max_reprices", 2)
+    quiet, inst = options()
+    BOOK["ask"] = 190.0  # stays stale: nothing to move to, it just sits
+    SCRIPT.append(("buy", None, "entry", OPT))
+    tick(quiet)
+    wait(quiet, 0.03)
+    assert option_orders(quiet)[0][2] == "OPEN"
+    wait(quiet, 0.2)
+    assert option_orders(quiet) == [("BUY", 190.95, "CANCELLED")]
+
+
+def test_unfilled_exit_is_chased_until_it_fills(options, monkeypatch):
+    monkeypatch.setattr(settings, "option_entry_max_reprices", 1)  # entries only
+    monkeypatch.setattr(settings, "option_entry_max_chase_pct", 1)
+    quiet, inst = options()
+    SCRIPT.extend([("buy", None, "entry", OPT), ("sell", 1, "stop", OPT)])
+    tick(quiet)
+    BOOK["bid"] = 260.0  # stale: the sell goes in at 258.70, far above the market at 200
+    tick(quiet)
+    wait(quiet)  # many checks: an exit is never given up on
+    assert option_orders(quiet)[1] == ("SELL", 258.7, "OPEN")
+
+    BOOK["bid"] = 230.0  # 11% lower: past any entry cap, still chased
+    wait(quiet)
+    assert option_orders(quiet)[1] == ("SELL", 228.85, "OPEN")
+    del BOOK["bid"]  # the real bid, 200
+    wait(quiet)
+    assert option_orders(quiet)[1] == ("SELL", 199.0, "FILLED")
+    assert instance(quiet, inst["id"])["position"] == 0
 
 
 def test_option_limit_price_rounds_to_the_tick():

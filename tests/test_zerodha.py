@@ -25,6 +25,7 @@ def tick_frame(*ticks):
 class FakeKite:
     def __init__(self):
         self.placed = []
+        self.modified = []
 
     def ltp(self, symbols):
         known = {"NSE:SBIN": SBIN}
@@ -35,6 +36,18 @@ class FakeKite:
             raise InputException("Invalid `tradingsymbol`.")
         self.placed.append(params)
         return "250101000000001"
+
+    def quote(self, symbols):
+        return {s: {"depth": {
+            "buy": [{"price": 799.5, "quantity": 10}, {"price": 799.0, "quantity": 4}],
+            "sell": [{"price": 0, "quantity": 0}, {"price": 800.5, "quantity": 7}],
+        }} for s in symbols if s == "NSE:SBIN"}
+
+    def modify_order(self, variety, order_id, **params):
+        if order_id == "done":
+            raise OrderException("Maximum allowed order modifications exceeded.")
+        self.modified.append((order_id, params))
+        return order_id
 
     def cancel_order(self, variety, order_id):
         if order_id == "done":
@@ -286,3 +299,21 @@ def test_stop_orders_and_product_map_to_kite():
                               "quantity": 1, "order_type": "SL", "price": 812.0, "trigger_price": 810.0,
                               "status": "TRIGGER PENDING"})
     assert (order.order_type, order.limit_price, order.trigger_price) == (OrderType.SL, 812.0, 810.0)
+
+
+def test_market_depth_and_modify():
+    async def run():
+        broker, kite, _ = make_broker()
+        await broker.start()
+        depth = await broker.get_depth("NSE:SBIN")
+        assert (depth.bid, depth.ask) == (799.5, 800.5)  # "buy" = bids, "sell" = asks
+        assert await broker.get_depth("NSE:TCS") is None
+
+        order = await broker.modify_order("250101000000001", 801.0)  # found via orders()
+        assert kite.modified == [("250101000000001", {"price": 801.0})]
+        assert order.limit_price == 801.0 and order.status == OrderStatus.OPEN
+        with pytest.raises(OrderError, match="modifications exceeded"):
+            await broker.modify_order("done", 801.0)
+        await broker.stop()
+
+    asyncio.run(run())

@@ -19,7 +19,7 @@ import httpx
 from fyers_apiv3 import fyersModel
 from fyers_apiv3.FyersWebsocket import data_ws, order_ws
 
-from app.brokers.base import Broker, Candle, Instrument, MissingCredentials, OptionContract, OrderError, Resolution
+from app.brokers.base import Broker, Candle, Depth, Instrument, MissingCredentials, OptionContract, OrderError, Resolution
 from app.orders.schemas import (
     Order,
     OrderStatus,
@@ -429,6 +429,14 @@ class FyersBroker(Broker):
             raise OrderError(f"Order {order_id!r} cancelled but not found in orderbook")
         return await self._record(order.model_copy(update={"status": OrderStatus.CANCELLED}))
 
+    async def modify_order(self, order_id: str, limit_price: float) -> Order:
+        resp = await asyncio.to_thread(self._model.modify_order,
+                                       {"id": order_id, "type": FYERS_ORDER_TYPE[OrderType.LIMIT],
+                                        "limitPrice": limit_price})
+        if resp.get("s") != "ok":
+            raise OrderError(resp.get("message", f"Could not modify order {order_id!r}"))
+        return await self._record_price(order_id, limit_price)
+
     async def get_orders(self) -> list[Order]:
         resp = await asyncio.to_thread(self._model.orderbook)
         if resp.get("s") != "ok":
@@ -480,6 +488,16 @@ class FyersBroker(Broker):
             for ts, o, h, low, c, v in resp.get("candles", [])
         ]
 
+
+    async def get_depth(self, symbol: str) -> Depth | None:
+        resp = await asyncio.to_thread(self._model.depth, {"symbol": symbol, "ohlcv_flag": 1})
+        if resp.get("s") != "ok":
+            raise OrderError(resp.get("message", f"Could not fetch market depth for {symbol}"))
+        book = (resp.get("d") or {}).get(symbol)
+        if not book:
+            return None
+        best = lambda side: next((float(r["price"]) for r in book.get(side) or [] if r.get("price")), 0.0)
+        return Depth(bid=best("bids"), ask=best("ask"))
 
     async def get_quotes(self, symbols: list[str]) -> dict[str, float]:
         resp = await asyncio.to_thread(self._model.quotes, {"symbols": ",".join(symbols)})

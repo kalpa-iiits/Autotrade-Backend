@@ -226,3 +226,9 @@ class BrokerService:
         broker = self.require()
         await self._orders_limit.acquire()
         return await broker.cancel_order(order_id)
+
+    async def modify_order(self, order_id: str, limit_price: float) -> Order:
+        """Every modify goes through here (rate-limited like placements)."""
+        broker = self.require()
+        await self._orders_limit.acquire()
+        return await broker.modify_order(order_id, limit_price)

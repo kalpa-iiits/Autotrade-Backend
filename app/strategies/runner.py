@@ -11,9 +11,10 @@ Safety rules, applied to every buy/sell before anything reaches the broker:
   - max order quantity, max absolute position, max orders per day (IST) — except for orders
     that only shrink the position (exits are never blocked by limits)
   - live orders also pause while the trade ledger has updates it couldn't save
-  - options are ordered at a limit price a little through the last price, never at market
-    (brokers cap or refuse market orders on options), and cancelled if still unfilled after
-    option_order_timeout
+  - options are ordered at a limit price, never at market (brokers cap or refuse market
+    orders on options): a little through the best ask / bid, repriced every few seconds while
+    unfilled. Exits are chased until they fill; entries give up after a few tries or too far
+    a move (see the option_* settings)
 A strategy that raises an exception is stopped with status "error".
 
 Each running instance has its own tick queue and worker task, so a strategy that is slow
@@ -34,7 +35,7 @@ from zoneinfo import ZoneInfo
 from sqlalchemy import func, select
 
 from app.brokers import OrderError
-from app.brokers.base import OptionContract
+from app.brokers.base import Depth, OptionContract
 from app.core import db
 from app.core.broker_service import BrokerService
 from app.core.config import Settings
@@ -231,7 +232,7 @@ class StrategyRunner:
         self._order_owner: dict[tuple[int, str], int] = {}
         # Order updates can arrive before place_order returns (and we learn the id).
         self._recent_orders: OrderedDict[tuple[int, str], Order] = OrderedDict()
-        self._expiries: set[asyncio.Task] = set()  # cancels of option orders left unfilled
+        self._chases: set[asyncio.Task] = set()  # repricing of unfilled option orders
 
     def service(self, account_id: int) -> BrokerService | None:
         runtime = self.accounts.get(account_id)
@@ -352,7 +353,7 @@ class StrategyRunner:
 
     async def shutdown(self) -> None:
         """Server stopping: leave statuses as "running" so they resume on the next start."""
-        for task in list(self._expiries):
+        for task in list(self._chases):
             task.cancel()
         for inst in self.running.values():
             await self._end_worker(inst)
@@ -499,17 +500,40 @@ class StrategyRunner:
             log.info("No quote for %s: %s", symbol, e)
             return None
 
+    async def _depth(self, account_id: int, symbol: str) -> Depth | None:
+        service = self.service(account_id)
+        try:
+            return await service.require().get_depth(symbol) if service else None
+        except Exception as e:
+            log.info("No market depth for %s: %s", symbol, e)
+            return None
+
+    async def _option_price(self, account_id: int, symbol: str, side: Side,
+                            last: float | None = None) -> tuple[float, str] | None:
+        """Limit price for an option order, and what it's based on: the best ask (buying) or
+        bid (selling), else the last price (`last`, or a fresh quote). None with neither."""
+        depth = await self._depth(account_id, symbol)
+        best = (depth.ask if side == Side.BUY else depth.bid) if depth else 0
+        if best:
+            basis = f"{'ask' if side == Side.BUY else 'bid'} {best:g}"
+            return option_limit_price(best, side, self.settings.option_limit_buffer_pct), basis
+        last = last or await self._quote(account_id, symbol)
+        if last:
+            return option_limit_price(last, side, self.settings.option_ltp_buffer_pct), f"last {last:g}"
+        return None
+
     async def _place(self, inst: RunningInstance, side: Side, quantity: int, signal: StrategySignal) -> None:
         service = self.service(inst.account_id)
         signal.broker = service.name
         order_type, limit_price = OrderType.MARKET, None
+        closing = inst.position > 0 if side == Side.SELL else inst.position < 0
         if OPTION_SYMBOL.search(signal.symbol):
-            if signal.price:
+            if priced := await self._option_price(inst.account_id, signal.symbol, side, signal.price):
                 order_type = OrderType.LIMIT
-                limit_price = option_limit_price(signal.price, side, self.settings.option_limit_buffer_pct)
-                signal.message = f"Limit {limit_price:.2f} (last {signal.price:g})"
-            else:  # no quote to price it from: the broker's own market protection applies
-                log.warning("Strategy %s: no quote for %s; placing a market order", inst.id, signal.symbol)
+                limit_price, basis = priced
+                signal.message = f"Limit {limit_price:.2f} ({basis})"
+            else:  # nothing to price it from: the broker's own market protection applies
+                log.warning("Strategy %s: no price for %s; placing a market order", inst.id, signal.symbol)
         try:
             order = await service.place_order(PlaceOrder(
                 action="place_order", symbol=signal.symbol, side=side, quantity=quantity,
@@ -531,29 +555,70 @@ class StrategyRunner:
         self._order_owner[(inst.account_id, order.id)] = inst.id
         if order.status not in TERMINAL:
             inst.pending_order_id = order.id
-            if order_type == OrderType.LIMIT and self.settings.option_order_timeout > 0:
-                task = asyncio.create_task(self._expire(inst, order.id))
-                self._expiries.add(task)
-                task.add_done_callback(self._expiries.discard)
+            if order_type == OrderType.LIMIT:
+                task = asyncio.create_task(self._chase(inst, order.id, signal.symbol, side, limit_price, closing))
+                self._chases.add(task)
+                task.add_done_callback(self._chases.discard)
         # Apply what we know now, plus any update that raced ahead of place_order returning.
         self._apply_order(inst, order)
         if early := self._recent_orders.get((inst.account_id, order.id)):
             self._apply_order(inst, early)
 
-    async def _expire(self, inst: RunningInstance, order_id: str) -> None:
-        """Cancel a strategy's limit order still open after option_order_timeout, so it doesn't
-        block the instance's next order. What filled before the cancel stays counted."""
-        await asyncio.sleep(self.settings.option_order_timeout)
-        if inst.pending_order_id != order_id:
-            return  # filled, cancelled or rejected meanwhile
-        service = self.service(inst.account_id)
+    async def _chase(self, inst: RunningInstance, order_id: str, symbol: str, side: Side,
+                     first_limit: float, closing: bool) -> None:
+        """Keep an unfilled option order where it can fill. Every option_reprice_interval, if
+        the best ask (buying) or bid (selling) + buffer has moved past its limit, move the limit
+        there. An exit (`closing`) is chased until it fills. An entry is cancelled, and the trade
+        skipped, after option_entry_max_reprices checks or rather than go more than
+        option_entry_max_chase_pct past `first_limit`. While it's open the instance can't place
+        another order. Ends when the order is done or the instance stops."""
+        cfg = self.settings
+        sign = 1 if side == Side.BUY else -1  # "further" = higher to buy, lower to sell
+        cap = first_limit * (1 + sign * cfg.option_entry_max_chase_pct / 100)
+        limit, checks = first_limit, 0
+        while True:
+            await asyncio.sleep(cfg.option_reprice_interval)
+            if inst.pending_order_id != order_id or self.running.get(inst.id) is not inst:
+                return  # filled, cancelled or rejected; or the strategy stopped
+            service = self.service(inst.account_id)
+            if service is None or not service.connected:
+                continue
+            checks += 1
+            try:
+                priced = await self._option_price(inst.account_id, symbol, side)
+                target = priced[0] if priced else None
+                if not closing:
+                    if checks > cfg.option_entry_max_reprices:
+                        await self._cancel_unfilled(inst, order_id, f"entry unfilled after {checks - 1} checks")
+                        return
+                    if target is not None and sign * (target - cap) > 0:
+                        await self._cancel_unfilled(
+                            inst, order_id, f"entry would chase to {target:.2f}, past {cap:.2f} "
+                                            f"({cfg.option_entry_max_chase_pct:g}% from {first_limit:.2f})")
+                        return
+                if target is None or sign * (target - limit) <= 0:
+                    continue  # still priced to fill (or nothing to price from): give it time
+                try:
+                    order = await service.modify_order(order_id, target)
+                except Exception as e:  # e.g. the broker's limit on modifications per order
+                    if inst.pending_order_id == order_id:
+                        await self._cancel_unfilled(inst, order_id, f"could not reprice ({e})")
+                    return  # an exit is sent again, fresh, by the strategy's own retry
+                log.info("Strategy %s: repriced %s order %s from %.2f to %.2f (%s)", inst.id,
+                         "exit" if closing else "entry", order_id, limit, target, priced[1])
+                limit = target
+                self._apply_order(inst, order)  # it may have filled straight away
+            except Exception:
+                log.exception("Strategy %s: repricing order %s failed; trying again", inst.id, order_id)
+
+    async def _cancel_unfilled(self, inst: RunningInstance, order_id: str, why: str) -> None:
+        """Cancel an order the instance gave up on. What filled before stays counted."""
         try:
-            order = await service.cancel_order(order_id)
+            order = await self.service(inst.account_id).cancel_order(order_id)
         except Exception as e:  # e.g. it filled just now: its update clears pending_order_id
-            log.info("Strategy %s: could not cancel unfilled order %s: %s", inst.id, order_id, e)
+            log.info("Strategy %s: could not cancel order %s (%s): %s", inst.id, order_id, why, e)
             return
-        log.warning("Strategy %s: cancelled order %s, unfilled after %gs", inst.id, order_id,
-                    self.settings.option_order_timeout)
+        log.warning("Strategy %s: cancelled order %s: %s", inst.id, order_id, why)
         self._apply_order(inst, order)
 
     # ---------- persistence ----------

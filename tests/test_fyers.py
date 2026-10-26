@@ -17,6 +17,7 @@ class FakeModel:
     def __init__(self):
         self.placed = []
         self.cancel_ok = True
+        self.modified = []
         self.history_requests = []
 
     def place_order(self, data):
@@ -24,6 +25,20 @@ class FakeModel:
         if data["symbol"] == "NSE:BAD-EQ":
             return {"s": "error", "code": -50, "message": "Invalid symbol"}
         return {"s": "ok", "code": 1101, "id": "2410250001", "message": "Order submitted"}
+
+    def modify_order(self, data):
+        self.modified.append(data)
+        if data["id"] == "done":
+            return {"s": "error", "message": "Order already executed"}
+        return {"s": "ok", "id": data["id"]}
+
+    def depth(self, data):
+        if data["symbol"] == "NSE:EMPTY-EQ":
+            return {"s": "ok", "d": {}}
+        return {"s": "ok", "d": {data["symbol"]: {
+            "bids": [{"price": 799.5, "volume": 10}, {"price": 799.0, "volume": 4}],
+            "ask": [{"price": 0, "volume": 0}, {"price": 800.5, "volume": 7}],  # an empty level first
+        }}}
 
     def cancel_order(self, data):
         if self.cancel_ok:
@@ -381,3 +396,27 @@ def test_stop_orders_and_product_map_to_fyers():
     order = _order_from_fyers({"id": "1", "symbol": "NSE:SBIN-EQ", "qty": 1, "type": 3, "side": -1,
                                "status": 6, "limitPrice": 0, "stopPrice": 790.0})
     assert (order.order_type, order.trigger_price, order.limit_price) == (OrderType.SL_M, 790.0, None)
+
+
+def test_market_depth_and_modify():
+    async def run():
+        broker, model = make_broker()
+        await broker.start()
+        depth = await broker.get_depth("NSE:SBIN-EQ")
+        assert (depth.bid, depth.ask) == (799.5, 800.5)  # best of each side, skipping empty levels
+        assert await broker.get_depth("NSE:EMPTY-EQ") is None
+
+        moved = []
+
+        async def listener(order):
+            moved.append(order)
+
+        broker.on_order_update(listener)
+        order = await broker.modify_order("2410250001", 801.0)  # found via orderbook
+        assert model.modified == [{"id": "2410250001", "type": 1, "limitPrice": 801.0}]
+        assert order.limit_price == 801.0 and order.status == OrderStatus.OPEN
+        assert [o.limit_price for o in moved] == [801.0]  # broadcast, so the history records it
+        with pytest.raises(OrderError, match="already executed"):
+            await broker.modify_order("done", 801.0)
+
+    asyncio.run(run())

@@ -1,6 +1,7 @@
 import os
 from pathlib import Path
 
+from pydantic import Field
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
 ENV_PREFIX = "AUTOTRADE_"
@@ -71,12 +72,18 @@ class Settings(BaseSettings):
     ws_queue_size: int = 1000
     # Strategies order options with limit orders, never market ones: brokers cap or refuse
     # market orders on options (Kite needs market protection, Fyers caps them and may refuse
-    # them on later expiries). Buys go at the option's last price + this %, sells at - this %,
-    # on the 0.05 tick, so they fill straight away while the price can't run further than that.
-    option_limit_buffer_pct: float = 3.0
-    # Seconds a strategy's option order may stay unfilled before it is cancelled (0 = never).
-    # An open order blocks the strategy's next one; it asks again on a later tick if it still wants to.
-    option_order_timeout: float = 30.0
+    # them on later expiries). Priced from market depth: buys at the best ask + this %, sells
+    # at the best bid - this %, on the 0.05 tick, so they fill straight away.
+    option_limit_buffer_pct: float = 0.5
+    # Without market depth: from the last traded price, this % through it.
+    option_ltp_buffer_pct: float = 3.0
+    # Seconds between checks of an unfilled option order: if the market has moved past it, it
+    # is repriced to the new best ask / bid + buffer. Exits are repriced until they fill.
+    option_reprice_interval: float = Field(5.0, gt=0)
+    # Entries give up instead: the order is cancelled and the trade skipped after this many
+    # checks, or rather than reprice more than option_entry_max_chase_pct past its first price.
+    option_entry_max_reprices: int = Field(6, ge=0)
+    option_entry_max_chase_pct: float = Field(5.0, ge=0)
 
 
 def obsolete_settings(env_file: str = ".env") -> list[str]:

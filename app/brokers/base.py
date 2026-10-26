@@ -38,6 +38,14 @@ class Instrument:
 
 
 @dataclass(frozen=True)
+class Depth:
+    """The best bid and ask: the prices an order can trade at right now (0 when a side is empty)."""
+
+    bid: float
+    ask: float
+
+
+@dataclass(frozen=True)
 class OptionContract:
     """One listed option on an underlying, in the broker's own symbol spelling."""
 
@@ -152,6 +160,27 @@ class Broker(ABC):
     async def get_instruments(self, exchange: str = "NSE") -> list[Instrument]:
         """Tradable cash-market instruments, using this broker's exact symbol spelling."""
         raise OrderError(f"{type(self).__name__} does not provide an instrument catalogue")
+
+    async def get_depth(self, symbol: str) -> Depth | None:
+        """Best bid and ask for `symbol`, or None if this broker doesn't provide market depth."""
+        return None
+
+    async def modify_order(self, order_id: str, limit_price: float) -> Order:
+        """Move an open limit order to a new price (quantity unchanged)."""
+        raise OrderError(f"{type(self).__name__} can't modify orders")
+
+    async def _record_price(self, order_id: str, limit_price: float) -> Order:
+        """Store and broadcast an order's new limit price after a modify. Not via _record: it
+        drops updates whose status and fills haven't changed, which a price change doesn't."""
+        order = self._orders.get(order_id)
+        if order is None:
+            order = next((o for o in await self.get_orders() if o.id == order_id), None)
+        if order is None:
+            raise OrderError(f"Order {order_id!r} modified but not found in orderbook")
+        order = order.model_copy(update={"limit_price": limit_price, "updated_at": _now()})
+        self._orders[order_id] = order
+        await self._emit_order(order)
+        return order
 
     async def get_tick_size(self, symbol: str) -> float | None:
         """The exchange's minimum price step for `symbol`, or None if unknown."""

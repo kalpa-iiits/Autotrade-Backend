@@ -20,7 +20,7 @@ from kiteconnect.exceptions import KiteException
 from websockets.asyncio.client import connect as ws_connect
 from websockets.exceptions import ConnectionClosed, InvalidStatus
 
-from app.brokers.base import Broker, Candle, Instrument, MissingCredentials, OptionContract, OrderError, Resolution
+from app.brokers.base import Broker, Candle, Depth, Instrument, MissingCredentials, OptionContract, OrderError, Resolution
 from app.orders.schemas import Order, OrderStatus, OrderType, PlaceOrder, Position, Product, Side
 
 log = logging.getLogger(__name__)
@@ -359,6 +359,13 @@ class ZerodhaBroker(Broker):
             raise OrderError(f"Order {order_id!r} cancelled but not found in orderbook")
         return await self._record(order.model_copy(update={"status": OrderStatus.CANCELLED}))
 
+    async def modify_order(self, order_id: str, limit_price: float) -> Order:
+        try:
+            await asyncio.to_thread(self._kite.modify_order, VARIETY, order_id, price=limit_price)
+        except KiteException as e:
+            raise OrderError(str(e))
+        return await self._record_price(order_id, limit_price)
+
     async def _call(self, fn, *args):
         try:
             return await asyncio.to_thread(fn, *args)
@@ -396,6 +403,15 @@ class ZerodhaBroker(Broker):
         return [Candle(r["date"], r["open"], r["high"], r["low"], r["close"], r.get("volume", 0))
                 for r in rows]
 
+
+    async def get_depth(self, symbol: str) -> Depth | None:
+        split_symbol(symbol)
+        depth = ((await self._call(self._kite.quote, [symbol])).get(symbol) or {}).get("depth")
+        if not depth:
+            return None
+        # Kite: "buy" is the bid side, "sell" the ask side; empty levels have price 0.
+        best = lambda side: next((float(r["price"]) for r in depth.get(side) or [] if r.get("price")), 0.0)
+        return Depth(bid=best("buy"), ask=best("sell"))
 
     async def get_quotes(self, symbols: list[str]) -> dict[str, float]:
         for s in symbols:

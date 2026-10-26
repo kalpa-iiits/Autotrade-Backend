@@ -5,7 +5,7 @@ import random
 from datetime import date, datetime, time, timedelta
 from zoneinfo import ZoneInfo
 
-from app.brokers.base import Broker, Candle, Instrument, OrderError, Resolution
+from app.brokers.base import Broker, Candle, Depth, Instrument, OrderError, Resolution
 from app.orders.schemas import (
     Order,
     OrderStatus,
@@ -162,6 +162,26 @@ class PaperBroker(Broker):
             ):
                 self._fill(order, self.prices[req.symbol])  # marketable: fills now, at the market
             self.orders[order.id] = order
+        await self._emit_order(order)
+        return order
+
+    async def get_depth(self, symbol: str) -> Depth | None:
+        """No order book here: both sides at the last price."""
+        price = self.prices.get(symbol)
+        return Depth(bid=price, ask=price) if price is not None else None
+
+    async def modify_order(self, order_id: str, limit_price: float) -> Order:
+        async with self._lock:
+            order = self.orders.get(order_id)
+            if order is None:
+                raise OrderError(f"Order {order_id!r} not found")
+            if order.status != OrderStatus.OPEN or order.order_type != OrderType.LIMIT:
+                raise OrderError(f"Order {order_id!r} is not an open limit order, cannot modify")
+            order.limit_price = limit_price
+            order.updated_at = _now()
+            price = self.prices[order.symbol]
+            if (order.side == Side.BUY and price <= limit_price) or (order.side == Side.SELL and price >= limit_price):
+                self._fill(order, price)  # now marketable: fills at the market
         await self._emit_order(order)
         return order
 
