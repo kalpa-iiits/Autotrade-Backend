@@ -1,0 +1,75 @@
+name: Test and deploy to EC2
+
+on:
+  push:
+    branches: [master]
+  workflow_dispatch:
+
+# Never run two deploys at once: the server must only ever run one app process.
+concurrency:
+  group: deploy-ec2
+  cancel-in-progress: false
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: astral-sh/setup-uv@v6
+        with:
+          python-version: "3.11"
+          enable-cache: true
+          cache-dependency-glob: requirements.txt
+
+      - name: Install dependencies
+        run: |
+          uv venv .venv
+          uv pip install -r requirements.txt
+
+      - name: Run tests
+        run: .venv/bin/python -m pytest -q
+
+  deploy:
+    needs: test
+    runs-on: ubuntu-latest
+    env:
+      APP_DIR: /home/${{ secrets.EC2_USER }}/autotrade_backend
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up SSH
+        run: |
+          mkdir -p ~/.ssh
+          echo "${{ secrets.EC2_SSH_KEY }}" > ~/.ssh/deploy_key
+          chmod 600 ~/.ssh/deploy_key
+          ssh-keyscan -H "${{ secrets.EC2_HOST }}" >> ~/.ssh/known_hosts
+
+      # .env, the SQLite database, logs and the venv live only on the server.
+      - name: Upload code
+        run: |
+          rsync -az --delete \
+            --exclude '.git/' --exclude '.github/' \
+            --exclude '.venv/' --exclude '__pycache__/' --exclude '.pytest_cache/' \
+            --exclude '.env' --exclude 'autotrade.db*' --exclude '*.lock' --exclude 'logs/' \
+            -e "ssh -i ~/.ssh/deploy_key" \
+            ./ "${{ secrets.EC2_USER }}@${{ secrets.EC2_HOST }}:$APP_DIR/"
+
+      # Migrations run on app startup (app/core/db.py), so a restart is enough.
+      - name: Install dependencies and restart
+        run: |
+          ssh -i ~/.ssh/deploy_key "${{ secrets.EC2_USER }}@${{ secrets.EC2_HOST }}" "APP_DIR=$APP_DIR bash -s" <<'EOF'
+          set -euo pipefail
+          export PATH="$HOME/.local/bin:$PATH"
+          cd "$APP_DIR"
+          [ -d .venv ] || uv venv .venv --python 3.11
+          uv pip install --python .venv/bin/python -r requirements.txt
+          sudo systemctl restart autotrade
+          for i in $(seq 1 20); do
+            if curl -fsS -o /dev/null http://127.0.0.1:8000/; then echo "App is up"; exit 0; fi
+            sleep 2
+          done
+          echo "App did not come up" >&2
+          sudo journalctl -u autotrade -n 50 --no-pager >&2
+          exit 1
+          EOF
