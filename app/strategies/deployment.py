@@ -27,7 +27,7 @@ class Deployment:
     symbol: str | None = None  # optional suggestion for a new instance
     params: BaseModel | dict = field(default_factory=dict)
     # "signal": record what it would trade, place nothing. "live": place real orders
-    # (also needs AUTOTRADE_STRATEGIES_LIVE=true).
+    # (also needs AUTOTRADE_STRATEGIES_LIVE_ENABLED=true).
     mode: Literal["signal", "live"] = "signal"
     max_order_qty: int | None = None  # default: quantity
     max_position: int | None = None  # absolute net quantity; default: quantity

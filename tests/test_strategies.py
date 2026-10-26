@@ -217,7 +217,7 @@ def test_live_mode_needs_global_switch(deploy):
     SCRIPT.append(("buy",))
     tick(quiet)
     [sig] = signals(quiet, inst["id"])
-    assert sig["outcome"] == "blocked" and "AUTOTRADE_STRATEGIES_LIVE" in sig["message"]
+    assert sig["outcome"] == "blocked" and "AUTOTRADE_STRATEGIES_LIVE_ENABLED" in sig["message"]
     assert quiet.get("/api/strategies", headers=AUTH).json()["live_trading_enabled"] is False
 
 

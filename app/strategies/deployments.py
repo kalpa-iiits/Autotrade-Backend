@@ -10,7 +10,7 @@ instance; running instances come back stopped after a change. Removing a deploym
 its instances "removed" and keeps their signal history.
 
 New deployments start in mode="signal" (no orders). Switch to mode="live" only after
-dry-running it; live orders also need AUTOTRADE_STRATEGIES_LIVE=true in .env.
+dry-running it; live orders also need AUTOTRADE_STRATEGIES_LIVE_ENABLED=true in .env.
 """
 
 from app.strategies.builtin.intraday_breakout import IntradayBreakout

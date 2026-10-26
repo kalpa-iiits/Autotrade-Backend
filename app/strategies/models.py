@@ -30,7 +30,7 @@ class StrategyInstance(Base):
     timeframe: Mapped[str] = mapped_column(String(8))  # key of TIMEFRAMES, e.g. "1m"
     params: Mapped[dict] = mapped_column(JSON, default=dict)
     # "signal" records what it would trade; "live" places real orders (also needs
-    # AUTOTRADE_STRATEGIES_LIVE=true).
+    # AUTOTRADE_STRATEGIES_LIVE_ENABLED=true).
     mode: Mapped[str] = mapped_column(String(8), default="signal")
     # stopped / running / error / removed (deployment no longer in code) / archived (removed in app)
     status: Mapped[str] = mapped_column(String(8), default="stopped")

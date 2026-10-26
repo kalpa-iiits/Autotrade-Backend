@@ -427,7 +427,7 @@
       banner.className = 'banner ' + (data.live_trading_enabled ? 'on' : 'off');
       banner.textContent = data.live_trading_enabled
         ? 'Live strategy trading is ON: strategies in live mode place real orders.'
-        : 'Live strategy trading is off: live-mode strategies are blocked (AUTOTRADE_STRATEGIES_LIVE).';
+        : 'Live strategy trading is off: live-mode strategies are blocked (AUTOTRADE_STRATEGIES_LIVE_ENABLED).';
       deployments = data.deployments;
       fillAddForm();
 

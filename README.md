@@ -262,7 +262,7 @@ unattended. Unchanged running ones resume. Removing a deployment from code marks
 1. **Mode.** New instances are `signal` mode: nothing is sent to the broker; the signal is
    recorded and the instance's position moves as if it filled, so a dry run behaves like the
    real thing. `live` mode places market orders.
-2. **Global switch.** Live mode also needs `AUTOTRADE_STRATEGIES_LIVE=true` in `.env`
+2. **Global switch.** Live mode also needs `AUTOTRADE_STRATEGIES_LIVE_ENABLED=true` in `.env`
    (off by default); otherwise live signals are recorded as `blocked`.
 3. **Risk limits per instance:** `max_order_qty`, `max_position` (absolute), `max_orders_per_day`
    (IST), and one open order at a time. Orders that only shrink a position are never blocked

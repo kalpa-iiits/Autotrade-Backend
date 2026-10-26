@@ -6,7 +6,7 @@ order updates, and its orders go to that account's broker, with that account's r
 Safety rules, applied to every buy/sell before anything reaches the broker:
   - mode "signal": nothing is sent; the trade is recorded and the strategy's position moves
     as if it filled at the last price, so a dry run behaves like the real thing
-  - mode "live" also needs AUTOTRADE_STRATEGIES_LIVE=true (global switch, off by default)
+  - mode "live" also needs AUTOTRADE_STRATEGIES_LIVE_ENABLED=true (global switch, off by default)
   - one open order at a time per instance
   - max order quantity, max absolute position, max orders per day (IST) — except for orders
     that only shrink the position (exits are never blocked by limits)
@@ -406,7 +406,7 @@ class StrategyRunner:
         if cfg.mode == "live":
             service = self.service(inst.account_id)
             if not self.settings.strategies_live_enabled:
-                return "Live strategy trading is off (set AUTOTRADE_STRATEGIES_LIVE=true)"
+                return "Live strategy trading is off (set AUTOTRADE_STRATEGIES_LIVE_ENABLED=true)"
             if service is None:
                 return "Broker account not available"
             if not service.connected:
