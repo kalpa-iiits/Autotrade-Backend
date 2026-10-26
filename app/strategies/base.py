@@ -97,6 +97,11 @@ class Strategy(ABC):
     class Params(BaseModel):
         """Override with the strategy's settings; validated when the deployment is loaded."""
 
+    # Shown above its Strategy Tester results, when the backtest differs from live trading.
+    backtest_note: ClassVar[str | None] = None
+    # False when it can't be sized from capital per trade (e.g. it trades option lots).
+    capital_sizing: ClassVar[bool] = True
+
     # Timeframes this strategy may run on, and the one new deployments get by default.
     timeframes: ClassVar[tuple[str, ...]] = tuple(TIMEFRAMES)
     default_timeframe: ClassVar[str] = "5m"

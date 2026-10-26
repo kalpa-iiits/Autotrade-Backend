@@ -20,7 +20,7 @@ from kiteconnect.exceptions import KiteException
 from websockets.asyncio.client import connect as ws_connect
 from websockets.exceptions import ConnectionClosed, InvalidStatus
 
-from app.brokers.base import Broker, Candle, Instrument, MissingCredentials, OrderError, Resolution
+from app.brokers.base import Broker, Candle, Instrument, MissingCredentials, OptionContract, OrderError, Resolution
 from app.orders.schemas import Order, OrderStatus, OrderType, PlaceOrder, Position, Product, Side
 
 log = logging.getLogger(__name__)
@@ -36,6 +36,11 @@ KITE_STATUS = {
 }  # everything else (OPEN, TRIGGER PENDING, ... PENDING) is still open
 
 _SEGMENT = KiteTicker.EXCHANGE_MAP
+
+
+# Kite index names whose options trade under a shorter name.
+KITE_INDEX_OPTIONS = {"NIFTY 50": "NIFTY", "NIFTY BANK": "BANKNIFTY", "NIFTY FIN SERVICE": "FINNIFTY",
+                      "NIFTY MID SELECT": "MIDCPNIFTY"}
 
 
 def split_symbol(symbol: str) -> tuple[str, str]:
@@ -133,6 +138,7 @@ class ZerodhaBroker(Broker):
         self._symbol_of: dict[int, str] = {}
         self._subscribed: set[int] = set()
         self._instrument_cache: tuple[date, list[Instrument]] | None = None
+        self._options_cache: tuple[date, list[dict]] | None = None
         self._spec_cache: dict[str, tuple[date, dict[str, tuple[float, int]]]] = {}  # exchange -> symbol -> (tick, lot)
 
     # ---------- lifecycle ----------
@@ -278,6 +284,25 @@ class ZerodhaBroker(Broker):
     async def get_lot_size(self, symbol: str) -> int | None:
         spec = await self._symbol_spec(symbol)
         return spec[1] if spec else None
+
+    async def get_option_contracts(self, underlying: str) -> list[OptionContract]:
+        _, tradingsymbol = split_symbol(underlying)
+        name = KITE_INDEX_OPTIONS.get(tradingsymbol, tradingsymbol)  # "NIFTY 50" trades as "NIFTY"
+        today = datetime.now().date()
+        if self._options_cache is None or self._options_cache[0] != today:
+            try:
+                rows = await asyncio.to_thread(self._kite.instruments, "NFO")
+            except KiteException as e:
+                log.warning("option contracts unavailable: %s", e)
+                return []
+            self._options_cache = today, rows
+        return [
+            OptionContract(f"NFO:{r['tradingsymbol']}", r["instrument_type"], float(r["strike"]),
+                           r["expiry"], max(int(r.get("lot_size") or 1), 1))
+            for r in self._options_cache[1]
+            if r.get("name") == name and r.get("instrument_type") in ("CE", "PE") and r.get("expiry")
+            and r["expiry"] >= today
+        ]
 
     # ---------- orders ----------
 

@@ -12,13 +12,14 @@ import io
 import logging
 from datetime import date, datetime, timedelta, timezone
 from pathlib import Path
+from zoneinfo import ZoneInfo
 
 import httpx
 
 from fyers_apiv3 import fyersModel
 from fyers_apiv3.FyersWebsocket import data_ws, order_ws
 
-from app.brokers.base import Broker, Candle, Instrument, MissingCredentials, OrderError, Resolution
+from app.brokers.base import Broker, Candle, Instrument, MissingCredentials, OptionContract, OrderError, Resolution
 from app.orders.schemas import (
     Order,
     OrderStatus,
@@ -30,10 +31,13 @@ from app.orders.schemas import (
 )
 
 log = logging.getLogger(__name__)
+IST = ZoneInfo("Asia/Kolkata")
 FYERS_NSE_MASTER = "https://public.fyers.in/sym_details/NSE_CM.csv"
 FYERS_NSE_FO_MASTER = "https://public.fyers.in/sym_details/NSE_FO.csv"
 _nse_instruments: tuple[date, list[Instrument]] | None = None
 _nse_instruments_lock = asyncio.Lock()
+_options: tuple[date, dict[str, list[OptionContract]]] | None = None  # underlying name -> options
+_options_lock = asyncio.Lock()
 _specs: dict[str, tuple[date, dict[str, tuple[float, int]]]] = {}  # master URL -> (day, symbol -> (tick, lot))
 _specs_lock = asyncio.Lock()
 
@@ -83,6 +87,22 @@ def parse_symbol_specs(text: str) -> dict[str, tuple[float, int]]:
         if tick > 0:
             specs[row[9].strip()] = tick, max(lot, 1)
     return specs
+
+
+def parse_option_contracts(text: str) -> dict[str, list[OptionContract]]:
+    """Options in a FYERS F&O master by underlying name ("NIFTY"): column 16 is CE/PE, 15 the
+    strike, 8 the expiry time (epoch seconds), 3 the lot and 13 the underlying."""
+    out: dict[str, list[OptionContract]] = {}
+    for row in csv.reader(io.StringIO(text)):
+        if len(row) < 17 or row[16] not in ("CE", "PE"):
+            continue
+        try:
+            expiry = datetime.fromtimestamp(int(row[8]), tz=IST).date()
+            contract = OptionContract(row[9].strip(), row[16], float(row[15]), expiry, max(int(float(row[3])), 1))
+        except ValueError:
+            continue
+        out.setdefault(row[13].strip(), []).append(contract)
+    return out
 
 
 async def _download_master(url: str) -> str:
@@ -346,6 +366,18 @@ class FyersBroker(Broker):
     async def get_lot_size(self, symbol: str) -> int | None:
         spec = await _symbol_spec(symbol)
         return spec[1] if spec else None
+
+    async def get_option_contracts(self, underlying: str) -> list[OptionContract]:
+        global _options
+        # The underlying's name in the masters: an instrument's ticker ("NIFTY" for NIFTY50-INDEX).
+        name = next((i.ticker for i in await _load_nse_instruments() if i.symbol == underlying), None)
+        if name is None:
+            return []
+        today = datetime.now(IST).date()
+        async with _options_lock:
+            if _options is None or _options[0] != today:
+                _options = today, parse_option_contracts(await _download_master(FYERS_NSE_FO_MASTER))
+        return [c for c in _options[1].get(name, []) if c.expiry >= today]
 
     # ---------- orders ----------
 

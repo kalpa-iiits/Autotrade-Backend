@@ -30,6 +30,7 @@ from zoneinfo import ZoneInfo
 from sqlalchemy import func, select
 
 from app.brokers import OrderError
+from app.brokers.base import OptionContract
 from app.core import db
 from app.core.broker_service import BrokerService
 from app.core.config import Settings
@@ -111,11 +112,24 @@ class StrategyContext:
         """The instance's trade size at the last price (see sized_quantity)."""
         return sized_quantity(self._inst.config, self._inst.last_price, self._inst.lot_size)
 
-    async def buy(self, quantity: int | None = None, reason: str | None = None) -> None:
-        await self._runner.request(self._inst, Side.BUY, quantity or self._sized(reason), reason)
+    @property
+    def held_symbol(self) -> str | None:
+        """The other instrument (e.g. an option) this instance last bought, while it holds one."""
+        return self._inst.held_symbol if self._inst.position else None
 
-    async def sell(self, quantity: int | None = None, reason: str | None = None) -> None:
-        await self._runner.request(self._inst, Side.SELL, quantity or self._sized(reason), reason)
+    async def buy(self, quantity: int | None = None, reason: str | None = None, symbol: str | None = None) -> None:
+        """Buy `symbol` (default: the instance's own symbol, whose ticks it receives)."""
+        await self._runner.request(self._inst, Side.BUY, quantity or self._sized(reason), reason, symbol)
+
+    async def sell(self, quantity: int | None = None, reason: str | None = None, symbol: str | None = None) -> None:
+        await self._runner.request(self._inst, Side.SELL, quantity or self._sized(reason), reason, symbol)
+
+    async def option_contracts(self) -> list[OptionContract]:
+        """Options listed on the instance's symbol, from its broker."""
+        service = self._runner.service(self._inst.account_id)
+        if service is None:
+            raise OrderError("Broker account not available")
+        return await service.require().get_option_contracts(self.symbol)
 
     def _sized(self, reason: str | None) -> int:
         quantity = self.quantity
@@ -158,6 +172,7 @@ class RunningInstance:
         self.position = 0
         self.last_price: float | None = None
         self.lot_size = 1  # the instrument's trading lot, for capital sizing
+        self.held_symbol: str | None = None  # another instrument it bought (an option), if any
         self.pending_order_id: str | None = None
         self.filled: dict[str, int] = {}  # order id -> filled qty already counted
         self._orders_day = _today_ist()
@@ -278,6 +293,8 @@ class StrategyRunner:
             inst.lot_size = await service.broker.get_lot_size(config.symbol) or 1
         inst.position, inst.filled, inst.pending_order_id = await self._load_position(config)
         inst.orders_today = await self._orders_today(instance_id)
+        if inst.position:
+            inst.held_symbol = await self._held_symbol(config)
         inst.strategy = dep.strategy(dep.params, StrategyContext(self, inst), TIMEFRAMES[config.timeframe])
         await inst.strategy.on_start()
         self.running[instance_id] = inst
@@ -427,14 +444,19 @@ class StrategyRunner:
             return f"Reached max_orders_per_day ({cfg.max_orders_per_day})"
         return None
 
-    async def request(self, inst: RunningInstance, side: Side, quantity: int, reason: str | None) -> None:
+    async def request(self, inst: RunningInstance, side: Side, quantity: int, reason: str | None,
+                      symbol: str | None = None) -> None:
+        """Signal (and in live mode place) a market order on `symbol`, default the instance's own.
+        The instance keeps one net position whichever symbol it trades."""
         if quantity <= 0:
             return
+        symbol = symbol or inst.symbol
         async with inst.lock:
             cfg = inst.config
+            price = inst.last_price if symbol == inst.symbol else await self._quote(inst.account_id, symbol)
             signal = StrategySignal(
-                instance_id=inst.id, symbol=inst.symbol, side=side.value, quantity=quantity,
-                price=inst.last_price, reason=(reason or "")[:512] or None, mode=cfg.mode,
+                instance_id=inst.id, symbol=symbol, side=side.value, quantity=quantity,
+                price=price, reason=(reason or "")[:512] or None, mode=cfg.mode,
             )
             if blocked := self._check(inst, side, quantity):
                 signal.outcome, signal.message = "blocked", blocked
@@ -444,14 +466,25 @@ class StrategyRunner:
                 inst.orders_today += 1
             else:
                 await self._place(inst, side, quantity, signal)
+            if symbol != inst.symbol and side == Side.BUY and signal.outcome in ("signal_only", "placed"):
+                inst.held_symbol = symbol
             await self._record(signal, inst.account_id)
+
+    async def _quote(self, account_id: int, symbol: str) -> float | None:
+        """Last price of an instrument the instance doesn't stream (e.g. the option it trades)."""
+        service = self.service(account_id)
+        try:
+            return (await service.require().get_quotes([symbol])).get(symbol) if service else None
+        except Exception as e:
+            log.info("No quote for %s: %s", symbol, e)
+            return None
 
     async def _place(self, inst: RunningInstance, side: Side, quantity: int, signal: StrategySignal) -> None:
         service = self.service(inst.account_id)
         signal.broker = service.name
         try:
             order = await service.place_order(PlaceOrder(
-                action="place_order", symbol=inst.symbol, side=side, quantity=quantity,
+                action="place_order", symbol=signal.symbol, side=side, quantity=quantity,
                 order_type=OrderType.MARKET,
             ))
         except OrderError as e:
@@ -491,6 +524,17 @@ class StrategyRunner:
             account_id = row.account_id
         await self.accounts.publish(account_id, {"type": "strategy_status", "instance_id": instance_id,
                                                  "status": status, "error": error})
+
+    async def _held_symbol(self, config: StrategyInstance) -> str | None:
+        """After a restart: the other instrument its latest accepted buy was for, if any."""
+        async with db.session() as s:
+            symbol = await s.scalar(
+                select(StrategySignal.symbol)
+                .where(StrategySignal.instance_id == config.id, StrategySignal.side == Side.BUY.value,
+                       StrategySignal.outcome.in_(("signal_only", "placed")))
+                .order_by(StrategySignal.id.desc()).limit(1)
+            )
+        return symbol if symbol and symbol != config.symbol else None
 
     async def _load_position(
         self, config: StrategyInstance

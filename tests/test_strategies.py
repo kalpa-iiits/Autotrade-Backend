@@ -538,3 +538,30 @@ def test_sized_quantity_rounds_to_lots_and_caps():
     assert sized_quantity(row, 26000.0, lot=65) == 0  # can't pay for one lot
     row.size_mode, row.fixed_quantity = "fixed", None
     assert sized_quantity(row, 26000.0) == 65
+
+
+def test_trading_another_symbol_is_remembered_across_restarts(deploy):
+    c = deploy(dep("a", quantity=1, max_order_qty=5, max_position=5))
+    inst = start_strategy(c, "a")
+    SCRIPT.extend([("buy", 2, "opened", "NSE:SBIN26NOV800CE")])
+    tick(c)
+    got = signals(c, inst["id"])[0]
+    assert (got["symbol"], got["side"], got["quantity"], got["outcome"]) == ("NSE:SBIN26NOV800CE", "BUY", 2, "signal_only")
+    assert c.app.state.strategy_runner.running[inst["id"]].held_symbol == "NSE:SBIN26NOV800CE"
+
+    c = deploy(dep("a", quantity=1, max_order_qty=5, max_position=5))  # restart
+    start_strategy(c, "a")
+    running = c.app.state.strategy_runner.running[inst["id"]]
+    assert (running.position, running.held_symbol) == (2, "NSE:SBIN26NOV800CE")
+
+
+def test_option_strategies_take_fixed_quantity_only(deploy):
+    from app.strategies.builtin.intraday_breakout_options import IntradayBreakoutOptions
+
+    c = deploy(dep("opt", strategy=IntradayBreakoutOptions, quantity=65, max_position=650, max_order_qty=650))
+    inst = by_key(c, "opt")
+    r = c.patch(f"/api/strategies/{inst['id']}", json={"size_mode": "capital", "capital_per_trade": 100000}, headers=AUTH)
+    assert r.status_code == 422 and "fixed quantity" in r.json()["detail"]
+    assert c.patch(f"/api/strategies/{inst['id']}", json={"fixed_quantity": 130}, headers=AUTH).status_code == 200
+    catalog = {d["key"]: d for d in c.get("/api/strategies/catalog", headers=AUTH).json()}
+    assert catalog["opt"]["capital_sizing"] is False and catalog["opt"]["backtest_note"]

@@ -14,6 +14,7 @@ dry-running it; live orders also need AUTOTRADE_STRATEGIES_LIVE_ENABLED=true in 
 """
 
 from app.strategies.builtin.intraday_breakout import IntradayBreakout
+from app.strategies.builtin.intraday_breakout_options import IntradayBreakoutOptions
 from app.strategies.builtin.sma_crossover import SmaCrossover
 from app.strategies.deployment import Deployment
 
@@ -42,6 +43,28 @@ DEPLOYMENTS: list[Deployment] = [
         # The reference TradingView report has commission overridden to zero: its trade-level
         # "Net P&L" equals raw price P&L (for example, 78.15 points × 65 = ₹5,079.75).
         backtest_commission_per_unit=0,
+    ),
+    # The same breakout signals on the NIFTY 50 index, traded with options 300 points in the
+    # money: a CE on a long signal, a PE on a short one, sold when the index trade exits. Sized in
+    # option lots (65 units = 1 NIFTY lot), up to 10 lots.
+    Deployment(
+        key="nifty-options-breakout",
+        label="Intraday Breakout · NIFTY options",
+        strategy=IntradayBreakoutOptions,
+        symbol="NSE:NIFTY50-INDEX",
+        timeframe="5m",
+        params=IntradayBreakoutOptions.Params(
+            lookback=5, max_width=0.4, avg_days=14,
+            stop_k=0.25, trail_k=0.40, max_trades_per_day=8,
+            entries_from="10:30", entries_until="14:45", square_off="15:15",
+            itm_points=300,
+        ),
+        quantity=65,
+        max_order_qty=650,
+        max_position=650,
+        max_orders_per_day=20,
+        mode="signal",
+        backtest_fixed_quantity=65,  # one lot, like live (the tester trades index points)
     ),
     Deployment(
         key="sbin-sma-1m",

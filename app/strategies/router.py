@@ -54,10 +54,13 @@ class InstanceUpdate(Sizing):
     timeframe: str | None = None
 
 
-def _sizing(body: Sizing, current: StrategyInstance | None, limits: dict) -> dict:
+def _sizing(body: Sizing, current: StrategyInstance | None, limits: dict, dep: Deployment | None) -> dict:
     """The sizing columns after applying `body` to `current` (None: a new instance), checked
     against the strategy's limits."""
     mode = body.size_mode or (current.size_mode if current else "fixed")
+    if mode == "capital" and dep is not None and not dep.strategy.capital_sizing:
+        raise HTTPException(status.HTTP_422_UNPROCESSABLE_ENTITY,
+                            "This strategy is sized by fixed quantity only (it trades option lots)")
     fields = body.model_fields_set
     fixed = body.fixed_quantity if "fixed_quantity" in fields else (current.fixed_quantity if current else None)
     capital = body.capital_per_trade if "capital_per_trade" in fields else (current.capital_per_trade if current else None)
@@ -82,6 +85,7 @@ def _instance_dict(row: StrategyInstance, runner: StrategyRunner) -> dict:
         "strategy": row.strategy, "description": dep.strategy.description if dep else None,
         "label": row.label, "symbol": row.symbol, "timeframe": row.timeframe,
         "timeframes": list(dep.strategy.timeframes) if dep else [],
+        "capital_sizing": dep.strategy.capital_sizing if dep else True,
         "params": row.params, "mode": row.mode, "status": row.status,
         "quantity": row.quantity, "max_order_qty": row.max_order_qty,
         "size_mode": row.size_mode, "fixed_quantity": row.fixed_quantity,
@@ -187,6 +191,7 @@ def _catalog_dict(dep: Deployment) -> dict:
         "rules": strategy.rules(dep.params), "params": params,
         "mode": dep.mode, "default_symbol": dep.symbol, "default_timeframe": dep.timeframe,
         "timeframes": list(strategy.timeframes),
+        "backtest_note": strategy.backtest_note, "capital_sizing": strategy.capital_sizing,
         "backtest_initial_capital": dep.backtest_initial_capital,
         "backtest_fixed_quantity": dep.backtest_fixed_quantity,
         "backtest_commission_per_unit": dep.backtest_commission_per_unit,
@@ -304,7 +309,7 @@ async def add_instance(request: Request, body: InstanceCreate, user: User = Depe
         raise HTTPException(status.HTTP_409_CONFLICT,
                             f"{body.deployment_key} already runs on {symbol} {body.timeframe} (#{existing.id})")
     dep = runner.deployments[body.deployment_key]
-    sizing = _sizing(body, None, dep.settings())
+    sizing = _sizing(body, None, dep.settings(), dep)
     async with db.session() as s, s.begin():
         if existing is not None:  # bring the archived one back, with its history
             row = await s.get(StrategyInstance, existing.id)
@@ -347,7 +352,8 @@ async def update_instance(request: Request, instance_id: int, body: InstanceUpda
     if other is not None:
         raise HTTPException(status.HTTP_409_CONFLICT,
                             f"Instance #{other.id} ({other.status}) already uses {symbol} {timeframe}")
-    sizing = _sizing(body, row, {"max_order_qty": row.max_order_qty, "max_position": row.max_position})
+    sizing = _sizing(body, row, {"max_order_qty": row.max_order_qty, "max_position": row.max_position},
+                     runner.deployments.get(row.deployment_key))
     async with db.session() as s, s.begin():
         row = await s.get(StrategyInstance, instance_id)
         for k, v in sizing.items():

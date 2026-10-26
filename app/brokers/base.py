@@ -37,6 +37,17 @@ class Instrument:
     kind: Literal["stock", "index"]
 
 
+@dataclass(frozen=True)
+class OptionContract:
+    """One listed option on an underlying, in the broker's own symbol spelling."""
+
+    symbol: str
+    kind: Literal["CE", "PE"]
+    strike: float
+    expiry: date  # IST trading day it expires
+    lot: int
+
+
 class OrderError(Exception):
     """An order request the broker refused (unknown symbol, cannot cancel, ...)."""
 
@@ -149,6 +160,11 @@ class Broker(ABC):
     async def get_lot_size(self, symbol: str) -> int | None:
         """The exchange's trading lot for `symbol` (1 for cash equities), or None if unknown."""
         return None
+
+    async def get_option_contracts(self, underlying: str) -> list[OptionContract]:
+        """Every unexpired CE/PE listed on `underlying` (e.g. the NIFTY 50 index); empty if the
+        broker lists none or can't say."""
+        return []
 
     async def get_history(
         self, symbol: str, resolution: Resolution, start: date, end: date
