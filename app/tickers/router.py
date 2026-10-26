@@ -85,8 +85,9 @@ async def candles(
         rows = await broker_or_503(runtime.service).get_history(symbol, resolution, start, end)
     return [
         {"time": c.start.isoformat(), "open": c.open, "high": c.high, "low": c.low,
-         "close": c.close, "volume": c.volume}
+         "close": c.close, "volume": c.volume or 0}
         for c in rows
+        if None not in (c.open, c.high, c.low, c.close)  # e.g. a broker's unfinished candle
     ]
 
 

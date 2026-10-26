@@ -139,13 +139,13 @@ def test_fyers_reconnect_triggers_resync_and_events_stay_in_order():
 
         def burst():  # the SDK thread delivers a burst faster than listeners handle it
             for i in range(50):
-                data_sock.kwargs["on_message"]({"symbol": SYM, "ltp": float(i)})
+                data_sock.kwargs["on_message"]({"symbol": SYM, "ltp": float(i + 1)})
         t = threading.Thread(target=burst)
         t.start()
         t.join()
         order_sock.kwargs["on_connect"]()  # the SDK reconnected the order socket
         await asyncio.sleep(0.2)
-        assert seen == [float(i) for i in range(50)]
+        assert seen == [float(i + 1) for i in range(50)]
         assert reconnects == [True]
         await broker.stop()
 

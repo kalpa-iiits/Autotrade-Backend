@@ -192,6 +192,8 @@ def test_ticks_subscriptions_and_account_data():
 
         data_sock.push("on_message", {"symbol": "NSE:SBIN-EQ", "ltp": 812.35, "type": "sf"})
         data_sock.push("on_message", {"type": "cn", "message": "Authentication done"})
+        for bad in (None, 0, "812", float("nan")):  # no usable price: dropped, not passed on
+            data_sock.push("on_message", {"symbol": "NSE:SBIN-EQ", "ltp": bad, "type": "sf"})
         await asyncio.sleep(0.05)
         assert ticks == [("NSE:SBIN-EQ", 812.35)]
 

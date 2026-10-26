@@ -1,9 +1,12 @@
+import logging
 from abc import ABC, abstractmethod
 from dataclasses import dataclass
 from datetime import date, datetime
 from typing import Awaitable, Callable, Literal
 
 from app.orders.schemas import Order, PlaceOrder, Position, _now, moves_backwards
+
+log = logging.getLogger(__name__)
 
 # Called whenever an order changes state (filled, cancelled, ...).
 OrderListener = Callable[[Order], Awaitable[None]]
@@ -120,6 +123,11 @@ class Broker(ABC):
         return order
 
     async def _emit_tick(self, symbol: str, price: float) -> None:
+        # A tick without a usable price (Fyers sends "ltp": null, e.g. around reconnects) is
+        # dropped here, for every broker: charts and strategies can't do anything with it.
+        if isinstance(price, bool) or not isinstance(price, (int, float)) or not price > 0:
+            log.debug("Dropping tick for %s without a price: %r", symbol, price)
+            return
         # Listeners must be quick (record, enqueue): slow work runs on their own tasks.
         self.ticks_received += 1
         self.last_tick_at = _now()

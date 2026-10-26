@@ -125,6 +125,23 @@ def test_candles(client):
     assert client.get("/api/accounts/1/market/candles?symbol=NOPE&resolution=D", headers=AUTH).status_code == 422
 
 
+def test_candles_without_a_price_are_left_out(client, monkeypatch):
+    from datetime import datetime, timezone
+
+    from app.brokers.base import Candle
+    from app.brokers.paper import PaperBroker
+
+    async def history(self, symbol, resolution, start, end):
+        at = lambda m: datetime(2026, 10, 23, 3, 45 + m, tzinfo=timezone.utc)
+        return [Candle(at(0), 800, 801, 799, 800.5, None),  # no volume: 0
+                Candle(at(1), 800.5, 802, 800, 801, 1200),
+                Candle(at(2), 801, None, None, None, 0)]  # unfinished: no prices yet
+
+    monkeypatch.setattr(PaperBroker, "get_history", history)
+    rows = client.get("/api/accounts/1/market/candles?symbol=NSE:SBIN-EQ&resolution=1", headers=AUTH).json()
+    assert [(r["close"], r["volume"]) for r in rows] == [(800.5, 0), (801, 1200)]
+
+
 # ---------- a frontend on another origin ----------
 
 def test_cors_only_for_configured_origins(client, monkeypatch):
