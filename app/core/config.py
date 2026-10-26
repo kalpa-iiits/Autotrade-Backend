@@ -85,6 +85,17 @@ class Settings(BaseSettings):
     option_entry_max_reprices: int = Field(6, ge=0)
     option_entry_max_chase_pct: float = Field(5.0, ge=0)
 
+    # ---------- forecasts (Kronos) ----------
+    # Price forecasts on the Market chart, from the Kronos model (app/forecast). Needs the extra
+    # packages in requirements-forecast.txt; without them POST /api/forecast answers 503.
+    # Model and tokenizer are Hugging Face repos, downloaded on first use. Kronos-mini pairs
+    # with NeoQuasar/Kronos-Tokenizer-2k and a 2048-bar context.
+    forecast_model: str = "NeoQuasar/Kronos-small"
+    forecast_tokenizer: str = "NeoQuasar/Kronos-Tokenizer-base"
+    forecast_max_context: int = 512
+    # "cpu", "mps", "cuda:0"; empty = the first of cuda / mps / cpu available.
+    forecast_device: str = ""
+
 
 def obsolete_settings(env_file: str = ".env") -> list[str]:
     """AUTOTRADE_ names set in the environment or .env that are no longer settings (e.g. the

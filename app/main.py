@@ -23,6 +23,8 @@ from app.auth.throttle import LoginThrottle
 from app.core import db
 from app.core.config import obsolete_settings, settings
 from app.core.instance_lock import InstanceLock, lock_path
+from app.forecast.router import router as forecast_router
+from app.forecast.service import Forecaster
 from app.orders.router import router as orders_router
 from app.strategies import deployments
 from app.strategies.router import router as strategies_router
@@ -65,6 +67,7 @@ async def _services(app: FastAPI):
     await app.state.login_throttle.prune()
     app.state.accounts = accounts
     app.state.strategy_runner = runner
+    app.state.forecaster = Forecaster(settings)  # loads the model on the first forecast
 
     # Accounts without credentials or today's login stay disconnected (not an error). Order
     # books are checked against our records below, once running strategies own their open
@@ -132,6 +135,7 @@ api.include_router(tickers_router)  # /api/accounts/{id}/ws/tickers, /api/accoun
 api.include_router(orders_router)  # /api/accounts/{id}/ws/orders, .../orders, positions, funds
 api.include_router(trades_router)  # /api/trades/...
 api.include_router(strategies_router)  # /api/strategies/...
+api.include_router(forecast_router)  # /api/forecast: Kronos price forecasts
 app.include_router(api)
 
 app.include_router(pages_router)  # HTML /login and /logout for the built-in test page

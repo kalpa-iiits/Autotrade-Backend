@@ -14,6 +14,7 @@ orders, trades or strategies.
 | **orders** | place / cancel orders, order updates, history, positions, funds, per account | `WS /api/accounts/{id}/ws/orders`, `/api/accounts/{id}/orders/...` |
 | **trades** | open / closed round-trip trades with P&L, across your accounts | `/api/trades/...` |
 | **strategies** | run the strategies defined in code on your accounts, symbols and timeframes | `/api/strategies/...` |
+| **forecast** | next-bar price forecasts from the [Kronos](https://github.com/shiyu-coder/Kronos) model (optional) | `/api/forecast` |
 
 Brokers (each account is one of these):
 
@@ -40,6 +41,19 @@ Upgrading from the single-broker version: your `AUTOTRADE_BROKER` / `AUTOTRADE_F
 `AUTOTRADE_ZERODHA_*` / `AUTOTRADE_API_TOKEN` settings are ignored now (the server logs their
 names). Existing orders and trades move to an "Imported (...)" account owned by the first user:
 paste that broker app's credentials into it, then remove them from `.env`.
+
+### Forecasts (optional)
+
+The Market chart's **Forecast** button draws the next 30 bars predicted by Kronos, a foundation
+model for candlestick series (code vendored in `app/forecast/kronos`, MIT). It needs PyTorch:
+
+```bash
+uv pip install -r requirements-forecast.txt
+```
+
+The model (`AUTOTRADE_FORECAST_MODEL`, default `NeoQuasar/Kronos-small`) downloads from Hugging
+Face on the first forecast. A forecast takes a few seconds (one at a time per server); without
+these packages `POST /api/forecast` answers 503 and everything else works as before.
 
 ## Run
 
