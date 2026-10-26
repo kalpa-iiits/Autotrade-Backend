@@ -11,6 +11,9 @@ Safety rules, applied to every buy/sell before anything reaches the broker:
   - max order quantity, max absolute position, max orders per day (IST) — except for orders
     that only shrink the position (exits are never blocked by limits)
   - live orders also pause while the trade ledger has updates it couldn't save
+  - options are ordered at a limit price a little through the last price, never at market
+    (brokers cap or refuse market orders on options), and cancelled if still unfilled after
+    option_order_timeout
 A strategy that raises an exception is stopped with status "error".
 
 Each running instance has its own tick queue and worker task, so a strategy that is slow
@@ -21,9 +24,10 @@ are dropped (counted in /health). Order updates are applied straight away, never
 
 import asyncio
 import logging
+import re
 from collections import OrderedDict
 from datetime import date, datetime, time
-from decimal import Decimal
+from decimal import ROUND_CEILING, ROUND_FLOOR, Decimal
 from typing import TYPE_CHECKING
 from zoneinfo import ZoneInfo
 
@@ -48,6 +52,19 @@ if TYPE_CHECKING:
 log = logging.getLogger(__name__)
 IST = ZoneInfo("Asia/Kolkata")
 TERMINAL = {OrderStatus.FILLED, OrderStatus.CANCELLED, OrderStatus.REJECTED}
+# Option contracts end in strike + CE/PE on every broker: NSE:NIFTY25O2825000CE, NFO:NIFTY25OCT25000CE.
+OPTION_SYMBOL = re.compile(r"\d(CE|PE)$")
+OPTION_TICK = Decimal("0.05")
+
+
+def option_limit_price(price: float, side: Side, buffer_pct: float) -> float:
+    """A limit price `buffer_pct` % through `price` (above it to buy, below it to sell), on the
+    0.05 tick, rounded away from the price so it still fills at once."""
+    step = Decimal(str(buffer_pct)) / 100
+    raw = Decimal(str(price)) * (1 + step if side == Side.BUY else 1 - step)
+    ticks = (raw / OPTION_TICK).to_integral_value(ROUND_CEILING if side == Side.BUY else ROUND_FLOOR)
+    return float(max(ticks, 1) * OPTION_TICK)
+
 
 class StrategyError(ValueError):
     """A request about strategy instances that can't be done (bad params, not stopped, ...)."""
@@ -214,6 +231,7 @@ class StrategyRunner:
         self._order_owner: dict[tuple[int, str], int] = {}
         # Order updates can arrive before place_order returns (and we learn the id).
         self._recent_orders: OrderedDict[tuple[int, str], Order] = OrderedDict()
+        self._expiries: set[asyncio.Task] = set()  # cancels of option orders left unfilled
 
     def service(self, account_id: int) -> BrokerService | None:
         runtime = self.accounts.get(account_id)
@@ -334,6 +352,8 @@ class StrategyRunner:
 
     async def shutdown(self) -> None:
         """Server stopping: leave statuses as "running" so they resume on the next start."""
+        for task in list(self._expiries):
+            task.cancel()
         for inst in self.running.values():
             await self._end_worker(inst)
             if inst.strategy is not None:
@@ -482,10 +502,18 @@ class StrategyRunner:
     async def _place(self, inst: RunningInstance, side: Side, quantity: int, signal: StrategySignal) -> None:
         service = self.service(inst.account_id)
         signal.broker = service.name
+        order_type, limit_price = OrderType.MARKET, None
+        if OPTION_SYMBOL.search(signal.symbol):
+            if signal.price:
+                order_type = OrderType.LIMIT
+                limit_price = option_limit_price(signal.price, side, self.settings.option_limit_buffer_pct)
+                signal.message = f"Limit {limit_price:.2f} (last {signal.price:g})"
+            else:  # no quote to price it from: the broker's own market protection applies
+                log.warning("Strategy %s: no quote for %s; placing a market order", inst.id, signal.symbol)
         try:
             order = await service.place_order(PlaceOrder(
                 action="place_order", symbol=signal.symbol, side=side, quantity=quantity,
-                order_type=OrderType.MARKET,
+                order_type=order_type, limit_price=limit_price,
             ))
         except OrderError as e:
             signal.outcome, signal.message = "rejected", str(e)
@@ -503,10 +531,30 @@ class StrategyRunner:
         self._order_owner[(inst.account_id, order.id)] = inst.id
         if order.status not in TERMINAL:
             inst.pending_order_id = order.id
+            if order_type == OrderType.LIMIT and self.settings.option_order_timeout > 0:
+                task = asyncio.create_task(self._expire(inst, order.id))
+                self._expiries.add(task)
+                task.add_done_callback(self._expiries.discard)
         # Apply what we know now, plus any update that raced ahead of place_order returning.
         self._apply_order(inst, order)
         if early := self._recent_orders.get((inst.account_id, order.id)):
             self._apply_order(inst, early)
+
+    async def _expire(self, inst: RunningInstance, order_id: str) -> None:
+        """Cancel a strategy's limit order still open after option_order_timeout, so it doesn't
+        block the instance's next order. What filled before the cancel stays counted."""
+        await asyncio.sleep(self.settings.option_order_timeout)
+        if inst.pending_order_id != order_id:
+            return  # filled, cancelled or rejected meanwhile
+        service = self.service(inst.account_id)
+        try:
+            order = await service.cancel_order(order_id)
+        except Exception as e:  # e.g. it filled just now: its update clears pending_order_id
+            log.info("Strategy %s: could not cancel unfilled order %s: %s", inst.id, order_id, e)
+            return
+        log.warning("Strategy %s: cancelled order %s, unfilled after %gs", inst.id, order_id,
+                    self.settings.option_order_timeout)
+        self._apply_order(inst, order)
 
     # ---------- persistence ----------
 

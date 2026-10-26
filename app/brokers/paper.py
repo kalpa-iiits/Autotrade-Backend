@@ -156,6 +156,11 @@ class PaperBroker(Broker):
                 order.reason = "Insufficient funds"
             elif req.order_type == OrderType.MARKET:
                 self._fill(order, self.prices[req.symbol])
+            elif req.order_type == OrderType.LIMIT and (
+                (req.side == Side.BUY and self.prices[req.symbol] <= req.limit_price)
+                or (req.side == Side.SELL and self.prices[req.symbol] >= req.limit_price)
+            ):
+                self._fill(order, self.prices[req.symbol])  # marketable: fills now, at the market
             self.orders[order.id] = order
         await self._emit_order(order)
         return order

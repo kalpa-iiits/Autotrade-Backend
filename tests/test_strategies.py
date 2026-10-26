@@ -1,3 +1,4 @@
+import asyncio
 from collections import deque
 from datetime import datetime, timezone
 
@@ -12,7 +13,7 @@ from app.strategies import deployments
 from app.strategies.base import Bar, BarBuilder, Strategy, Tick
 from app.strategies.builtin.sma_crossover import SmaCrossover
 from app.strategies.deployment import Deployment
-from tests.conftest import ACCOUNT, TOKEN, add_user, run
+from tests.conftest import ACCOUNT, TOKEN, add_user, run, runtime
 
 AUTH = {"Authorization": f"Bearer {TOKEN}"}
 SYM = "NSE:SBIN-EQ"
@@ -253,6 +254,67 @@ def test_live_rejection_is_recorded(deploy, monkeypatch):
     [sig] = signals(quiet, inst["id"])
     assert sig["outcome"] == "rejected" and "Unknown symbol" in sig["message"]
     assert instance(quiet, inst["id"])["position"] == 0
+
+
+OPT = "NSE:NIFTY26N0425000CE"  # an option, which the paper broker is taught a price for
+
+
+def test_live_option_orders_are_limit_orders(deploy, monkeypatch):
+    monkeypatch.setattr(settings, "strategies_live_enabled", True)
+    quiet = deploy(dep("a", mode="live"))
+    runtime(quiet).service.broker.prices[OPT] = 200.0
+    inst = start_strategy(quiet, "a")
+    SCRIPT.extend([("buy", None, "entry", OPT), ("sell", 1, "exit", OPT)])
+    tick(quiet)
+    assert instance(quiet, inst["id"])["position"] == 1  # filled straight away
+    tick(quiet)
+
+    history = quiet.get("/api/accounts/1/orders/history", headers=AUTH).json()
+    assert [(o["side"], o["order_type"], o["limit_price"], o["status"]) for o in reversed(history)] == [
+        ("BUY", "LIMIT", 206.0, "FILLED"),   # 3% above the last price
+        ("SELL", "LIMIT", 194.0, "FILLED"),  # 3% below it
+    ]
+    assert [s["message"] for s in reversed(signals(quiet, inst["id"]))] == [
+        "Limit 206.00 (last 200)", "Limit 194.00 (last 200)"]
+    assert instance(quiet, inst["id"])["position"] == 0
+
+
+def test_unfilled_option_order_is_cancelled(deploy, monkeypatch):
+    from app.strategies.runner import StrategyRunner
+
+    async def stale_quote(self, account_id, symbol):
+        return 100.0  # the option has since moved to 200: a buy limit at 103 won't fill
+
+    monkeypatch.setattr(settings, "strategies_live_enabled", True)
+    monkeypatch.setattr(settings, "option_order_timeout", 0.05)
+    monkeypatch.setattr(StrategyRunner, "_quote", stale_quote)
+    quiet = deploy(dep("a", mode="live"))
+    runtime(quiet).service.broker.prices[OPT] = 200.0
+    inst = start_strategy(quiet, "a")
+    SCRIPT.append(("buy", None, "entry", OPT))
+    tick(quiet)
+    [order] = quiet.get("/api/accounts/1/orders/history", headers=AUTH).json()
+    assert (order["limit_price"], order["status"]) == (103.0, "OPEN")
+
+    run(quiet, asyncio.sleep, 0.3)
+    [order] = quiet.get("/api/accounts/1/orders/history", headers=AUTH).json()
+    assert order["status"] == "CANCELLED"
+    assert quiet.app.state.strategy_runner.running[inst["id"]].pending_order_id is None
+    assert instance(quiet, inst["id"])["position"] == 0
+    SCRIPT.append(("buy", None, "again", OPT))  # free to try again
+    tick(quiet)
+    assert signals(quiet, inst["id"])[0]["outcome"] == "placed"
+
+
+def test_option_limit_price_rounds_to_the_tick():
+    from app.orders.schemas import Side
+    from app.strategies.runner import OPTION_SYMBOL, option_limit_price
+
+    assert option_limit_price(187.33, Side.BUY, 3) == 192.95  # 192.9499 up to the next tick
+    assert option_limit_price(187.33, Side.SELL, 3) == 181.7   # 181.7101 down
+    assert option_limit_price(0.04, Side.SELL, 3) == 0.05      # never below one tick
+    assert [bool(OPTION_SYMBOL.search(s)) for s in (OPT, "NFO:NIFTY25OCT25000PE", SYM, "NSE:NIFTY50-INDEX")] == [
+        True, True, False, False]
 
 
 # ---------- failures, kill switch, restarts ----------

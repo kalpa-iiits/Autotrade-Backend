@@ -69,6 +69,14 @@ class Settings(BaseSettings):
     # ticks are dropped (the client is disconnected) so one slow consumer can't stall the rest.
     strategy_queue_size: int = 1000
     ws_queue_size: int = 1000
+    # Strategies order options with limit orders, never market ones: brokers cap or refuse
+    # market orders on options (Kite needs market protection, Fyers caps them and may refuse
+    # them on later expiries). Buys go at the option's last price + this %, sells at - this %,
+    # on the 0.05 tick, so they fill straight away while the price can't run further than that.
+    option_limit_buffer_pct: float = 3.0
+    # Seconds a strategy's option order may stay unfilled before it is cancelled (0 = never).
+    # An open order blocks the strategy's next one; it asks again on a later tick if it still wants to.
+    option_order_timeout: float = 30.0
 
 
 def obsolete_settings(env_file: str = ".env") -> list[str]:
