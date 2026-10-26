@@ -83,6 +83,9 @@ async def candles(
                             f"At most {MAX_DAYS[resolution]} days for resolution {resolution}")
     async with broker_errors():
         rows = await broker_or_503(runtime.service).get_history(symbol, resolution, start, end)
+    # Oldest first, one candle per time: charts break on anything else, and brokers don't
+    # always deliver that (e.g. overlapping pieces of a long range). The later copy wins.
+    rows = sorted({c.start: c for c in rows}.values(), key=lambda c: c.start)
     return [
         {"time": c.start.isoformat(), "open": c.open, "high": c.high, "low": c.low,
          "close": c.close, "volume": c.volume or 0}

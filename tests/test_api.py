@@ -142,6 +142,22 @@ def test_candles_without_a_price_are_left_out(client, monkeypatch):
     assert [(r["close"], r["volume"]) for r in rows] == [(800.5, 0), (801, 1200)]
 
 
+def test_candles_come_oldest_first_one_per_time(client, monkeypatch):
+    from datetime import datetime, timezone
+
+    from app.brokers.base import Candle
+    from app.brokers.paper import PaperBroker
+
+    async def history(self, symbol, resolution, start, end):
+        at = lambda m: datetime(2026, 10, 23, 3, 45 + m, tzinfo=timezone.utc)
+        return [Candle(at(0), 800, 801, 799, 800.5), Candle(at(2), 801, 802, 800, 801.5),
+                Candle(at(1), 800.5, 802, 800, 801), Candle(at(2), 801, 803, 800, 802)]  # out of order, repeated
+
+    monkeypatch.setattr(PaperBroker, "get_history", history)
+    rows = client.get("/api/accounts/1/market/candles?symbol=NSE:SBIN-EQ&resolution=1", headers=AUTH).json()
+    assert [(r["time"][11:16], r["close"]) for r in rows] == [("03:45", 800.5), ("03:46", 801), ("03:47", 802)]
+
+
 # ---------- a frontend on another origin ----------
 
 def test_cors_only_for_configured_origins(client, monkeypatch):
