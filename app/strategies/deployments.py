@@ -39,7 +39,7 @@ DEPLOYMENTS: list[Deployment] = [
         max_order_qty=5_000,
         max_position=5_000,
         max_orders_per_day=20,
-        mode="signal",
+        mode="live",  # real broker orders (also needs AUTOTRADE_STRATEGIES_LIVE_ENABLED=true)
         # The reference TradingView report has commission overridden to zero: its trade-level
         # "Net P&L" equals raw price P&L (for example, 78.15 points × 65 = ₹5,079.75).
         backtest_commission_per_unit=0,
