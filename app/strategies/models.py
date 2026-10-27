@@ -29,9 +29,6 @@ class StrategyInstance(Base):
     symbol: Mapped[str] = mapped_column(String(64))
     timeframe: Mapped[str] = mapped_column(String(8))  # key of TIMEFRAMES, e.g. "1m"
     params: Mapped[dict] = mapped_column(JSON, default=dict)
-    # "signal" records what it would trade; "live" places real orders (also needs
-    # AUTOTRADE_STRATEGIES_LIVE_ENABLED=true).
-    mode: Mapped[str] = mapped_column(String(8), default="signal")
     # stopped / running / error / removed (deployment no longer in code) / archived (removed in app)
     status: Mapped[str] = mapped_column(String(8), default="stopped")
     quantity: Mapped[int] = mapped_column(Integer)  # default size of buy()/sell()
@@ -63,8 +60,8 @@ class StrategySignal(Base):
     quantity: Mapped[int] = mapped_column(Integer)
     price: Mapped[float | None] = mapped_column(Float, nullable=True)  # last price when signalled
     reason: Mapped[str | None] = mapped_column(String(512), nullable=True)
-    mode: Mapped[str] = mapped_column(String(8))
-    # signal_only / placed / rejected (by broker) / blocked (by a risk check)
+    # placed / rejected (by broker) / blocked (by a risk check); signal_only = recorded by the
+    # dry-run mode that no longer exists (old history)
     outcome: Mapped[str] = mapped_column(String(12))
     message: Mapped[str | None] = mapped_column(String(512), nullable=True)
     broker: Mapped[str | None] = mapped_column(String(32), nullable=True)

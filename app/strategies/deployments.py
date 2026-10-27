@@ -9,8 +9,8 @@ Changes take effect when the server restarts (with --reload, on save) and apply 
 instance; running instances come back stopped after a change. Removing a deployment here marks
 its instances "removed" and keeps their signal history.
 
-New deployments start in mode="signal" (no orders). Switch to mode="live" only after
-dry-running it; live orders also need AUTOTRADE_STRATEGIES_LIVE_ENABLED=true in .env.
+A running instance places real orders on its account's broker: there is no dry-run mode. To
+try a strategy without real money, run it on a paper account.
 """
 
 from app.strategies.builtin.intraday_breakout import IntradayBreakout
@@ -39,7 +39,6 @@ DEPLOYMENTS: list[Deployment] = [
         max_order_qty=5_000,
         max_position=5_000,
         max_orders_per_day=20,
-        mode="live",  # real broker orders (also needs AUTOTRADE_STRATEGIES_LIVE_ENABLED=true)
         # The reference TradingView report has commission overridden to zero: its trade-level
         # "Net P&L" equals raw price P&L (for example, 78.15 points × 65 = ₹5,079.75).
         backtest_commission_per_unit=0,
@@ -63,7 +62,6 @@ DEPLOYMENTS: list[Deployment] = [
         max_order_qty=650,
         max_position=650,
         max_orders_per_day=20,
-        mode="signal",
         backtest_fixed_quantity=65,  # one lot, like live (the tester trades index points)
     ),
     Deployment(
@@ -75,6 +73,5 @@ DEPLOYMENTS: list[Deployment] = [
         quantity=1,
         max_position=1,
         max_orders_per_day=10,
-        mode="signal",
     ),
 ]

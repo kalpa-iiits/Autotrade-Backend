@@ -120,19 +120,19 @@ def test_deployments_come_from_code(deploy):
     assert [(r["deployment_key"], r["symbol"], r["timeframe"]) for r in rows] == [
         ("a", SYM, "5m"), ("b", SYM, "5m")]
     b = rows[1]
-    assert (b["strategy"], b["mode"], b["status"]) == ("sma_crossover", "signal", "stopped")
+    assert (b["strategy"], b["status"]) == ("sma_crossover", "stopped")
     assert (b["max_order_qty"], b["max_position"]) == (3, 3)  # default to quantity
     assert b["params"] == {"fast": 5, "slow": 10, "allow_short": False}
 
 
-def test_logic_limits_and_mode_cannot_be_changed_in_the_app(deploy):
+def test_logic_and_limits_cannot_be_changed_in_the_app(deploy):
     c = deploy(dep("a"))
     inst = by_key(c, "a")
-    # Only symbol/timeframe are accepted; anything else is ignored.
-    r = c.patch(f"/api/strategies/{inst['id']}", json={"mode": "live", "quantity": 999,
+    # Only symbol/timeframe (and sizing) are accepted; anything else is ignored.
+    r = c.patch(f"/api/strategies/{inst['id']}", json={"quantity": 999, "max_position": 999,
                                                     "params": {"x": 1}}, headers=AUTH)
     assert r.status_code == 200
-    assert (r.json()["mode"], r.json()["quantity"]) == ("signal", 1)
+    assert (r.json()["quantity"], r.json()["max_position"], r.json()["params"]) == (1, 2, {})
     # A brand-new strategy can't be defined from the app.
     assert c.post("/api/strategies", json={"deployment_key": "nope", "account_id": ACCOUNT, "symbol": SYM,
                                            "timeframe": "1m"}, headers=AUTH).status_code == 404
@@ -154,9 +154,9 @@ def test_changed_settings_come_back_stopped(deploy):
     start_strategy(c, "a")
     start_strategy(c, "b")
 
-    c = deploy(dep("a", mode="live"), dep("b", symbol="NSE:TCS-EQ"))  # only "a" changed
+    c = deploy(dep("a", max_orders_per_day=7), dep("b", symbol="NSE:TCS-EQ"))  # only "a" changed
     a, b = by_key(c, "a"), by_key(c, "b")
-    assert (a["status"], a["mode"]) == ("stopped", "live")
+    assert (a["status"], a["max_orders_per_day"]) == ("stopped", 7)
     assert "changed in code" in a["last_error"]
     assert b["status"] == "running"  # unchanged: resumes
 
@@ -188,9 +188,9 @@ def test_requires_login(deploy):
         assert getattr(c, method)(path).status_code == 401
 
 
-# ---------- signal mode (dry run) ----------
+# ---------- orders (paper broker) ----------
 
-def test_signal_mode_tracks_virtual_position_and_limits(deploy):
+def test_orders_are_placed_within_the_limits(deploy):
     quiet = deploy(dep("a", max_position=2, max_orders_per_day=3))
     inst = start_strategy(quiet, "a")
     SCRIPT.extend([("buy",), ("buy",), ("buy",), ("exit", "done"), ("buy",), ("buy",), ("exit",)])
@@ -199,34 +199,22 @@ def test_signal_mode_tracks_virtual_position_and_limits(deploy):
 
     got = list(reversed(signals(quiet, inst["id"])))
     assert [(s["side"], s["quantity"], s["outcome"]) for s in got] == [
-        ("BUY", 1, "signal_only"),
-        ("BUY", 1, "signal_only"),
-        ("BUY", 1, "blocked"),        # would make position 3 > max_position 2
-        ("SELL", 2, "signal_only"),   # exit: above max_order_qty 1, still allowed
-        ("BUY", 1, "blocked"),        # 3 orders today already
+        ("BUY", 1, "placed"),
+        ("BUY", 1, "placed"),
+        ("BUY", 1, "blocked"),   # would make position 3 > max_position 2
+        ("SELL", 2, "placed"),   # exit: above max_order_qty 1, still allowed
+        ("BUY", 1, "blocked"),   # 3 orders today already
         ("BUY", 1, "blocked"),
     ]
     assert "max_position" in got[2]["message"] and "max_orders_per_day" in got[4]["message"]
     assert got[3]["reason"] == "done" and got[0]["price"] == 100.0
     assert instance(quiet, inst["id"])["position"] == 0
-    assert quiet.get("/api/accounts/1/orders/history", headers=AUTH).json() == []  # nothing sent to the broker
+    history = quiet.get("/api/accounts/1/orders/history", headers=AUTH).json()
+    assert len(history) == 3  # every allowed trade went to the broker; blocked ones didn't
 
 
-def test_live_mode_needs_global_switch(deploy):
-    quiet = deploy(dep("a", mode="live"))
-    inst = start_strategy(quiet, "a")
-    SCRIPT.append(("buy",))
-    tick(quiet)
-    [sig] = signals(quiet, inst["id"])
-    assert sig["outcome"] == "blocked" and "AUTOTRADE_STRATEGIES_LIVE_ENABLED" in sig["message"]
-    assert quiet.get("/api/strategies", headers=AUTH).json()["live_trading_enabled"] is False
-
-
-# ---------- live mode (paper broker) ----------
-
-def test_live_mode_places_orders_and_tracks_fills(deploy, monkeypatch):
-    monkeypatch.setattr(settings, "strategies_live_enabled", True)
-    quiet = deploy(dep("a", mode="live", quantity=2, max_position=2))
+def test_orders_reach_the_broker_and_track_fills(deploy):
+    quiet = deploy(dep("a", quantity=2, max_position=2))
     inst = start_strategy(quiet, "a")
     SCRIPT.extend([("buy",), ("exit", "take profit")])
     tick(quiet)
@@ -245,9 +233,8 @@ def test_live_mode_places_orders_and_tracks_fills(deploy, monkeypatch):
     assert closed["totals"]["count"] == 1 and closed["positions"][0]["strategy"] == inst["label"]
 
 
-def test_live_rejection_is_recorded(deploy, monkeypatch):
-    monkeypatch.setattr(settings, "strategies_live_enabled", True)
-    quiet = deploy(dep("a", mode="live", symbol="NSE:NOPE"))  # paper broker doesn't know it
+def test_rejection_is_recorded(deploy):
+    quiet = deploy(dep("a", symbol="NSE:NOPE"))  # paper broker doesn't know it
     inst = start_strategy(quiet, "a")
     SCRIPT.append(("buy",))
     tick(quiet, symbol="NSE:NOPE")
@@ -262,7 +249,7 @@ BOOK: dict = {}  # best "bid" / "ask" the paper broker reports for OPT; missing 
 
 @pytest.fixture
 def options(deploy, monkeypatch):
-    """deploy() for option trading: live mode on, OPT priced at 200, market depth from BOOK,
+    """deploy() for option trading: OPT priced at 200, market depth from BOOK,
     and quick repricing checks (the defaults are seconds)."""
     from app.brokers.base import Depth
     from app.brokers.paper import PaperBroker
@@ -273,11 +260,10 @@ def options(deploy, monkeypatch):
 
     BOOK.clear()
     monkeypatch.setattr(PaperBroker, "get_depth", depth)
-    monkeypatch.setattr(settings, "strategies_live_enabled", True)
     monkeypatch.setattr(settings, "option_reprice_interval", 0.02)
 
     def start(**overrides):
-        c = deploy(dep("a", mode="live", **overrides))
+        c = deploy(dep("a", **overrides))
         runtime(c).service.broker.prices[OPT] = 200.0
         return c, start_strategy(c, "a")
 
@@ -480,9 +466,9 @@ def test_exits_are_never_blocked_by_limits(deploy):
         tick(quiet)
     got = list(reversed(signals(quiet, inst["id"])))
     assert [(s["side"], s["quantity"], s["outcome"]) for s in got] == [
-        ("BUY", 1, "signal_only"),
-        ("SELL", 2, "blocked"),       # a flip opens new risk, so limits apply
-        ("SELL", 1, "signal_only"),   # exit allowed despite max_orders_per_day=1
+        ("BUY", 1, "placed"),
+        ("SELL", 2, "blocked"),   # a flip opens new risk, so limits apply
+        ("SELL", 1, "placed"),    # exit allowed despite max_orders_per_day=1
     ]
 
 
@@ -519,7 +505,7 @@ def test_add_copies_on_other_symbols_and_timeframes(deploy):
     r = add(c, "a", "NSE:TCS-EQ", "5m")
     assert r.status_code == 201, r.text
     copy = r.json()
-    assert (copy["symbol"], copy["timeframe"], copy["status"], copy["mode"]) == ("NSE:TCS-EQ", "5m", "stopped", "signal")
+    assert (copy["symbol"], copy["timeframe"], copy["status"]) == ("NSE:TCS-EQ", "5m", "stopped")
     assert copy["warning"] is None  # paper broker knows the symbol
 
     assert add(c, "a", "NSE:TCS-EQ", "5m").status_code == 409  # same target twice
@@ -617,13 +603,13 @@ def test_orders_per_day_starts_again_the_next_day(deploy, monkeypatch):
     SCRIPT.extend([("buy",), ("buy",)])
     tick(quiet)
     tick(quiet)
-    assert [s["outcome"] for s in reversed(signals(quiet, inst["id"]))] == ["signal_only", "blocked"]
+    assert [s["outcome"] for s in reversed(signals(quiet, inst["id"]))] == ["placed", "blocked"]
 
     monkeypatch.setattr(runner_module, "_today_ist", lambda: date(2026, 10, 27))  # midnight passes
     assert instance(quiet, inst["id"])["orders_today"] == 0
     SCRIPT.append(("buy",))
     tick(quiet)
-    assert signals(quiet, inst["id"])[0]["outcome"] == "signal_only"
+    assert signals(quiet, inst["id"])[0]["outcome"] == "placed"
     assert instance(quiet, inst["id"])["orders_today"] == 1
 
 
@@ -685,11 +671,12 @@ def test_sized_quantity_rounds_to_lots_and_caps():
 
 def test_trading_another_symbol_is_remembered_across_restarts(deploy):
     c = deploy(dep("a", quantity=1, max_order_qty=5, max_position=5))
+    runtime(c).service.broker.prices["NSE:SBIN26NOV800CE"] = 50.0  # the paper broker learns the option
     inst = start_strategy(c, "a")
     SCRIPT.extend([("buy", 2, "opened", "NSE:SBIN26NOV800CE")])
     tick(c)
     got = signals(c, inst["id"])[0]
-    assert (got["symbol"], got["side"], got["quantity"], got["outcome"]) == ("NSE:SBIN26NOV800CE", "BUY", 2, "signal_only")
+    assert (got["symbol"], got["side"], got["quantity"], got["outcome"]) == ("NSE:SBIN26NOV800CE", "BUY", 2, "placed")
     assert c.app.state.strategy_runner.running[inst["id"]].held_symbol == "NSE:SBIN26NOV800CE"
 
     c = deploy(dep("a", quantity=1, max_order_qty=5, max_position=5))  # restart

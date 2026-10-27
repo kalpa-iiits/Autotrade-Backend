@@ -61,8 +61,7 @@ def test_resync_applies_updates_the_socket_never_delivered(client, monkeypatch):
 
 
 def test_resync_unblocks_a_strategy_waiting_on_a_lost_fill(deploy, monkeypatch):
-    monkeypatch.setattr(settings, "strategies_live_enabled", True)
-    c = deploy(dep("a", mode="live"))
+    c = deploy(dep("a"))
     inst = start_strategy(c, "a")
     runner, brokers = c.app.state.strategy_runner, c.app.state.accounts.get(1).service
     order = place_limit(c, qty=1)
@@ -266,9 +265,8 @@ def test_rate_limiter_spaces_out_calls():
 
 # ---------- ledger failures ----------
 
-def test_ledger_failure_is_retried_and_pauses_live_trading(deploy, monkeypatch):
-    monkeypatch.setattr(settings, "strategies_live_enabled", True)
-    c = deploy(dep("a", mode="live"))
+def test_ledger_failure_is_retried_and_pauses_trading(deploy, monkeypatch):
+    c = deploy(dep("a"))
     inst = start_strategy(c, "a")
     ledger, brokers = c.app.state.accounts.get(1).ledger, c.app.state.accounts.get(1).service
     order = Order(id="lost1", symbol=SYM, side=Side.BUY, quantity=3, order_type=OrderType.MARKET,

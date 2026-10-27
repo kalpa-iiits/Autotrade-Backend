@@ -26,8 +26,6 @@ class Settings(BaseSettings):
     # Anyone may create an account with POST /api/auth/signup. Off: users are created with
     # `python -m app.auth.users create`.
     allow_signup: bool = False
-    # Global switch for strategies in "live" mode to place real orders. Off: they are blocked.
-    strategies_live_enabled: bool = False
     # Interactive API docs at /api/docs (and /api/openapi.json), for signed-in users only.
     enable_docs: bool = True
     # Browser origins of a separately hosted frontend, e.g. ["http://localhost:5173"]

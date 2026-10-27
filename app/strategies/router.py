@@ -86,7 +86,7 @@ def _instance_dict(row: StrategyInstance, runner: StrategyRunner) -> dict:
         "label": row.label, "symbol": row.symbol, "timeframe": row.timeframe,
         "timeframes": list(dep.strategy.timeframes) if dep else [],
         "capital_sizing": dep.strategy.capital_sizing if dep else True,
-        "params": row.params, "mode": row.mode, "status": row.status,
+        "params": row.params, "status": row.status,
         "quantity": row.quantity, "max_order_qty": row.max_order_qty,
         "size_mode": row.size_mode, "fixed_quantity": row.fixed_quantity,
         "capital_per_trade": float(row.capital_per_trade) if row.capital_per_trade is not None else None,
@@ -161,11 +161,10 @@ async def list_strategies(request: Request, include_hidden: bool = False, accoun
         rows = list(await s.scalars(query))
     runner = _runner(request)
     return {
-        "live_trading_enabled": runner.settings.strategies_live_enabled,
         # What code defines: for the "add an instance" form.
         "deployments": [
             {"key": d.key, "strategy": d.strategy.name, "description": d.strategy.description,
-             "mode": d.mode, "default_symbol": d.symbol, "default_timeframe": d.timeframe,
+             "default_symbol": d.symbol, "default_timeframe": d.timeframe,
              "timeframes": list(d.strategy.timeframes)}
             for d in runner.deployments.values()
         ],
@@ -189,7 +188,7 @@ def _catalog_dict(dep: Deployment) -> dict:
         "key": dep.key, "label": dep.label or dep.key, "strategy": strategy.name,
         "description": strategy.description, "tags": list(strategy.tags),
         "rules": strategy.rules(dep.params), "params": params,
-        "mode": dep.mode, "default_symbol": dep.symbol, "default_timeframe": dep.timeframe,
+        "default_symbol": dep.symbol, "default_timeframe": dep.timeframe,
         "timeframes": list(strategy.timeframes),
         "backtest_note": strategy.backtest_note, "capital_sizing": strategy.capital_sizing,
         "backtest_initial_capital": dep.backtest_initial_capital,

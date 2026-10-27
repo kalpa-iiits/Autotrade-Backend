@@ -3,10 +3,9 @@
 Each instance runs on one broker account (its owner's): it sees only that account's ticks and
 order updates, and its orders go to that account's broker, with that account's rate limit.
 
-Safety rules, applied to every buy/sell before anything reaches the broker:
-  - mode "signal": nothing is sent; the trade is recorded and the strategy's position moves
-    as if it filled at the last price, so a dry run behaves like the real thing
-  - mode "live" also needs AUTOTRADE_STRATEGIES_LIVE_ENABLED=true (global switch, off by default)
+Every running instance places real orders on its account's broker (no dry-run mode: use a
+paper account to try a strategy). Safety rules, applied to every buy/sell before it's sent:
+  - the broker must be connected
   - one open order at a time per instance
   - max order quantity, max absolute position, max orders per day (IST) — except for orders
     that only shrink the position (exits are never blocked by limits)
@@ -83,7 +82,7 @@ def signal_dict(s: StrategySignal) -> dict:
     return {
         "id": s.id, "instance_id": s.instance_id, "at": s.at.isoformat(), "symbol": s.symbol,
         "side": s.side, "quantity": s.quantity, "price": s.price, "reason": s.reason,
-        "mode": s.mode, "outcome": s.outcome, "message": s.message, "order_id": s.order_id,
+        "outcome": s.outcome, "message": s.message, "order_id": s.order_id,
     }
 
 
@@ -404,7 +403,6 @@ class StrategyRunner:
             "running": len(self.running),
             "dropped_ticks": sum(i.dropped_ticks for i in self.running.values()),
             "queued_ticks": sum(i.ticks.qsize() for i in self.running.values()),
-            "live_enabled": self.settings.strategies_live_enabled,
         }
 
     # ---------- broker events ----------
@@ -441,18 +439,15 @@ class StrategyRunner:
     def _check(self, inst: RunningInstance, side: Side, quantity: int) -> str | None:
         """The reason a trade is blocked, or None if it may go ahead."""
         cfg = inst.config
-        if cfg.mode == "live":
-            service = self.service(inst.account_id)
-            if not self.settings.strategies_live_enabled:
-                return "Live strategy trading is off (set AUTOTRADE_STRATEGIES_LIVE_ENABLED=true)"
-            if service is None:
-                return "Broker account not available"
-            if not service.connected:
-                return f"Broker not connected: {service.not_connected_reason}"
-            if not service.records_reliable():
-                return "Trade ledger has unsaved order updates (see /health); live orders paused"
-            if inst.pending_order_id:
-                return f"Order {inst.pending_order_id} is still open"
+        service = self.service(inst.account_id)
+        if service is None:
+            return "Broker account not available"
+        if not service.connected:
+            return f"Broker not connected: {service.not_connected_reason}"
+        if not service.records_reliable():
+            return "Trade ledger has unsaved order updates (see /health); orders paused"
+        if inst.pending_order_id:
+            return f"Order {inst.pending_order_id} is still open"
         new_position = inst.position + (quantity if side == Side.BUY else -quantity)
         reduces_only = abs(new_position) < abs(inst.position) and (new_position * inst.position >= 0)
         if reduces_only:
@@ -467,7 +462,7 @@ class StrategyRunner:
 
     async def request(self, inst: RunningInstance, side: Side, quantity: int, reason: str | None,
                       symbol: str | None = None) -> None:
-        """Signal (and in live mode place) a market order on `symbol`, default the instance's own.
+        """Place an order on `symbol` (default the instance's own) and record it as a signal.
         The instance keeps one net position whichever symbol it trades."""
         if quantity <= 0:
             return
@@ -477,17 +472,13 @@ class StrategyRunner:
             price = inst.last_price if symbol == inst.symbol else await self._quote(inst.account_id, symbol)
             signal = StrategySignal(
                 instance_id=inst.id, symbol=symbol, side=side.value, quantity=quantity,
-                price=price, reason=(reason or "")[:512] or None, mode=cfg.mode,
+                price=price, reason=(reason or "")[:512] or None,
             )
             if blocked := self._check(inst, side, quantity):
                 signal.outcome, signal.message = "blocked", blocked
-            elif cfg.mode != "live":
-                signal.outcome = "signal_only"
-                inst.position += quantity if side == Side.BUY else -quantity
-                inst.orders_today += 1
             else:
                 await self._place(inst, side, quantity, signal)
-            if symbol != inst.symbol and side == Side.BUY and signal.outcome in ("signal_only", "placed"):
+            if symbol != inst.symbol and side == Side.BUY and signal.outcome == "placed":
                 inst.held_symbol = symbol
             await self._record(signal, inst.account_id)
 
@@ -644,7 +635,7 @@ class StrategyRunner:
             symbol = await s.scalar(
                 select(StrategySignal.symbol)
                 .where(StrategySignal.instance_id == config.id, StrategySignal.side == Side.BUY.value,
-                       StrategySignal.outcome.in_(("signal_only", "placed")))
+                       StrategySignal.outcome == "placed")
                 .order_by(StrategySignal.id.desc()).limit(1)
             )
         return symbol if symbol and symbol != config.symbol else None
@@ -652,17 +643,8 @@ class StrategyRunner:
     async def _load_position(
         self, config: StrategyInstance
     ) -> tuple[int, dict[str, int], str | None]:
-        """Rebuild the instance's position after a restart, from its own history."""
+        """Rebuild the instance's position after a restart, from the orders it placed."""
         async with db.session() as s:
-            if config.mode != "live":
-                rows = await s.execute(
-                    select(StrategySignal.side, func.sum(StrategySignal.quantity))
-                    .where(StrategySignal.instance_id == config.id,
-                           StrategySignal.outcome == "signal_only")
-                    .group_by(StrategySignal.side)
-                )
-                totals = dict(rows.all())
-                return int(totals.get("BUY", 0) - totals.get("SELL", 0)), {}, None
             rows = (await s.execute(
                 select(OrderRecord.id, OrderRecord.side, OrderRecord.filled_quantity, OrderRecord.status)
                 .join(StrategySignal, (StrategySignal.order_id == OrderRecord.id)
@@ -683,7 +665,7 @@ class StrategyRunner:
             return await s.scalar(
                 select(func.count()).select_from(StrategySignal).where(
                     StrategySignal.instance_id == instance_id,
-                    StrategySignal.outcome.in_(("placed", "signal_only")),
+                    StrategySignal.outcome == "placed",
                     StrategySignal.at >= _start_of_today_utc(),
                 )
             )

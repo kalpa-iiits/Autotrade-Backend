@@ -219,13 +219,13 @@ python -m app.auth.users token <username> [name]   # a personal API token (shown
 
 ## Strategies
 
-**Code** (the platform admin) defines each strategy's logic, parameters, size, limits and mode:
+**Code** (the platform admin) defines each strategy's logic, parameters, size and limits:
 the catalog. **Each user** chooses where it runs: which of their broker accounts, symbol and
 timeframe, on as many at once as they like. Users only see and control their own instances.
 
 - A **strategy** is a Python class that reacts to price bars (or ticks) and calls `buy()`,
   `sell()` or `exit()` (`app/strategies/builtin/`). It can limit which timeframes it allows.
-- A **deployment** is a strategy plus its parameters, size, limits and mode, listed in
+- A **deployment** is a strategy plus its parameters, size and limits, listed in
   `app/strategies/deployments.py`:
 
 ```python
@@ -237,7 +237,6 @@ DEPLOYMENTS = [
         timeframe="1m",                     # suggested timeframe
         params=IntradayBreakout.Params(...),
         quantity=65, max_position=65, max_orders_per_day=20,
-        mode="signal",                      # "live" places real orders
     ),
 ]
 ```
@@ -251,36 +250,33 @@ DEPLOYMENTS = [
   with it first. Its orders go to that account's broker only. Each instance has its own position and its
   own copy of the limits, so two instances can each hold `max_position`.
 
-On every server start, instances are synced from code: changed parameters/size/limits/mode
+On every server start, instances are synced from code: changed parameters/size/limits
 apply to every instance of that deployment, and **instances that were running come back
-stopped** after such a change, so an edit (e.g. switching to live) never starts trading
-unattended. Unchanged running ones resume. Removing a deployment from code marks its instances
+stopped** after such a change, so an edit never resumes trading unattended. Unchanged running ones resume. Removing a deployment from code marks its instances
 `removed`. Every trade a strategy asks for is recorded in `strategy_signals` with its outcome.
 
 **Safety, in order:**
 
-1. **Mode.** New instances are `signal` mode: nothing is sent to the broker; the signal is
-   recorded and the instance's position moves as if it filled, so a dry run behaves like the
-   real thing. `live` mode places market orders.
-2. **Global switch.** Live mode also needs `AUTOTRADE_STRATEGIES_LIVE_ENABLED=true` in `.env`
-   (off by default); otherwise live signals are recorded as `blocked`.
-3. **Risk limits per instance:** `max_order_qty`, `max_position` (absolute), `max_orders_per_day`
+1. **Real orders only.** A running instance places real orders on its account's broker; there
+   is no dry-run mode. To try a strategy without real money, run it on a **paper** account.
+   Option contracts are ordered at a limit price from market depth, never at market.
+2. **Risk limits per instance:** `max_order_qty`, `max_position` (absolute), `max_orders_per_day`
    (IST), and one open order at a time. Orders that only shrink a position are never blocked
    by these limits, so a strategy can always exit.
-4. **Errors.** A strategy that raises is stopped with status `error` and the message in
+3. **Errors.** A strategy that raises is stopped with status `error` and the message in
    `last_error`.
-5. **Kill switch.** `POST /api/strategies/stop-all` (or **Stop all** on the test page) stops
+4. **Kill switch.** `POST /api/strategies/stop-all` (or **Stop all** on the test page) stops
    all of *your* strategies; it does not cancel orders already at the broker.
 
 After a restart, indicators start empty (no historical warm-up yet) and each strategy's
-position is rebuilt from its own signals/orders.
+position is rebuilt from the orders it placed.
 
 **Built-in strategies** (`app/strategies/builtin/`):
 
 | strategy | idea |
 |---|---|
 | `sma_crossover` | fast/slow moving average cross on bar closes; long-only or with shorts |
-| `intraday_breakout` | port of the TradingView "NIFTY 1-minute breakout": from 10:30, trade the first break of the last 5 one-minute candles' high/low; stop 0.25x and trail 0.40x the 14-day average daily range; skip if the 5-candle range is wider than 0.4x it; max 8 entries/day; entries until 14:45; square-off 15:15 (IST). Deployed as `nifty-1m-breakout` on the NIFTY future, 1 lot (65), signal mode. Roll the symbol to the next contract before monthly expiry. |
+| `intraday_breakout` | port of the TradingView "NIFTY 1-minute breakout": from 10:30, trade the first break of the last 5 one-minute candles' high/low; stop 0.25x and trail 0.40x the 14-day average daily range; skip if the 5-candle range is wider than 0.4x it; max 8 entries/day; entries until 14:45; square-off 15:15 (IST). Deployed as `nifty-1m-breakout` on the NIFTY future, 1 lot (65). Roll the symbol to the next contract before monthly expiry. |
 
 Strategies can read the broker's candle history with `await self.ctx.history("D" or "1", days=...)`
 (Fyers, Zerodha; the paper broker makes up candles for its own symbols).

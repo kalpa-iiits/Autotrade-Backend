@@ -1,6 +1,5 @@
 import re
 from dataclasses import dataclass, field
-from typing import Literal
 
 from pydantic import BaseModel
 
@@ -26,16 +25,13 @@ class Deployment:
     quantity: int  # default size of buy()/sell()
     symbol: str | None = None  # optional suggestion for a new instance
     params: BaseModel | dict = field(default_factory=dict)
-    # "signal": record what it would trade, place nothing. "live": place real orders
-    # (also needs AUTOTRADE_STRATEGIES_LIVE_ENABLED=true).
-    mode: Literal["signal", "live"] = "signal"
     max_order_qty: int | None = None  # default: quantity
     max_position: int | None = None  # absolute net quantity; default: quantity
     max_orders_per_day: int = 20
     label: str | None = None
     timeframe: str | None = None  # default for the first instance; None = strategy's default
     # Optional Strategy Tester settings for ports whose source has fixed backtest properties.
-    # They do not affect live/signal execution.
+    # They do not affect live trading.
     backtest_initial_capital: float | None = None
     backtest_fixed_quantity: int | None = None
     backtest_commission_per_unit: float = 0.0
@@ -45,8 +41,6 @@ class Deployment:
             raise ValueError(f"Deployment key {self.key!r}: use lowercase letters, digits, _ or -")
         if not (isinstance(self.strategy, type) and issubclass(self.strategy, Strategy)):
             raise TypeError(f"{self.key}: strategy must be a Strategy subclass")
-        if self.mode not in ("signal", "live"):
-            raise ValueError(f"{self.key}: mode must be 'signal' or 'live'")
         for name in ("quantity", "max_order_qty", "max_position", "max_orders_per_day"):
             value = getattr(self, name)
             if value is not None and value <= 0:
@@ -83,7 +77,6 @@ class Deployment:
             "strategy": self.strategy.name,
             "label": self.label or self.key,
             "params": self.params.model_dump(mode="json"),
-            "mode": self.mode,
             "quantity": self.quantity,
             "max_order_qty": self.max_order_qty or self.quantity,
             "max_position": self.max_position or self.quantity,

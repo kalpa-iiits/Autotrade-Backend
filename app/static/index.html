@@ -25,9 +25,6 @@
     #strategies td select { margin: 0; }
     .muted { color: #888; }
     details summary { cursor: pointer; }
-    .banner { padding: 6px 10px; border-radius: 6px; margin: 4px 0 8px; font-size: 14px; }
-    .banner.off { background: #8882; }
-    .banner.on { background: #d9363633; color: #d93636; font-weight: 600; }
     .status-running { color: #1a9e4b; font-weight: 600; }
     .status-error { color: #d93636; font-weight: 600; }
     .table-scroll { overflow-x: auto; }
@@ -106,7 +103,6 @@
 
   <fieldset id="strategies">
     <legend>Strategies</legend>
-    <div id="liveBanner" class="banner off">Loading…</div>
     <div class="muted" style="font-size:13px">
       Strategy logic, size, limits and mode are defined in code (app/strategies/deployments.py).
       Add them to the selected broker account and choose symbol and timeframe here (while stopped).
@@ -423,11 +419,6 @@
     async function refreshStrategies(force = true) {
       if (!force && isEditing()) return;
       const data = await api('GET', currentAccount() ? `/api/strategies?account_id=${currentAccount()}` : '/api/strategies');
-      const banner = document.getElementById('liveBanner');
-      banner.className = 'banner ' + (data.live_trading_enabled ? 'on' : 'off');
-      banner.textContent = data.live_trading_enabled
-        ? 'Live strategy trading is ON: strategies in live mode place real orders.'
-        : 'Live strategy trading is off: live-mode strategies are blocked (AUTOTRADE_STRATEGIES_LIVE_ENABLED).';
       deployments = data.deployments;
       fillAddForm();
 
@@ -464,7 +455,7 @@
         tr.append(
           cell(inst.id), cell(inst.deployment_key),
           cell(symbolInput || inst.symbol), cell(tfSelect || inst.timeframe),
-          cell(inst.mode), status,
+          status,
           cell(inst.position ?? '—', 'num'), cell(inst.last_price?.toFixed(2) ?? '—', 'num'),
           cell(inst.orders_today ?? '—', 'num'),
         );
@@ -484,8 +475,7 @@
             }),
             actionButton('Start', () => {
               if (tr.dataset.dirty) return log('! save the symbol/timeframe change first');
-              if (inst.mode === 'live' &&
-                  !confirm(`Start ${inst.deployment_key} on ${inst.symbol} ${inst.timeframe} in LIVE mode? It can place real orders.`)) return;
+              if (!confirm(`Start ${inst.deployment_key} on ${inst.symbol} ${inst.timeframe}? It places real orders on this account.`)) return;
               api('POST', `/api/strategies/${inst.id}/start`).then(refreshStrategies);
             }),
             actionButton('Remove', () =>

@@ -227,7 +227,7 @@ def test_deployment_matches_the_tradingview_inputs():
     assert (p.lookback, p.max_width, p.avg_days, p.stop_k, p.trail_k, p.max_trades_per_day) == (
         5, 0.4, 14, 0.25, 0.40, 8)
     assert (p.entries_from, p.entries_until, p.square_off) == (time(10, 30), time(14, 45), time(15, 15))
-    assert (dep.quantity, dep.mode) == (65, "live")  # live on purpose: real orders
+    assert dep.quantity == 65
 
 
 def test_history_through_the_real_runner(tmp_path, monkeypatch):
