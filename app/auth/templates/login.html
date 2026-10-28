@@ -54,8 +54,8 @@
     $error
     <form method="post" action="/login">
       <input type="hidden" name="next" value="$next">
-      <label for="username">Username</label>
-      <input id="username" name="username" autocomplete="username" required autofocus
+      <label for="username">Email</label>
+      <input id="username" name="username" autocomplete="username" inputmode="email" required autofocus
              value="$username">
       <label for="password">Password</label>
       <input id="password" name="password" type="password" autocomplete="current-password" required>

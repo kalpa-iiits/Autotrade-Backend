@@ -12,7 +12,7 @@ from app.accounts.vault import Vault, VaultError, generate_key
 from app.auth.models import ApiToken
 from app.core import db
 from app.core.config import obsolete_settings, settings
-from tests.conftest import AUTH, TOKEN, add_user, recv_until, run
+from tests.conftest import ADMIN_PASSWORD, AUTH, TOKEN, add_user, recv_until, run
 
 FYERS = {"client_id": "XB12345-100", "secret_key": "super-secret-value"}
 
@@ -295,14 +295,31 @@ def test_disabled_users_tokens_stop_working(client):
 
 
 def test_signup(client, monkeypatch):
-    body = {"username": "newbie", "password": "a long enough password"}
+    body = {"username": " New.Bie@Example.com ", "password": "a long enough password"}
     assert client.post("/api/auth/signup", json=body).status_code == 404  # off by default
     monkeypatch.setattr(settings, "allow_signup", True)
     r = client.post("/api/auth/signup", json=body)
-    assert r.status_code == 201 and r.json()["username"] == "newbie"
+    assert r.status_code == 201 and r.json()["username"] == "new.bie@example.com"  # stored lowercase
     assert client.get("/api/accounts").json() == []  # signed in, no accounts yet
-    assert client.post("/api/auth/signup", json=body).status_code == 422  # taken
-    assert client.post("/api/auth/signup", json={"username": "x", "password": "short"}).status_code == 422
+    r = client.post("/api/auth/signup", json={**body, "username": "new.bie@EXAMPLE.com"})
+    assert r.status_code == 422 and "already exists" in r.json()["detail"]  # taken, whatever the case
+    r = client.post("/api/auth/signup", json={"username": "newbie", "password": "a long enough password"})
+    assert r.status_code == 422 and "email" in r.json()["detail"]  # not an email
+    assert client.post("/api/auth/signup", json={"username": "x@y.in", "password": "short"}).status_code == 422
+
+
+def test_login_by_email_ignores_case_and_old_usernames_still_work(client, monkeypatch):
+    monkeypatch.setattr(settings, "allow_signup", True)
+    pw = "a long enough password"
+    assert client.post("/api/auth/signup", json={"username": "trader@example.com", "password": pw}).status_code == 201
+    client.post("/api/auth/logout")
+    r = client.post("/api/auth/login", json={"username": "  Trader@Example.COM", "password": pw})
+    assert r.status_code == 200 and r.json()["username"] == "trader@example.com"
+    client.post("/api/auth/logout")
+    r = client.post("/api/auth/login", json={"username": "TRADER@example.com", "password": "wrong password!"})
+    assert r.status_code == 401 and r.json()["detail"] == "Invalid email or password."
+    # An account made before emails (here the test admin) signs in with its username as before.
+    assert client.post("/api/auth/login", json={"username": "admin", "password": ADMIN_PASSWORD}).status_code == 200
 
 
 def test_obsolete_settings_are_reported_by_name(tmp_path, monkeypatch):

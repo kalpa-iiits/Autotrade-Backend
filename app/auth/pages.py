@@ -60,7 +60,7 @@ async def sign_in(request: Request, username: str, password: str) -> User:
     user = await authenticate(username, password)
     await throttle.record(client, username, success=user is not None)
     if user is None:
-        raise SignInFailed("Invalid username or password.", 401)
+        raise SignInFailed("Invalid email or password.", 401)
     request.session.clear()
     request.session.update({"uid": user.id, "pw": password_fingerprint(user)})
     return user

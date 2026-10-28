@@ -33,7 +33,7 @@ def test_sign_in_and_out(client):
 
 def test_wrong_credentials(client):
     r = sign_in(client, password="nope")
-    assert r.status_code == 401 and "Invalid username or password" in r.text
+    assert r.status_code == 401 and "Invalid email or password" in r.text
     assert sign_in(client, username="root").status_code == 401
     assert client.get("/api/accounts").status_code == 401
 

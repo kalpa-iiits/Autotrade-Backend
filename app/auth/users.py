@@ -10,6 +10,7 @@
 
 import asyncio
 import hashlib
+import re
 
 from sqlalchemy import func, select
 
@@ -19,6 +20,9 @@ from app.core import db
 from app.core.db import utcnow
 
 MIN_PASSWORD_LENGTH = 10
+# Users sign up with their email as their username. Users created before that (or with the CLI)
+# may have a plain username; they still sign in with it.
+EMAIL = re.compile(r"^[^@\s]+@[^@\s]+\.[^@\s]+$")
 
 
 class UserError(ValueError):
@@ -28,6 +32,20 @@ class UserError(ValueError):
 def password_fingerprint(user: User) -> str:
     """Stored in the session; changing a user's password logs out their existing sessions."""
     return hashlib.sha256(user.password_hash.encode()).hexdigest()[:16]
+
+
+def login_name(username: str) -> str:
+    """The stored username to look up: emails are compared lowercase, plain usernames as typed."""
+    username = username.strip()
+    return username.lower() if "@" in username else username
+
+
+def normalize_email(email: str) -> str:
+    """A sign-up email, lowercase; UserError if it doesn't look like one."""
+    email = email.strip().lower()
+    if not EMAIL.match(email) or len(email) > 64:
+        raise UserError("Enter a valid email address.")
+    return email
 
 
 def _check_password(password: str) -> None:
@@ -47,7 +65,7 @@ async def count_users() -> int:
 
 async def authenticate(username: str, password: str) -> User | None:
     async with db.session() as s, s.begin():
-        user = await s.scalar(select(User).where(User.username == username))
+        user = await s.scalar(select(User).where(User.username == login_name(username)))
         # Always run the hash check so a wrong username takes as long as a wrong password.
         ok = await asyncio.to_thread(verify_password, password, user.password_hash if user else DUMMY_HASH)
         if not (user and ok and user.is_active):

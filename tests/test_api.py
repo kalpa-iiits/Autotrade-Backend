@@ -20,7 +20,7 @@ def login(client, password=ADMIN_PASSWORD, username="admin"):
 def test_login_me_logout(client):
     assert client.get("/api/auth/me").status_code == 401
     bad = login(client, password="nope")
-    assert bad.status_code == 401 and bad.json()["detail"] == "Invalid username or password."
+    assert bad.status_code == 401 and bad.json()["detail"] == "Invalid email or password."
 
     r = login(client)
     assert r.status_code == 200 and r.json()["username"] == "admin"

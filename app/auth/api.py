@@ -12,7 +12,7 @@ from app.auth.models import User
 from app.auth.pages import SignInFailed, sign_in
 from app.auth.tokens import create_token, list_tokens, revoke_token, token_dict
 from app.auth.users import (
-    UserError, check_password, create_user, get_user, password_fingerprint, set_password,
+    UserError, check_password, create_user, get_user, normalize_email, password_fingerprint, set_password,
 )
 from app.core.config import settings
 
@@ -20,6 +20,7 @@ router = APIRouter(prefix="/auth", tags=["auth"])
 
 
 class Credentials(BaseModel):
+    # Sign-up takes an email here; sign-in takes the email, or an older account's plain username.
     username: str = Field(min_length=1, max_length=64)
     password: str = Field(min_length=1, max_length=256)
 
@@ -85,8 +86,9 @@ async def change_password(request: Request, body: PasswordChange,
 
 @router.post("/signup", response_model=Me, status_code=status.HTTP_201_CREATED)
 async def signup(request: Request, body: Credentials, response: Response):
-    """Create your own user and sign in. Only when AUTOTRADE_ALLOW_SIGNUP=true (404 otherwise).
-    Shares the failed-login lockout, so it can't be used to hammer the server."""
+    """Create your own user, with your email as its username, and sign in. Only when
+    AUTOTRADE_ALLOW_SIGNUP=true (404 otherwise). Shares the failed-login lockout, so it can't be
+    used to hammer the server."""
     if not settings.allow_signup:
         raise HTTPException(status.HTTP_404_NOT_FOUND, "Sign-up is disabled on this server")
     throttle = request.app.state.login_throttle
@@ -95,11 +97,13 @@ async def signup(request: Request, body: Credentials, response: Response):
         raise HTTPException(status.HTTP_429_TOO_MANY_REQUESTS, f"Too many attempts. Try again in {wait} seconds.",
                             headers={"Retry-After": str(wait)})
     try:
-        await create_user(body.username, body.password)
+        email = normalize_email(body.username)
+        await create_user(email, body.password)
     except UserError as e:
         await throttle.record(client, body.username, success=False)
-        raise HTTPException(status.HTTP_422_UNPROCESSABLE_ENTITY, str(e))
-    user = await sign_in(request, body.username, body.password)
+        message = "An account with this email already exists." if "already exists" in str(e) else str(e)
+        raise HTTPException(status.HTTP_422_UNPROCESSABLE_ENTITY, message)
+    user = await sign_in(request, email, body.password)
     response.headers["Cache-Control"] = "no-store"
     return _me(user)
 
