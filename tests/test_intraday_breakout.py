@@ -181,6 +181,27 @@ def test_entry_window_and_square_off():
     assert late.levels is None  # closes after 14:45: no new entries
 
 
+def test_clock_squares_off_without_ticks():
+    ctx = FakeCtx(live=True)
+    strat, _ = make(ctx)
+    quiet_minutes(strat, "10:25", "10:29")
+    ticks(strat, ("10:30", 5, 1000.5), ("10:30", 9, 999.0))  # short; then the feed goes quiet
+    ctx.position = -65  # filled
+
+    asyncio.run(strat.on_clock(at("15:14", 55)))
+    assert ctx.calls[-1][0] == "sell"  # before square-off time: nothing
+    asyncio.run(strat.on_clock(at("15:15", 2)))
+    assert ctx.calls[-1] == ("exit", "square-off at 15:15")
+    asyncio.run(strat.on_clock(at("15:15", 4)))
+    assert len(ctx.calls) == 2  # not repeated while the exit is being filled
+    asyncio.run(strat.on_clock(at("15:15", 8)))
+    assert ctx.calls[-1] == ("exit", "square-off at 15:15")  # still open: asked again
+
+    ctx.position = 0  # filled
+    asyncio.run(strat.on_clock(at("15:15", 20)))
+    assert len(ctx.calls) == 3
+
+
 def test_no_history_means_no_trades_and_retries():
     ctx = FakeCtx(history_error="Broker not connected")
     strat, _ = make(ctx)

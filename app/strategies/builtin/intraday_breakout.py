@@ -16,6 +16,8 @@ Differences from the Pine version (which simulates resting stop orders on bar da
   - Entries and exits are market orders sent when a tick reaches the level, so live fills
     include slippage; the stop is measured from the price of the triggering tick.
   - The stop and trail are checked on every tick instead of once per bar.
+  - The square-off is checked on every tick and on the runner's clock, so it still happens on
+    time when no ticks arrive (feed dropped, quiet market).
   - Commission is not modelled (the broker charges the real one).
   - The daily cap counts entries requested, including ones a risk check blocks.
 """
@@ -126,6 +128,14 @@ class IntradayBreakout(Strategy):
         if bar := self._bars.add(tick):
             await self.on_bar(bar)
         await self._on_price(tick.price, now)
+
+    async def on_clock(self, now: datetime) -> None:
+        """Square off on time even if no tick comes after the square-off time."""
+        now = now.astimezone(IST)
+        if now.time() >= self.params.square_off:
+            self.levels = None
+            if self.ctx.position != 0:
+                await self._exit(now, f"square-off at {self.params.square_off:%H:%M}")
 
     async def on_backtest_candle(self, candle: Candle) -> None:
         """Replay one broker candle with TradingView's bar-close strategy semantics.

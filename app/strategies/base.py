@@ -123,5 +123,9 @@ class Strategy(ABC):
     async def on_bar(self, bar: Bar) -> None:
         """A completed bar of the instance's timeframe (`self.bar_seconds`)."""
 
+    async def on_clock(self, now: datetime) -> None:
+        """Called every few seconds (`strategy_clock_interval`) when no ticks are waiting, so
+        time-based rules (e.g. an intraday square-off) don't depend on a price update arriving."""
+
     async def on_stop(self) -> None:
         """Called when the instance stops."""

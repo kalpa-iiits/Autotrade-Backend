@@ -20,12 +20,15 @@ Each running instance has its own tick queue and worker task, so a strategy that
 (placing an order, loading history) only delays itself: the broker feed, other strategies and
 clients keep going. If an instance falls `strategy_queue_size` ticks behind, its oldest ticks
 are dropped (counted in /health). Order updates are applied straight away, never queued.
+Every `strategy_clock_interval` seconds an idle instance also gets a clock event (on_clock)
+through the same queue, so timed rules run even when no ticks arrive.
 """
 
 import asyncio
 import logging
 import re
 from collections import OrderedDict
+from dataclasses import dataclass
 from datetime import date, datetime, time
 from decimal import ROUND_CEILING, ROUND_FLOOR, Decimal
 from typing import TYPE_CHECKING
@@ -64,6 +67,12 @@ def option_limit_price(price: float, side: Side, buffer_pct: float) -> float:
     raw = Decimal(str(price)) * (1 + step if side == Side.BUY else 1 - step)
     ticks = (raw / OPTION_TICK).to_integral_value(ROUND_CEILING if side == Side.BUY else ROUND_FLOOR)
     return float(max(ticks, 1) * OPTION_TICK)
+
+
+@dataclass
+class Clock:
+    """A clock event in an instance's tick queue (see StrategyRunner._clock)."""
+    at: datetime
 
 
 class StrategyError(ValueError):
@@ -195,11 +204,12 @@ class RunningInstance:
         self._orders_day = _today_ist()
         self._orders_count = 0
         self.lock = asyncio.Lock()
-        self.ticks: asyncio.Queue[Tick] = asyncio.Queue(queue_size)
+        self.ticks: asyncio.Queue[Tick | Clock] = asyncio.Queue(queue_size)
         self.worker: asyncio.Task | None = None
+        self.clock: asyncio.Task | None = None
         self.dropped_ticks = 0
 
-    def enqueue(self, tick: Tick) -> None:
+    def enqueue(self, tick: Tick | Clock) -> None:
         if self.ticks.full():
             # Behind: the oldest tick matters least.
             self.ticks.get_nowait()
@@ -317,6 +327,7 @@ class StrategyRunner:
         await inst.strategy.on_start()
         self.running[instance_id] = inst
         inst.worker = asyncio.create_task(self._work(inst))
+        inst.clock = asyncio.create_task(self._clock(inst))
         await self._set_status(instance_id, "running", None)
 
         if service.connected:
@@ -368,8 +379,11 @@ class StrategyRunner:
         while True:
             tick = await inst.ticks.get()
             try:
-                inst.last_price = tick.price
-                await inst.strategy.on_tick(tick)
+                if isinstance(tick, Clock):
+                    await inst.strategy.on_clock(tick.at)
+                else:
+                    inst.last_price = tick.price
+                    await inst.strategy.on_tick(tick)
             except Exception as e:
                 log.exception("Strategy %s failed on tick", inst.id)
                 inst.ticks.task_done()
@@ -377,7 +391,18 @@ class StrategyRunner:
                 return
             inst.ticks.task_done()
 
+    async def _clock(self, inst: RunningInstance) -> None:
+        """Queues a clock event every `strategy_clock_interval` seconds while the instance has
+        no ticks waiting (queued ticks wake it anyway), whether or not the feed is sending."""
+        while True:
+            await asyncio.sleep(self.settings.strategy_clock_interval)
+            if inst.ticks.empty():
+                inst.enqueue(Clock(utcnow()))
+
     async def _end_worker(self, inst: RunningInstance) -> None:
+        clock, inst.clock = inst.clock, None
+        if clock is not None:
+            clock.cancel()
         worker, inst.worker = inst.worker, None
         if worker is not None and worker is not asyncio.current_task():
             # request() holds the lock from placing an order until its signal is saved: wait

@@ -18,19 +18,27 @@ from tests.conftest import ACCOUNT, TOKEN, add_user, run, runtime
 AUTH = {"Authorization": f"Bearer {TOKEN}"}
 SYM = "NSE:SBIN-EQ"
 SCRIPT: deque = deque()  # commands the scripted strategy runs, one per tick
+CLOCK_SCRIPT: deque = deque()  # commands it runs, one per clock event
 
 
 class Scripted(Strategy):
-    """Test strategy: each tick runs the next command from SCRIPT."""
+    """Test strategy: each tick runs the next command from SCRIPT, each clock event the next
+    from CLOCK_SCRIPT."""
     name = "test_scripted"
 
     class Params(BaseModel):
         pass
 
     async def on_tick(self, tick: Tick) -> None:
-        if not SCRIPT:
+        await self._next(SCRIPT)
+
+    async def on_clock(self, now: datetime) -> None:
+        await self._next(CLOCK_SCRIPT)
+
+    async def _next(self, script: deque) -> None:
+        if not script:
             return
-        cmd, *args = SCRIPT.popleft()
+        cmd, *args = script.popleft()
         if cmd == "raise":
             raise RuntimeError("boom")
         await getattr(self.ctx, cmd)(*args)
@@ -48,6 +56,7 @@ def deploy(monkeypatch):
     Its paper broker sends no random ticks during the test."""
     monkeypatch.setattr(settings, "tick_interval", 3600)
     SCRIPT.clear()
+    CLOCK_SCRIPT.clear()
     clients = []
 
     def start(*deps):
@@ -394,6 +403,24 @@ def test_exception_stops_strategy_with_error(deploy):
     got = instance(quiet, inst["id"])
     assert got["status"] == "error" and "boom" in got["last_error"]
     assert inst["id"] not in quiet.app.state.strategy_runner.running
+
+
+def test_clock_events_arrive_without_ticks(deploy, monkeypatch):
+    monkeypatch.setattr(settings, "strategy_clock_interval", 0.01)
+    quiet = deploy(dep("a"))
+    inst = start_strategy(quiet, "a")
+    SCRIPT.append(("buy",))
+    tick(quiet)
+    assert instance(quiet, inst["id"])["position"] == 1
+
+    CLOCK_SCRIPT.append(("exit", "square-off"))  # no more ticks: only the clock can do it
+    for _ in range(100):
+        if not CLOCK_SCRIPT:
+            break
+        run(quiet, asyncio.sleep, 0.01)
+    run(quiet, quiet.app.state.strategy_runner.drain)
+    assert instance(quiet, inst["id"])["position"] == 0
+    assert any(s["reason"] == "square-off" for s in signals(quiet, inst["id"]))
 
 
 def test_stop_all(deploy):

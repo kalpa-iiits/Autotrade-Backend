@@ -68,6 +68,9 @@ class Settings(BaseSettings):
     # ticks are dropped (the client is disconnected) so one slow consumer can't stall the rest.
     strategy_queue_size: int = 1000
     ws_queue_size: int = 1000
+    # Seconds between clock events for each running strategy (Strategy.on_clock), sent even
+    # when no ticks arrive, so a dropped feed or quiet market can't delay a timed square-off.
+    strategy_clock_interval: float = Field(5.0, gt=0)
     # Strategies order options with limit orders, never market ones: brokers cap or refuse
     # market orders on options (Kite needs market protection, Fyers caps them and may refuse
     # them on later expiries). Priced from market depth: buys at the best ask + this %, sells
