@@ -16,15 +16,15 @@ def chain():
     return out
 
 
-def test_picks_300_points_in_the_money_on_the_next_expiry():
+def test_picks_300_points_in_the_money_on_todays_expiry():
     ce = pick_contract(chain(), "CE", 25012.4, 300, TODAY)
     pe = pick_contract(chain(), "PE", 25012.4, 300, TODAY)
-    assert (ce.kind, ce.strike, ce.expiry) == ("CE", 24700.0, date(2026, 11, 3))  # not today's expiry
-    assert (pe.kind, pe.strike, pe.expiry) == ("PE", 25300.0, date(2026, 11, 3))
+    assert (ce.kind, ce.strike, ce.expiry) == ("CE", 24700.0, TODAY)
+    assert (pe.kind, pe.strike, pe.expiry) == ("PE", 25300.0, TODAY)
     # Halfway between strikes: the deeper in-the-money one.
     assert pick_contract(chain(), "CE", 25025.0, 300, TODAY).strike == 24700.0
     assert pick_contract(chain(), "PE", 25025.0, 300, TODAY).strike == 25350.0
-    assert pick_contract(chain(), "CE", 25000, 300, date(2026, 11, 9)) is None  # nothing after the last expiry
+    assert pick_contract(chain(), "CE", 25000, 300, date(2026, 11, 10)) is None  # nothing after the last expiry
 
 
 class FakeCtx:

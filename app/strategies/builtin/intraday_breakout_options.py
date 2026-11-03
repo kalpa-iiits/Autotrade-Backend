@@ -6,8 +6,8 @@ changes:
   - long signal  -> buy a call (CE) `itm_points` below the index (in the money)
   - short signal -> buy a put (PE) `itm_points` above the index (in the money)
   - the index strategy's exit (stop, trailing stop or square-off) -> sell that same option.
-Options are only ever bought, never written. The contract is the nearest weekly expiry; on its
-expiry day the next one is used, so it never holds a contract expiring that afternoon.
+Options are only ever bought, never written. The contract is the nearest weekly expiry,
+including a contract that expires today.
 
 Strategy Tester replays the index signals and reports index points x quantity: option premiums
 of past contracts aren't available, so the option P&L itself isn't simulated.
@@ -74,9 +74,9 @@ class OptionLegs:
 def pick_contract(contracts: list[OptionContract], kind: str, spot: float, itm_points: float,
                   today) -> OptionContract | None:
     """The `kind` option `itm_points` in the money (strike below the index for a call, above it
-    for a put), on the nearest expiry after today. The listed strike closest to that target;
+    for a put), on the nearest expiry on or after today. The listed strike closest to that target;
     a tie goes to the deeper in-the-money one."""
-    expiries = sorted({c.expiry for c in contracts if c.kind == kind and c.expiry > today})
+    expiries = sorted({c.expiry for c in contracts if c.kind == kind and c.expiry >= today})
     if not expiries:
         return None
     chain = [c for c in contracts if c.kind == kind and c.expiry == expiries[0]]
@@ -102,7 +102,7 @@ class IntradayBreakoutOptions(IntradayBreakout):
     @classmethod
     def rules(cls, p: "IntradayBreakoutOptions.Params") -> list[dict]:
         rules = super().rules(p)
-        itm = f"{p.itm_points:g} points in the money, nearest weekly expiry (the next one on expiry day)"
+        itm = f"{p.itm_points:g} points in the money, nearest weekly expiry (today's on expiry day)"
         for rule in rules:
             if rule["kind"] == "entry_long":
                 rule["title"] = "Buy a call (CE)"
