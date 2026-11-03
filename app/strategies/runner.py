@@ -386,8 +386,12 @@ class StrategyRunner:
                     await inst.strategy.on_tick(tick)
             except Exception as e:
                 log.exception("Strategy %s failed on tick", inst.id)
-                inst.ticks.task_done()
-                await self.stop(inst.id, "error", f"{type(e).__name__}: {e}")
+                try:
+                    # Keep the queue item unfinished until the error state is persisted so
+                    # drain() cannot return while the instance still appears to be running.
+                    await self.stop(inst.id, "error", f"{type(e).__name__}: {e}")
+                finally:
+                    inst.ticks.task_done()
                 return
             inst.ticks.task_done()
 
