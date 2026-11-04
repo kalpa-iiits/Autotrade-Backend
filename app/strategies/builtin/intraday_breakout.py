@@ -14,8 +14,8 @@ Differences from the Pine version (which simulates resting stop orders on bar da
     instrument's tick size (down for longs, up for shorts). The differences below describe
     live/signal execution only.
   - Entries and exits are market orders sent when a tick reaches the level, so live fills
-    include slippage; the stop is measured from the price of the triggering tick.
-  - The stop and trail are checked on every tick instead of once per bar.
+    include slippage. Breakout levels and trailing-stop updates use the broker's completed
+    one-minute OHLC candles, matching Strategy Tester; stop hits are enforced on every tick.
   - The square-off is checked on every tick and on the runner's clock, so it still happens on
     time when no ticks arrive (feed dropped, quiet market).
   - Commission is not modelled (the broker charges the real one).
@@ -69,7 +69,7 @@ class IntradayBreakout(Strategy):
             ]},
             {"kind": "risk", "title": "Stop-loss", "conditions": [
                 f"Initial stop {p.stop_k:g} × {rng} from the entry price",
-                (f"Trails {p.trail_k:g} × {rng} behind the best price since entry, checked on every tick"
+                (f"Trails {p.trail_k:g} × {rng} behind the best completed-candle price; stop hits are checked on every tick"
                  if p.trail_k else "No trailing stop"),
                 "No profit target",
             ]},
@@ -117,6 +117,8 @@ class IntradayBreakout(Strategy):
         self.stop: float | None = None
         self.best: float | None = None
         self.trade_range: float | None = None
+        self.entry_price: float | None = None
+        self._entry_pending_close = False
         self._exit_sent_at: datetime | None = None
 
     # ---------- events ----------
@@ -254,22 +256,59 @@ class IntradayBreakout(Strategy):
         return round(steps * tick, 10)
 
     async def on_bar(self, bar: Bar) -> None:
-        """A candle closed: arm or clear the breakout levels for the next one."""
+        """A candle closed: use the broker's completed minute candles, like the backtest.
+
+        Streaming index ticks can omit an intraminute high or low.  Building the breakout
+        range from them made the live width filter and levels differ from the tester, which
+        uses the broker's historical OHLC candles.  Fetch the just-completed candles here so
+        both paths make decisions from the same bars.  Orders and stop hits still react to
+        live prices.
+        """
         closed_at = (bar.start + timedelta(seconds=bar.seconds)).astimezone(IST)
         if bar.start.astimezone(IST).date() != self.day:
             return  # yesterday's last candle; the lookback only uses today's
-        self.bars_today.append(bar)
         await self._load_day_range(closed_at)
 
         p = self.params
         self.levels = None
-        if self.ctx.position != 0 or self.day_range is None:
+        if self.day_range is None:
             return
-        if len(self.bars_today) < p.lookback:
-            return
+
         t = closed_at.time()
-        if not (p.entries_from <= t <= p.entries_until and t < p.square_off):
+        in_entry_window = p.entries_from <= t <= p.entries_until and t < p.square_off
+        if self.ctx.position == 0 and not in_entry_window:
             return
+
+        history_bars = await self._completed_history_bars(
+            closed_at, 1 if self.ctx.position != 0 else p.lookback)
+        if history_bars is None:
+            return
+
+        if self.ctx.position != 0:
+            completed = history_bars[-1]
+            self.bars_today.append(completed)
+            long = self.ctx.position > 0
+            if self._entry_pending_close:
+                self.stop = (self.entry_price - p.stop_k * self.trade_range if long
+                             else self.entry_price + p.stop_k * self.trade_range)
+                self.best = completed.high if long else completed.low
+                self._entry_pending_close = False
+            elif self.best is None or self.trade_range is None or self.stop is None:
+                # A position restored after a server restart has no in-memory stop state.
+                self.trade_range = self.day_range
+                self.best = completed.high if long else completed.low
+                self.stop = (completed.close - p.stop_k * self.trade_range if long
+                             else completed.close + p.stop_k * self.trade_range)
+            else:
+                self.best = max(self.best, completed.high) if long else min(self.best, completed.low)
+            if p.trail_k > 0:
+                trail = (self.best - p.trail_k * self.trade_range if long
+                         else self.best + p.trail_k * self.trade_range)
+                self.stop = max(self.stop, trail) if long else min(self.stop, trail)
+            return
+
+        self.bars_today.clear()
+        self.bars_today.extend(history_bars)
         if p.max_trades_per_day and self.trades_today >= p.max_trades_per_day:
             return
         high = max(b.high for b in self.bars_today)
@@ -277,6 +316,51 @@ class IntradayBreakout(Strategy):
         if p.max_width and high - low > p.max_width * self.day_range:
             return
         self.levels = (high, low, self.day_range)
+
+    async def _completed_history_bars(self, closed_at: datetime, count: int) -> list[Bar] | None:
+        """Return the latest complete strategy bars reconstructed from broker 1-minute OHLC.
+
+        Missing or not-yet-published minutes make the bar unusable; skipping that setup is
+        safer than silently falling back to the incomplete streaming-tick bar.
+        """
+        try:
+            candles = await self.ctx.history("1", days=1)
+        except OrderError as e:
+            self.ctx.log(f"no intraday candle history yet ({e}); skipping this candle")
+            return None
+
+        day = closed_at.date()
+        latest_bucket = int(closed_at.timestamp()) // self.bar_seconds - 1
+        first_bucket = latest_bucket - count + 1
+        grouped: dict[int, list[Candle]] = {}
+        for candle in candles:
+            start = candle.start.astimezone(IST)
+            if start.date() != day or start >= closed_at:
+                continue
+            bucket = int(candle.start.timestamp()) // self.bar_seconds
+            if first_bucket <= bucket <= latest_bucket:
+                grouped.setdefault(bucket, []).append(candle)
+
+        expected_minutes = self.bar_seconds // 60
+        out: list[Bar] = []
+        for bucket in range(first_bucket, latest_bucket + 1):
+            rows = sorted(grouped.get(bucket, []), key=lambda c: c.start)
+            if len(rows) != expected_minutes:
+                self.ctx.log(
+                    f"only {len(rows)}/{expected_minutes} minute candles for the bar ending "
+                    f"{datetime.fromtimestamp((bucket + 1) * self.bar_seconds, tz=IST):%H:%M}; skipping")
+                return None
+            out.append(Bar(
+                self.ctx.symbol,
+                datetime.fromtimestamp(bucket * self.bar_seconds, tz=rows[0].start.tzinfo),
+                self.bar_seconds,
+                rows[0].open,
+                max(c.high for c in rows),
+                min(c.low for c in rows),
+                rows[-1].close,
+                len(rows) * 4,
+            ))
+        return out
 
     # ---------- trading ----------
 
@@ -299,11 +383,13 @@ class IntradayBreakout(Strategy):
         self.levels = None  # one breakout per candle; the other side is cancelled
         self.trades_today += 1
         self.trade_range, self.best = rng, price
+        self.entry_price = price
+        self._entry_pending_close = True
         if price >= buy_at:
-            self.stop = price - self.params.stop_k * rng
+            self.stop = buy_at - self.params.stop_k * rng
             await self.ctx.buy(reason=f"broke above {buy_at:.2f}; stop {self.stop:.2f}")
         else:
-            self.stop = price + self.params.stop_k * rng
+            self.stop = sell_at + self.params.stop_k * rng
             await self.ctx.sell(reason=f"broke below {sell_at:.2f}; stop {self.stop:.2f}")
 
     async def _manage(self, price: float, now: datetime) -> None:
@@ -320,11 +406,6 @@ class IntradayBreakout(Strategy):
                 return
             self.trade_range, self.best = rng, price
             self.stop = price - p.stop_k * rng if long else price + p.stop_k * rng
-
-        self.best = max(self.best, price) if long else min(self.best, price)
-        if p.trail_k > 0:
-            trail = self.best - p.trail_k * self.trade_range if long else self.best + p.trail_k * self.trade_range
-            self.stop = max(self.stop, trail) if long else min(self.stop, trail)
 
         if (long and price <= self.stop) or (not long and price >= self.stop):
             await self._exit(now, f"stop {self.stop:.2f} hit at {price:.2f}")

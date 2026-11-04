@@ -23,6 +23,12 @@ class FakeCtx:
         self.symbol, self.position, self.calls, self.logs = SYM, 0, [], []
         self.live, self.history_error, self.day_range = live, history_error, day_range
         self.history_calls = 0
+        self.minute_ticks = {}
+        self.history_minutes = None
+
+    def record_tick(self, tick):
+        start = tick.at.replace(second=0, microsecond=0)
+        self.minute_ticks.setdefault(start, []).append(tick.price)
 
     async def buy(self, quantity=None, reason=None):
         self.calls.append(("buy", reason))
@@ -43,6 +49,11 @@ class FakeCtx:
         self.history_calls += 1
         if self.history_error:
             raise OrderError(self.history_error)
+        if resolution == "1":
+            if self.history_minutes is not None:
+                return self.history_minutes
+            return [Candle(start, prices[0], max(prices), min(prices), prices[-1])
+                    for start, prices in sorted(self.minute_ticks.items())]
         # 20 previous weekdays with range day_range, plus today's (wide) candle to be ignored
         out, d = [], DAY
         while len(out) < 20:
@@ -73,7 +84,9 @@ def ticks(strat, *items):
     """items: (hhmm, sec, price)"""
     async def go():
         for hhmm, sec, price in items:
-            await strat.on_tick(Tick(SYM, price, at(hhmm, sec)))
+            tick = Tick(SYM, price, at(hhmm, sec))
+            strat.ctx.record_tick(tick)
+            await strat.on_tick(tick)
     asyncio.run(go())
 
 
@@ -83,8 +96,12 @@ def quiet_minutes(strat, start: str, end: str, low=1000.0, high=1001.0, day=DAY)
     async def go():
         nonlocal t
         while t <= stop:
-            await strat.on_tick(Tick(SYM, low, t))
-            await strat.on_tick(Tick(SYM, high, t + timedelta(seconds=30)))
+            first = Tick(SYM, low, t)
+            second = Tick(SYM, high, t + timedelta(seconds=30))
+            strat.ctx.record_tick(first)
+            await strat.on_tick(first)
+            strat.ctx.record_tick(second)
+            await strat.on_tick(second)
             t += timedelta(minutes=1)
     asyncio.run(go())
 
@@ -104,7 +121,7 @@ def test_no_entries_before_window_then_long_breakout():
 
     ticks(strat, ("10:30", 20, 1001.5))
     assert ctx.calls[0][0] == "buy" and ctx.position == 65
-    assert strat.stop == pytest.approx(1001.5 - 0.25 * 100)
+    assert strat.stop == pytest.approx(1001.0 - 0.25 * 100)
     assert strat.levels is None  # the sell side is cancelled
 
 
@@ -113,18 +130,19 @@ def test_short_breakout():
     quiet_minutes(strat, "10:25", "10:29")
     ticks(strat, ("10:30", 5, 1000.5), ("10:30", 9, 999.0))
     assert ctx.calls[0][0] == "sell" and ctx.position == -65
-    assert strat.stop == pytest.approx(999.0 + 25)
+    assert strat.stop == pytest.approx(1000.0 + 25)
 
 
 def test_trailing_stop_exits():
     strat, ctx = make()
     quiet_minutes(strat, "10:25", "10:29")
-    ticks(strat, ("10:30", 5, 1000.5), ("10:30", 10, 1002.0))  # long at 1002, stop 977
-    ticks(strat, ("10:31", 0, 1100.0))   # best 1100 -> trail 1060
+    ticks(strat, ("10:30", 5, 1000.5), ("10:30", 10, 1002.0))  # long at 1002
+    ticks(strat, ("10:31", 0, 1100.0))
+    assert strat.stop == pytest.approx(977.0)  # entry candle closed; based on the 1002 fill
+    ticks(strat, ("10:32", 0, 1061.0))  # completed candle high 1100 -> trail 1060
     assert strat.stop == pytest.approx(1060.0)
-    ticks(strat, ("10:31", 5, 1061.0))
     assert ctx.position == 65
-    ticks(strat, ("10:31", 10, 1059.0))
+    ticks(strat, ("10:32", 10, 1059.0))
     assert ctx.calls[-1][0] == "exit" and ctx.position == 0
     assert "stop" in ctx.calls[-1][1]
 
@@ -134,7 +152,7 @@ def test_initial_stop_exits():
     quiet_minutes(strat, "10:25", "10:29")
     ticks(strat, ("10:30", 5, 1000.5), ("10:30", 10, 1002.0), ("10:30", 20, 977.5))
     assert ctx.position == 65
-    ticks(strat, ("10:30", 30, 976.9))
+    ticks(strat, ("10:30", 30, 975.9))
     assert ctx.calls[-1][0] == "exit"
 
 
@@ -162,6 +180,21 @@ def test_wide_lookback_range_is_skipped():
     quiet_minutes(strat2, "10:25", "10:29", low=1000, high=1050)
     ticks(strat2, ("10:30", 5, 1020.0))
     assert strat2.levels == (1050, 1000, 100.0)
+
+
+def test_live_width_filter_uses_broker_candles_not_incomplete_streaming_extremes():
+    strat, ctx = make(max_width=0.4)  # maximum width is 40 points
+    # The tick stream only observes a narrow 20-point range, but the broker's completed
+    # candles contain the full 41-point high/low. The backtest sees these same candles.
+    starts = [at("10:25") + timedelta(minutes=i) for i in range(5)]
+    ctx.history_minutes = [
+        Candle(start, 1010, 1041 if i == 0 else 1020, 1000, 1010)
+        for i, start in enumerate(starts)
+    ]
+    quiet_minutes(strat, "10:25", "10:29", low=1005, high=1025)
+    ticks(strat, ("10:30", 5, 1010))
+    assert strat.levels is None
+    assert not ctx.calls
 
 
 def test_entry_window_and_square_off():
@@ -221,8 +254,8 @@ def test_new_day_resets_lookback_and_count():
     ticks(strat, ("10:30", 5, 1000.5), ("10:30", 10, 1002.0), ("15:15", 0, 1002.0))  # trade, square-off
     assert strat.trades_today == 1
     next_day = DAY + timedelta(days=1)
-    quiet_minutes(strat, "09:15", "09:18", day=next_day)  # only 3 candles of the new day closed
-    assert strat.trades_today == 0 and len(strat.bars_today) == 3
+    quiet_minutes(strat, "09:15", "09:18", day=next_day)  # before the entry window
+    assert strat.trades_today == 0 and len(strat.bars_today) == 0
 
 
 def test_exit_not_repeated_while_live_fill_is_pending():
