@@ -14,7 +14,7 @@ from zoneinfo import ZoneInfo
 
 from fastapi import APIRouter, Depends, HTTPException, Query, Request, status
 from pydantic import BaseModel, Field, TypeAdapter
-from sqlalchemy import select
+from sqlalchemy import func, select
 
 from app.accounts import store
 from app.accounts.dependencies import owns
@@ -32,6 +32,18 @@ from app.strategies.runner import StrategyError, StrategyRunner, signal_dict, si
 router = APIRouter(prefix="/strategies", tags=["strategies"])
 IST = ZoneInfo("Asia/Kolkata")
 HIDDEN = ("archived", "removed")
+DEFAULT_PAGE_SIZE = 5
+MAX_PAGE_SIZE = 100
+
+
+def _pagination(page: int, page_size: int, total: int, **extra) -> dict:
+    return {
+        "page": page,
+        "page_size": page_size,
+        "total": total,
+        "total_pages": (total + page_size - 1) // page_size,
+        **extra,
+    }
 
 
 class Sizing(BaseModel):
@@ -149,15 +161,29 @@ async def _conflict(account_id: int, deployment_key: str, symbol: str, timeframe
 
 @router.get("")
 async def list_strategies(request: Request, include_hidden: bool = False, account_id: int | None = None,
+                          page: int = Query(1, ge=1),
+                          page_size: int = Query(DEFAULT_PAGE_SIZE, ge=1, le=MAX_PAGE_SIZE),
+                          strategy_status: Literal["all", "running", "stopped"] = Query("all", alias="status"),
                           user: User = Depends(require_user)):
     mine = await store.account_ids(user.id)
     if account_id is not None:
         mine = [account_id] if account_id in mine else []
-    query = (select(StrategyInstance).where(StrategyInstance.account_id.in_(mine))
-             .order_by(StrategyInstance.deployment_key, StrategyInstance.id))
+    conditions = [StrategyInstance.account_id.in_(mine)]
     if not include_hidden:
-        query = query.where(StrategyInstance.status.not_in(HIDDEN))
+        conditions.append(StrategyInstance.status.not_in(HIDDEN))
+    filtered = list(conditions)
+    if strategy_status == "running":
+        filtered.append(StrategyInstance.status == "running")
+    elif strategy_status == "stopped":
+        filtered.append(StrategyInstance.status != "running")
+    query = (select(StrategyInstance).where(*filtered)
+             .order_by(StrategyInstance.deployment_key, StrategyInstance.id)
+             .offset((page - 1) * page_size).limit(page_size))
     async with db.session() as s:
+        total = await s.scalar(select(func.count()).select_from(StrategyInstance).where(*filtered)) or 0
+        all_count = await s.scalar(select(func.count()).select_from(StrategyInstance).where(*conditions)) or 0
+        running_count = await s.scalar(select(func.count()).select_from(StrategyInstance).where(
+            *conditions, StrategyInstance.status == "running")) or 0
         rows = list(await s.scalars(query))
     runner = _runner(request)
     return {
@@ -169,6 +195,10 @@ async def list_strategies(request: Request, include_hidden: bool = False, accoun
             for d in runner.deployments.values()
         ],
         "strategies": [_instance_dict(r, runner) for r in rows],
+        "pagination": _pagination(
+            page, page_size, total,
+            counts={"all": all_count, "running": running_count, "stopped": all_count - running_count},
+        ),
     }
 
 
@@ -231,9 +261,16 @@ async def _backtest(request: Request, user: User, key: str, account_id: int, sym
 
 
 @router.get("/catalog")
-async def list_catalog(request: Request, user: User = Depends(require_user)):
-    """Every strategy defined in code, with its description, rules and settings."""
-    return [_catalog_dict(d) for d in _runner(request).deployments.values()]
+async def list_catalog(request: Request, page: int = Query(1, ge=1),
+                       page_size: int = Query(DEFAULT_PAGE_SIZE, ge=1, le=MAX_PAGE_SIZE),
+                       user: User = Depends(require_user)):
+    """Strategies defined in code, paginated for the strategy library."""
+    deployments = list(_runner(request).deployments.values())
+    start = (page - 1) * page_size
+    return {
+        "strategies": [_catalog_dict(d) for d in deployments[start:start + page_size]],
+        "pagination": _pagination(page, page_size, len(deployments)),
+    }
 
 
 @router.get("/instruments/search")
@@ -360,6 +397,7 @@ async def update_instance(request: Request, instance_id: int, body: InstanceUpda
         if (row.symbol, row.timeframe) != (symbol, timeframe):
             # Its position history belongs to the old symbol: a different instrument now.
             row.symbol, row.timeframe, row.last_error = symbol, timeframe, None
+            row.strategy_state = {}
     return _instance_dict(row, runner) | {"warning": warning}
 
 

@@ -72,8 +72,10 @@ async def _services(app: FastAPI):
     await accounts.start_all(resync=False)
     try:
         await runner.sync(deployments.DEPLOYMENTS)  # strategies are defined in code only
+        # Broker truth comes first: apply fills / cancels that happened while we were down,
+        # then let each strategy reconcile positions and open orders before it accepts ticks.
+        await accounts.resync_all()
         await runner.resume()  # ones that were running before the restart
-        await accounts.resync_all()  # fills / cancels that happened while we were down
     except BaseException:
         # Startup failed after brokers connected: close their sockets, or their threads
         # keep the process alive in a state that serves nothing.

@@ -1,7 +1,11 @@
 import asyncio
-from datetime import date
+from datetime import date, datetime, time, timedelta
+
+import pytest
 
 from app.brokers.base import OptionContract
+from app.strategies.base import Tick
+from app.strategies.builtin.intraday_breakout import IST
 from app.strategies.builtin.intraday_breakout_options import IntradayBreakoutOptions, OptionLegs, pick_contract
 
 TODAY = date(2026, 10, 27)  # a weekly expiry day
@@ -91,3 +95,66 @@ def test_rules_and_settings_describe_the_option_trades():
     rules = {r["kind"]: r for r in IntradayBreakoutOptions.rules(IntradayBreakoutOptions.Params())}
     assert rules["entry_long"]["title"] == "Buy a call (CE)" and rules["entry_short"]["title"] == "Buy a put (PE)"
     assert IntradayBreakoutOptions.capital_sizing is False and IntradayBreakoutOptions.backtest_note
+
+
+def test_restart_restores_exact_option_stop_and_opening_gap_exits():
+    today = datetime.now(IST).date()
+    params = IntradayBreakoutOptions.Params()
+
+    class PersistentCtx(FakeCtx):
+        def __init__(self):
+            super().__init__()
+            self.symbol = "NSE:NIFTY50-INDEX"
+            self.position = 65
+            self.held_symbol = "NSE:NIFTY071124700CE"
+            self.tick_size = 0.05
+            self.order_pending = False
+            self.saved = []
+            self.strategy_state = {
+                "version": 1,
+                "strategy": "intraday_breakout_options",
+                "bar_seconds": 60,
+                "params": params.model_dump(mode="json"),
+                "day": today.isoformat(),
+                "day_range": 100.0,
+                "bars_today": [],
+                "trades_today": 1,
+                "levels": None,
+                "direction": 1,
+                "stop": 24_900.0,
+                "best": 25_100.0,
+                "trade_range": 100.0,
+                "entry_price": 25_000.0,
+                "entry_pending_close": False,
+                "exit_sent_at": None,
+            }
+
+        async def save_strategy_state(self, state):
+            self.strategy_state = dict(state)
+            self.saved.append(dict(state))
+
+    ctx = PersistentCtx()
+    strategy = IntradayBreakoutOptions(params, ctx, 60)
+    opened = datetime.combine(today, time(9, 15), tzinfo=IST)
+
+    async def go():
+        await strategy.on_start()
+        assert strategy.stop == 24_900
+        await strategy.on_tick(Tick(ctx.symbol, 25_000, opened))
+        assert ctx.saved == []  # harmless ticks remain database-free
+        await strategy.on_tick(Tick(ctx.symbol, 24_800, opened + timedelta(seconds=1)))
+
+    asyncio.run(go())
+    assert ctx.calls == [("SELL", 65, "NSE:NIFTY071124700CE")]
+    assert ctx.saved[-1]["stop"] == 24_900
+    assert ctx.saved[-1]["exit_sent_at"] is not None
+
+
+def test_existing_option_position_without_checkpoint_refuses_unsafe_start():
+    ctx = FakeCtx()
+    ctx.position = 65
+    ctx.held_symbol = "NSE:NIFTY071124700CE"
+    strategy = IntradayBreakoutOptions(IntradayBreakoutOptions.Params(), ctx, 60)
+
+    with pytest.raises(RuntimeError, match="no compatible intraday checkpoint"):
+        asyncio.run(strategy.on_start())

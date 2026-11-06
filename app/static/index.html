@@ -418,7 +418,7 @@
 
     async function refreshStrategies(force = true) {
       if (!force && isEditing()) return;
-      const data = await api('GET', currentAccount() ? `/api/strategies?account_id=${currentAccount()}` : '/api/strategies');
+      const data = await api('GET', currentAccount() ? `/api/strategies?account_id=${currentAccount()}&page_size=100` : '/api/strategies?page_size=100');
       deployments = data.deployments;
       fillAddForm();
 

@@ -24,8 +24,9 @@ from app.core.db import alembic_config
 from app.core.instance_lock import AlreadyRunning, InstanceLock, lock_path
 from app.core.ratelimit import RateLimiter
 from app.orders.models import OrderRecord
-from app.orders.schemas import Order, OrderStatus, OrderType, Side
+from app.orders.schemas import Order, OrderStatus, OrderType, Position, Side
 from app.strategies.base import Strategy, Tick
+from app.strategies.runner import StrategyError
 from app.trades.models import Fill
 from tests.conftest import TOKEN, run
 from tests.test_fyers import FakeSocket, make_broker
@@ -43,6 +44,70 @@ def place_limit(client, price=1.0, qty=2):
 
 
 # ---------- reconciliation ----------
+
+
+def test_strategy_startup_reconciliation_requires_broker_position_match(deploy):
+    c = deploy(dep("reconcile"))
+    inst = start_strategy(c, "reconcile")
+    SCRIPT.append(("buy",))
+    tick(c)
+
+    runner = c.app.state.strategy_runner
+    service = c.app.state.accounts.get(1).service
+    running = runner.running[inst["id"]]
+    # Recorded fills and the live broker position agree.
+    run(c, runner._reconcile_broker_state, running.config, service)
+
+    # A broker-side/manual discrepancy is not guessed through: startup must stop for review.
+    service.broker.positions[SYM].quantity = 2
+    with pytest.raises(StrategyError, match=r"database 1, broker 2"):
+        run(c, runner._reconcile_broker_state, running.config, service)
+
+
+def test_strategy_startup_reconciliation_rejects_unmatched_open_order(deploy):
+    c = deploy(dep("reconcile-order"))
+    inst = start_strategy(c, "reconcile-order")
+    order = place_limit(c, price=1, qty=1)  # manual/app order on the strategy symbol
+
+    runner = c.app.state.strategy_runner
+    service = c.app.state.accounts.get(1).service
+    running = runner.running[inst["id"]]
+    with pytest.raises(StrategyError, match=rf"unmatched broker open orders.*{order['id']}"):
+        run(c, runner._reconcile_broker_state, running.config, service)
+
+
+def test_options_reconciliation_rejects_unrecorded_broker_option_position(deploy):
+    c = deploy(dep("reconcile-option"))
+    inst = start_strategy(c, "reconcile-option")
+    runner = c.app.state.strategy_runner
+    service = c.app.state.accounts.get(1).service
+    running = runner.running[inst["id"]]
+    running.config.strategy = "test_options"
+    symbol = "NSE:NIFTY071124700CE"
+    service.broker.positions[symbol] = Position(symbol=symbol, quantity=65, avg_price=100)
+
+    with pytest.raises(StrategyError, match=rf"{symbol}: database 0, broker 65"):
+        run(c, runner._reconcile_broker_state, running.config, service)
+
+
+def test_periodic_reconciliation_stops_strategy_on_broker_mismatch(deploy):
+    c = deploy(dep("periodic-reconcile"))
+    inst = start_strategy(c, "periodic-reconcile")
+    SCRIPT.append(("buy",))
+    tick(c)
+    runner = c.app.state.strategy_runner
+    service = c.app.state.accounts.get(1).service
+    service.name = "fyers"  # exercise the real-account gate with the deterministic fake broker
+
+    run(c, runner._reconcile_running)  # matching state stays live
+    assert inst["id"] in runner.running
+
+    service.broker.positions[SYM].quantity = 2
+    run(c, runner._reconcile_running)
+    assert inst["id"] not in runner.running
+    got = c.get(f"/api/strategies/{inst['id']}", headers=AUTH).json()
+    assert got["status"] == "error"
+    assert "database 1, broker 2" in got["last_error"]
 
 def test_resync_applies_updates_the_socket_never_delivered(client, monkeypatch):
     brokers = client.app.state.accounts.get(1).service

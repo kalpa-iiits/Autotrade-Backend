@@ -29,6 +29,9 @@ class StrategyInstance(Base):
     symbol: Mapped[str] = mapped_column(String(64))
     timeframe: Mapped[str] = mapped_column(String(8))  # key of TIMEFRAMES, e.g. "1m"
     params: Mapped[dict] = mapped_column(JSON, default=dict)
+    # Durable, strategy-owned checkpoint. Strategies update this only when decision state
+    # changes (for example a trailing stop ratchets), never for ordinary market ticks.
+    strategy_state: Mapped[dict] = mapped_column(JSON, default=dict, server_default="{}")
     # stopped / running / error / removed (deployment no longer in code) / archived (removed in app)
     status: Mapped[str] = mapped_column(String(8), default="stopped")
     quantity: Mapped[int] = mapped_column(Integer)  # default size of buy()/sell()

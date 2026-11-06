@@ -39,6 +39,7 @@ EXIT_RETRY = timedelta(seconds=5)  # don't repeat an exit request while it's bei
 
 
 class IntradayBreakout(Strategy):
+    checkpoint_version = 1
     name = "intraday_breakout"
     description = (
         "Breakout of the last N candles' high/low, with a wide trailing stop scaled to "
@@ -104,6 +105,108 @@ class IntradayBreakout(Strategy):
         self._range_retry_at: datetime | None = None
         self._new_day(None)
         self._clear_trade()
+        self._checkpoint_restored = self._restore_checkpoint()
+        self._last_checkpoint = self._checkpoint() if self._checkpoint_restored else None
+        if self.ctx.position != 0:
+            direction = 1 if self.ctx.position > 0 else -1
+            if not self._checkpoint_restored:
+                raise RuntimeError(
+                    "broker position exists but no compatible intraday checkpoint; "
+                    "stop state cannot be recovered safely"
+                )
+            if self._direction != direction:
+                raise RuntimeError(
+                    f"intraday checkpoint direction {self._direction} does not match "
+                    f"broker position direction {direction}"
+                )
+
+    def _checkpoint(self) -> dict:
+        return {
+            "version": self.checkpoint_version,
+            "strategy": self.name,
+            "bar_seconds": self.bar_seconds,
+            "params": self.params.model_dump(mode="json"),
+            "day": self.day.isoformat() if self.day else None,
+            "day_range": self.day_range,
+            "bars_today": [
+                {
+                    "symbol": bar.symbol, "start": bar.start.isoformat(), "seconds": bar.seconds,
+                    "open": bar.open, "high": bar.high, "low": bar.low, "close": bar.close,
+                    "ticks": bar.ticks,
+                }
+                for bar in self.bars_today
+            ],
+            "trades_today": self.trades_today,
+            "levels": list(self.levels) if self.levels else None,
+            "direction": self._direction,
+            "stop": self.stop,
+            "best": self.best,
+            "trade_range": self.trade_range,
+            "entry_price": self.entry_price,
+            "entry_pending_close": self._entry_pending_close,
+            "exit_sent_at": self._exit_sent_at.isoformat() if self._exit_sent_at else None,
+        }
+
+    def _restore_checkpoint(self) -> bool:
+        state = getattr(self.ctx, "strategy_state", None)
+        if not isinstance(state, dict) or not state:
+            return False
+        expected = {
+            "version": self.checkpoint_version,
+            "strategy": self.name,
+            "bar_seconds": self.bar_seconds,
+            "params": self.params.model_dump(mode="json"),
+        }
+        if any(state.get(key) != value for key, value in expected.items()):
+            return False
+        try:
+            direction = int(state["direction"])
+            if direction not in (-1, 0, 1):
+                return False
+            day = date.fromisoformat(state["day"]) if state.get("day") else None
+            bars = deque((
+                Bar(
+                    row["symbol"], datetime.fromisoformat(row["start"]), int(row["seconds"]),
+                    float(row["open"]), float(row["high"]), float(row["low"]),
+                    float(row["close"]), int(row["ticks"]),
+                )
+                for row in state.get("bars_today", [])
+            ), maxlen=self.params.lookback)
+            levels = state.get("levels")
+            if levels is not None and len(levels) != 3:
+                return False
+            exit_sent = (datetime.fromisoformat(state["exit_sent_at"])
+                         if state.get("exit_sent_at") else None)
+            self.day = day
+            self.day_range = self._optional_float(state.get("day_range"))
+            self.bars_today = bars
+            self.trades_today = int(state.get("trades_today", 0))
+            self.levels = tuple(float(value) for value in levels) if levels is not None else None
+            self._direction = direction
+            self.stop = self._optional_float(state.get("stop"))
+            self.best = self._optional_float(state.get("best"))
+            self.trade_range = self._optional_float(state.get("trade_range"))
+            self.entry_price = self._optional_float(state.get("entry_price"))
+            self._entry_pending_close = bool(state.get("entry_pending_close"))
+            self._exit_sent_at = exit_sent
+            self._range_retry_at = None
+        except (KeyError, TypeError, ValueError):
+            return False
+        return True
+
+    @staticmethod
+    def _optional_float(value) -> float | None:
+        return float(value) if value is not None else None
+
+    async def _save_checkpoint(self) -> None:
+        save = getattr(self.ctx, "save_strategy_state", None)
+        if save is None:
+            return
+        checkpoint = self._checkpoint()
+        if checkpoint == self._last_checkpoint:
+            return
+        await save(checkpoint)
+        self._last_checkpoint = checkpoint
 
     def _new_day(self, day: date | None) -> None:
         self.day = day
@@ -120,6 +223,7 @@ class IntradayBreakout(Strategy):
         self.entry_price: float | None = None
         self._entry_pending_close = False
         self._exit_sent_at: datetime | None = None
+        self._direction = 0
 
     # ---------- events ----------
 
@@ -127,6 +231,12 @@ class IntradayBreakout(Strategy):
         now = tick.at.astimezone(IST)
         if now.date() != self.day:
             self._new_day(now.date())
+            if self.ctx.position == 0:
+                self._clear_trade()
+            await self._save_checkpoint()
+            if self.ctx.position != 0:
+                await self._exit(now, "overnight intraday position found after restart/day change")
+                return
         if bar := self._bars.add(tick):
             await self.on_bar(bar)
         await self._on_price(tick.price, now)
@@ -138,6 +248,8 @@ class IntradayBreakout(Strategy):
             self.levels = None
             if self.ctx.position != 0:
                 await self._exit(now, f"square-off at {self.params.square_off:%H:%M}")
+            else:
+                await self._save_checkpoint()
 
     async def on_backtest_candle(self, candle: Candle) -> None:
         """Replay one broker candle with TradingView's bar-close strategy semantics.
@@ -264,6 +376,13 @@ class IntradayBreakout(Strategy):
         both paths make decisions from the same bars.  Orders and stop hits still react to
         live prices.
         """
+        try:
+            await self._on_live_bar(bar)
+        finally:
+            await self._save_checkpoint()
+
+    async def _on_live_bar(self, bar: Bar) -> None:
+        """Live completed-bar calculation; ``on_bar`` durably records any state change."""
         closed_at = (bar.start + timedelta(seconds=bar.seconds)).astimezone(IST)
         if bar.start.astimezone(IST).date() != self.day:
             return  # yesterday's last candle; the lookback only uses today's
@@ -366,9 +485,12 @@ class IntradayBreakout(Strategy):
 
     async def _on_price(self, price: float, now: datetime) -> None:
         if self.ctx.position == 0:
+            if getattr(self.ctx, "order_pending", False):
+                return  # entry/exit transition is reconciled by its broker order
             self._exit_sent_at = None
             if self.stop is not None:
                 self._clear_trade()
+                await self._save_checkpoint()
             if now.time() >= self.params.square_off:
                 self.levels = None
             elif self.levels is not None:
@@ -386,10 +508,14 @@ class IntradayBreakout(Strategy):
         self.entry_price = price
         self._entry_pending_close = True
         if price >= buy_at:
+            self._direction = 1
             self.stop = buy_at - self.params.stop_k * rng
+            await self._save_checkpoint()
             await self.ctx.buy(reason=f"broke above {buy_at:.2f}; stop {self.stop:.2f}")
         else:
+            self._direction = -1
             self.stop = sell_at + self.params.stop_k * rng
+            await self._save_checkpoint()
             await self.ctx.sell(reason=f"broke below {sell_at:.2f}; stop {self.stop:.2f}")
 
     async def _manage(self, price: float, now: datetime) -> None:
@@ -406,6 +532,8 @@ class IntradayBreakout(Strategy):
                 return
             self.trade_range, self.best = rng, price
             self.stop = price - p.stop_k * rng if long else price + p.stop_k * rng
+            self._direction = 1 if long else -1
+            await self._save_checkpoint()
 
         if (long and price <= self.stop) or (not long and price >= self.stop):
             await self._exit(now, f"stop {self.stop:.2f} hit at {price:.2f}")
@@ -415,6 +543,7 @@ class IntradayBreakout(Strategy):
             return  # already asked; waiting for the fill
         self._exit_sent_at = now
         self.levels = None
+        await self._save_checkpoint()
         await self.ctx.exit(reason=reason)
 
     # ---------- volatility ----------
@@ -437,3 +566,4 @@ class IntradayBreakout(Strategy):
         last = previous[-self.params.avg_days:]
         self.day_range = sum(c.high - c.low for c in last) / len(last)
         self.ctx.log(f"average daily range over {len(last)} days: {self.day_range:.2f}")
+        await self._save_checkpoint()

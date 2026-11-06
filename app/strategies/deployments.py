@@ -16,21 +16,39 @@ try a strategy without real money, run it on a paper account.
 from app.strategies.builtin.intraday_breakout import IntradayBreakout
 from app.strategies.builtin.intraday_breakout_options import IntradayBreakoutOptions
 from app.strategies.builtin.nifty_trailing_reversal import NiftyTrailingReversal
+from app.strategies.builtin.nifty_trailing_reversal_options import NiftyTrailingReversalOptions
 from app.strategies.builtin.sma_crossover import SmaCrossover
 from app.strategies.deployment import Deployment
 
 DEPLOYMENTS: list[Deployment] = [
-    # Percentage trailing reversal from the supplied historical-reproduction rules. A reversal
-    # is one 130-unit order: 65 closes the current side and 65 opens the opposite side.
+    # Direct-instrument version: one 130-unit order reverses a 65-unit future/index position.
     Deployment(
         key="nifty-percentage-reversal",
         label="NIFTY Percentage Trailing Reversal",
         strategy=NiftyTrailingReversal,
         timeframe="5m",
         quantity=65,
-        max_order_qty=130,
-        max_position=65,
+        # Capital sizing may target up to 5,000 units. A net reversal order can be twice the
+        # position size because it closes the old side and opens the new side in one order.
+        max_order_qty=10_000,
+        max_position=5_000,
         max_orders_per_day=100,
+        backtest_initial_capital=1_000_000,
+    ),
+    # Option version: NIFTY supplies the signals; a reversal sells the held CE/PE before buying
+    # the opposite leg through the runner's depth-priced limit and repricing policy.
+    Deployment(
+        key="nifty-percentage-reversal-options",
+        label="NIFTY Percentage Trailing Reversal · Options",
+        strategy=NiftyTrailingReversalOptions,
+        symbol="NSE:NIFTY50-INDEX",
+        timeframe="5m",
+        params=NiftyTrailingReversalOptions.Params(itm_points=300, history_days=7),
+        quantity=65,
+        max_order_qty=650,
+        max_position=650,
+        max_orders_per_day=100,
+        backtest_initial_capital=1_000_000,
         backtest_fixed_quantity=65,
     ),
     # Intraday breakout (ported from the TradingView script). By default an instance trades one

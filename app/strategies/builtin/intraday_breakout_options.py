@@ -115,6 +115,6 @@ class IntradayBreakoutOptions(IntradayBreakout):
         return rules
 
     async def on_start(self) -> None:
-        await super().on_start()
         if hasattr(self.ctx, "option_contracts"):  # live / signal mode; backtests trade the index
             self.ctx = OptionLegs(self.ctx, self.params.itm_points)
+        await super().on_start()

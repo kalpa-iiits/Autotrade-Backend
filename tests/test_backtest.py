@@ -155,7 +155,9 @@ def test_tick_stop_rounds_against_the_position():
 def test_catalog_and_performance(deploy):
     c = deploy(Deployment(key="sma", strategy=SmaCrossover, symbol=SYM, quantity=1,
                           params={"fast": 3, "slow": 8, "allow_short": True}))
-    [item] = c.get("/api/strategies/catalog", headers=AUTH).json()
+    catalog = c.get("/api/strategies/catalog", headers=AUTH).json()
+    [item] = catalog["strategies"]
+    assert catalog["pagination"] == {"page": 1, "page_size": 5, "total": 1, "total_pages": 1}
     assert item["key"] == "sma" and item["tags"]
     assert {r["kind"] for r in item["rules"]} >= {"entry_long", "entry_short", "exit"}
     assert {p["name"]: p["value"] for p in item["params"]} == {"fast": 3, "slow": 8, "allow_short": True}

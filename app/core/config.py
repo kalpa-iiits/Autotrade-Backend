@@ -64,6 +64,9 @@ class Settings(BaseSettings):
     # Seconds between checks of each account's order book against our records (0 = only on
     # (re)connect). Catches order updates a socket never delivered.
     resync_interval: float = 60.0
+    # Seconds between full running-strategy checks: recorded fills/open orders versus live
+    # broker positions/open orders. 0 disables periodic checks (startup still reconciles).
+    strategy_reconcile_interval: float = Field(120.0, ge=0)
     # Ticks queued per running strategy (and messages per WebSocket client) before the oldest
     # ticks are dropped (the client is disconnected) so one slow consumer can't stall the rest.
     strategy_queue_size: int = 1000

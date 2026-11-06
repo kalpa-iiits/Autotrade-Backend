@@ -95,6 +95,12 @@ page), up to `AUTOTRADE_MAX_ACCOUNTS_PER_USER` (10). Each has a label unique to 
   `orders` table and every order whose state we missed (socket down, dropped update) is
   replayed to the ledger, running strategies and clients. A strategy never stays stuck waiting
   on a fill it was never told about.
+- **Running-position audit.** Every `AUTOTRADE_STRATEGY_RECONCILE_INTERVAL` seconds (120),
+  running strategies on each real account are paused briefly while recorded fills/open orders
+  are compared with live broker positions/open orders. The broker snapshot is fetched once per
+  account, not once per tick or strategy. A mismatch stops the affected account's strategies in
+  `error` rather than allowing them to trade from stale state. Set the interval to `0` to keep
+  startup-only reconciliation.
 - **Slow consumers are isolated.** Each running strategy has its own tick queue and task, and
   each WebSocket client its own send queue, so a strategy placing an order or a slow browser tab
   never delays the broker feed or anyone else. A strategy that falls
@@ -268,8 +274,17 @@ stopped** after such a change, so an edit never resumes trading unattended. Unch
 4. **Kill switch.** `POST /api/strategies/stop-all` (or **Stop all** on the test page) stops
    all of *your* strategies; it does not cancel orders already at the broker.
 
-After a restart, indicators start empty (no historical warm-up yet) and each strategy's
-position is rebuilt from the orders it placed.
+After a restart, broker orders are resynchronised before strategies resume. On real accounts,
+each instance then requires its recorded fills, broker positions, and strategy-owned open order
+IDs to agree; an unmatched position/order leaves the instance in `error` rather than trading
+from guessed state. Only after that gate do checkpointed strategies accept ticks. The NIFTY
+percentage-reversal variants restore their exact stop, direction and fill bucket; the Intraday
+Breakout variants restore their session, breakout levels, daily trade count, active stop, best
+price, range and pending transition. They write checkpoints only when decision state changes,
+not for ordinary ticks. Options deployments also resume repricing a pending option limit order.
+Recent candle replay is used only when no compatible checkpoint exists. Paper accounts are exempt
+from broker reconciliation because their broker state is intentionally process-local and their
+recorded orders are the durable simulation history.
 
 **Built-in strategies** (`app/strategies/builtin/`):
 
@@ -277,7 +292,8 @@ position is rebuilt from the orders it placed.
 |---|---|
 | `sma_crossover` | fast/slow moving average cross on bar closes; long-only or with shorts |
 | `intraday_breakout` | port of the TradingView "NIFTY 1-minute breakout": from 10:30, trade the first break of the last 5 one-minute candles' high/low; stop 0.25x and trail 0.40x the 14-day average daily range; skip if the 5-candle range is wider than 0.4x it; max 8 entries/day; entries until 14:45; square-off 15:15 (IST). Deployed as `nifty-1m-breakout` on the NIFTY future, 1 lot (65). Roll the symbol to the next contract before monthly expiry. |
-| `nifty_trailing_reversal` | persistent 5-minute NIFTY long/short reversal: fixed 65 units, 0.8% initial stop, 0.4% scheduled-close trail, overnight holding, and no daily reset. Deployed as `nifty-percentage-reversal`. |
+| `nifty_trailing_reversal` | capital-sized direct-instrument NIFTY long/short reversal on 1–60 minute timeframes (5-minute default/Pine behavior): 0.8% initial stop, 0.4% scheduled-close trail and overnight holding. Deployed as `nifty-percentage-reversal`; tester sizing defaults to percentage of capital rather than 65 fixed units. |
+| `nifty_trailing_reversal_options` | the same NIFTY signals, executed with a long ITM CE or PE. Exact signal/stop state survives deployment restarts; recent one-minute history initializes instances that have no compatible checkpoint. Deployed separately as `nifty-percentage-reversal-options`. |
 
 Strategies can read the broker's candle history with `await self.ctx.history("D" or "1", days=...)`
 (Fyers, Zerodha; the paper broker makes up candles for its own symbols).
@@ -347,8 +363,9 @@ credentials key on the server.
 | | `WS /api/accounts/{id}/ws/orders` | same actions, pushes `order_update`, `strategy_signal`, `strategy_status` |
 | **Account** | `GET /api/accounts/{id}/positions`, `GET /api/accounts/{id}/funds` | from the broker |
 | **Trades** | `GET /api/trades/open`, `/api/trades/closed?account_id=&symbol=&since=&until=&limit=`, `/api/trades/{id}` | round trips + P&L |
-| **Strategies** | `GET /api/strategies` | instances, plus the deployments code defines |
-| | `GET /api/strategies?account_id=` | one account's only |
+| **Strategies** | `GET /api/strategies?page=&page_size=&status=` | paginated instances (5 by default), plus the deployments code defines |
+| | `GET /api/strategies?account_id=&page=&page_size=` | one account's only |
+| | `GET /api/strategies/catalog?page=&page_size=` | paginated strategy catalog (5 by default) |
 | | `POST /api/strategies` `{deployment_key, account_id, symbol, timeframe}` | add an instance |
 | | `PATCH /api/strategies/{id}` `{symbol?, timeframe?}` | while stopped |
 | | `DELETE /api/strategies/{id}` | archive (history kept) |

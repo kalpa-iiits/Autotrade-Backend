@@ -139,6 +139,25 @@ class StrategyContext:
         return sized_quantity(self._inst.config, self._inst.last_price, self._inst.lot_size)
 
     @property
+    def tick_size(self) -> float | None:
+        """The instrument's minimum price step, or None when the broker does not provide it."""
+        return self._inst.tick_size
+
+    @property
+    def order_pending(self) -> bool:
+        """Whether this strategy instance currently has a non-terminal broker order."""
+        return self._inst.pending_order_id is not None
+
+    @property
+    def strategy_state(self) -> dict:
+        """Last durable strategy checkpoint loaded when this instance started."""
+        return dict(self._inst.strategy_state)
+
+    async def save_strategy_state(self, state: dict) -> None:
+        """Persist a decision-state checkpoint. This is for transitions, not market ticks."""
+        await self._runner.save_strategy_state(self._inst, state)
+
+    @property
     def held_symbol(self) -> str | None:
         """The other instrument (e.g. an option) this instance last bought, while it holds one."""
         return self._inst.held_symbol if self._inst.position else None
@@ -198,7 +217,9 @@ class RunningInstance:
         self.position = 0
         self.last_price: float | None = None
         self.lot_size = 1  # the instrument's trading lot, for capital sizing
+        self.tick_size: float | None = None
         self.held_symbol: str | None = None  # another instrument it bought (an option), if any
+        self.strategy_state: dict = dict(config.strategy_state or {})
         self.pending_order_id: str | None = None
         self.filled: dict[str, int] = {}  # order id -> filled qty already counted
         self._orders_day = _today_ist()
@@ -242,6 +263,7 @@ class StrategyRunner:
         # Order updates can arrive before place_order returns (and we learn the id).
         self._recent_orders: OrderedDict[tuple[int, str], Order] = OrderedDict()
         self._chases: set[asyncio.Task] = set()  # repricing of unfilled option orders
+        self._reconcile_task: asyncio.Task | None = None
 
     def service(self, account_id: int) -> BrokerService | None:
         runtime = self.accounts.get(account_id)
@@ -316,19 +338,42 @@ class StrategyRunner:
         if service is None:
             raise StrategyError("Its broker account is not available (deleted?)")
 
+        # Paper positions intentionally live only in this process. Real accounts must prove
+        # that the database execution state still matches the broker before strategy-local
+        # checkpoints (stop, direction, etc.) are trusted.
+        if service.name != "paper":
+            if not service.connected:
+                raise StrategyError(f"Broker not connected: {service.not_connected_reason}")
+            await service.resync()
+            if service.last_resync_error:
+                raise StrategyError(f"Broker order reconciliation failed: {service.last_resync_error}")
+            if not service.records_reliable():
+                raise StrategyError("Trade ledger has unsaved broker updates")
+            await self._reconcile_broker_state(config, service)
+
         inst = RunningInstance(config, self.settings.strategy_queue_size)
-        if config.size_mode == "capital" and service.broker is not None:
-            inst.lot_size = await service.broker.get_lot_size(config.symbol) or 1
+        if service.broker is not None:
+            inst.tick_size = await service.broker.get_tick_size(config.symbol)
+            if config.size_mode == "capital":
+                inst.lot_size = await service.broker.get_lot_size(config.symbol) or 1
         inst.position, inst.filled, inst.pending_order_id = await self._load_position(config)
         inst.orders_today = await self._orders_today(instance_id)
         if inst.position:
             inst.held_symbol = await self._held_symbol(config)
         inst.strategy = dep.strategy(dep.params, StrategyContext(self, inst), TIMEFRAMES[config.timeframe])
-        await inst.strategy.on_start()
+        try:
+            await inst.strategy.on_start()
+        except StrategyError:
+            raise
+        except Exception as exc:
+            raise StrategyError(f"Strategy could not initialize safely: {exc}") from exc
         self.running[instance_id] = inst
         inst.worker = asyncio.create_task(self._work(inst))
         inst.clock = asyncio.create_task(self._clock(inst))
+        if self.settings.strategy_reconcile_interval > 0 and self._reconcile_task is None:
+            self._reconcile_task = asyncio.create_task(self._reconciliation_loop())
         await self._set_status(instance_id, "running", None)
+        await self._resume_pending_option_chase(inst)
 
         if service.connected:
             try:
@@ -363,6 +408,9 @@ class StrategyRunner:
 
     async def shutdown(self) -> None:
         """Server stopping: leave statuses as "running" so they resume on the next start."""
+        if self._reconcile_task is not None:
+            self._reconcile_task.cancel()
+            self._reconcile_task = None
         for task in list(self._chases):
             task.cancel()
         for inst in self.running.values():
@@ -373,6 +421,58 @@ class StrategyRunner:
                 except Exception:
                     log.exception("Strategy %s on_stop failed", inst.id)
         self.running.clear()
+
+    async def _reconciliation_loop(self) -> None:
+        """Periodically prove that every real-broker strategy still matches broker truth."""
+        while True:
+            await asyncio.sleep(self.settings.strategy_reconcile_interval)
+            try:
+                await self._reconcile_running()
+            except Exception:
+                # Per-account failures are handled below. Keep an unexpected bug from silently
+                # killing all future safety checks.
+                log.exception("Periodic strategy reconciliation failed")
+
+    async def _reconcile_running(self) -> None:
+        by_account: dict[int, list[RunningInstance]] = {}
+        for inst in list(self.running.values()):
+            service = self.service(inst.account_id)
+            if service is not None and service.name != "paper":
+                by_account.setdefault(inst.account_id, []).append(inst)
+
+        for account_id, instances in by_account.items():
+            service = self.service(account_id)
+            failure: str | None = None
+            acquired: list[asyncio.Lock] = []
+            try:
+                # Freeze strategy order submission on this account while broker and database
+                # snapshots are compared, avoiding a false mismatch mid-placement.
+                for inst in sorted(instances, key=lambda item: item.id):
+                    await inst.lock.acquire()
+                    acquired.append(inst.lock)
+                if service is None or not service.connected:
+                    reason = service.not_connected_reason if service else "account unavailable"
+                    raise StrategyError(f"Periodic broker reconciliation unavailable: {reason}")
+                await service.resync()
+                if service.last_resync_error:
+                    raise StrategyError(f"Periodic order reconciliation failed: {service.last_resync_error}")
+                if not service.records_reliable():
+                    raise StrategyError("Trade ledger has unsaved broker updates")
+                broker = service.require()
+                snapshot = await asyncio.gather(broker.get_positions(), broker.get_orders())
+                for inst in instances:
+                    if self.running.get(inst.id) is inst:
+                        await self._reconcile_broker_state(inst.config, service, snapshot)
+            except Exception as exc:
+                failure = f"{type(exc).__name__}: {exc}"
+            finally:
+                for lock in reversed(acquired):
+                    lock.release()
+
+            if failure:
+                for inst in instances:
+                    if self.running.get(inst.id) is inst:
+                        await self.stop(inst.id, "error", failure)
 
     async def _work(self, inst: RunningInstance) -> None:
         """The instance's worker: hands it its ticks one at a time, in order."""
@@ -641,7 +741,126 @@ class StrategyRunner:
         log.warning("Strategy %s: cancelled order %s: %s", inst.id, order_id, why)
         self._apply_order(inst, order)
 
+    async def _resume_pending_option_chase(self, inst: RunningInstance) -> None:
+        """A deployment restart must not leave an open option limit order unmanaged."""
+        if not inst.pending_order_id:
+            return
+        async with db.session() as s:
+            row = await s.get(OrderRecord, (inst.account_id, inst.pending_order_id))
+        if (row is None or row.order_type != OrderType.LIMIT.value or
+                not OPTION_SYMBOL.search(row.symbol) or row.limit_price is None):
+            return
+        side = Side(row.side)
+        task = asyncio.create_task(self._chase(
+            inst, row.id, row.symbol, side, float(row.limit_price), side == Side.SELL,
+        ))
+        self._chases.add(task)
+        task.add_done_callback(self._chases.discard)
+        log.info("Strategy %s: resumed repricing pending option order %s", inst.id, row.id)
+
     # ---------- persistence ----------
+
+    async def _reconcile_broker_state(
+        self, config: StrategyInstance, service: BrokerService,
+        snapshot: tuple[list, list] | list | None = None,
+    ) -> None:
+        """Require recorded strategy execution state to match live broker truth.
+
+        Positions are account-level at a broker, so expected quantities include every strategy
+        instance on the account, including stopped instances that still own an open position.
+        Open-order comparison is scoped to this instance's recorded order ids.
+        """
+        if snapshot is None:
+            broker = service.require()
+            try:
+                positions, orders = await asyncio.gather(broker.get_positions(), broker.get_orders())
+            except Exception as exc:
+                raise StrategyError(f"Could not read broker positions/orders: {exc}") from exc
+        else:
+            positions, orders = snapshot
+
+        async with db.session() as s:
+            rows = (await s.execute(
+                select(
+                    StrategySignal.instance_id, StrategySignal.symbol, OrderRecord.id,
+                    OrderRecord.side, OrderRecord.filled_quantity, OrderRecord.status,
+                )
+                .join(StrategyInstance, StrategyInstance.id == StrategySignal.instance_id)
+                .join(OrderRecord, (StrategySignal.order_id == OrderRecord.id)
+                      & (OrderRecord.account_id == StrategyInstance.account_id))
+                .where(StrategyInstance.account_id == config.account_id,
+                       StrategySignal.outcome == "placed")
+            )).all()
+
+        expected: dict[str, int] = {}
+        all_owned_ids: set[str] = set()
+        owned_ids: set[str] = set()
+        recorded_open: set[str] = set()
+        instance_symbols: set[str] = set()
+        terminal = {status.value for status in TERMINAL}
+        for owner, symbol, order_id, side, filled, order_status in rows:
+            all_owned_ids.add(order_id)
+            quantity = filled or 0
+            expected[symbol] = expected.get(symbol, 0) + (
+                quantity if side == Side.BUY.value else -quantity
+            )
+            if owner == config.id:
+                instance_symbols.add(symbol)
+                owned_ids.add(order_id)
+                if order_status not in terminal:
+                    recorded_open.add(order_id)
+
+        # Direct-instrument strategies trade their configured symbol. Options strategies use
+        # it only as the signal underlying. For those, reconcile every option position on the
+        # account: an unrecorded CE/PE may be an order accepted just before a process crash.
+        options_strategy = config.strategy.endswith("_options")
+        if options_strategy:
+            instance_symbols.update(symbol for symbol in expected if OPTION_SYMBOL.search(symbol))
+            instance_symbols.update(
+                position.symbol for position in positions if OPTION_SYMBOL.search(position.symbol)
+            )
+        else:
+            instance_symbols.add(config.symbol)
+            expected.setdefault(config.symbol, 0)
+
+        actual = {position.symbol: position.quantity for position in positions if position.quantity}
+        mismatches = [
+            f"{symbol}: database {expected.get(symbol, 0)}, broker {actual.get(symbol, 0)}"
+            for symbol in sorted(instance_symbols)
+            if expected.get(symbol, 0) != actual.get(symbol, 0)
+        ]
+        broker_open = {
+            order.id for order in orders
+            if order.id in owned_ids and order.status not in TERMINAL
+        }
+        if broker_open != recorded_open:
+            mismatches.append(
+                f"open orders: database {sorted(recorded_open)}, broker {sorted(broker_open)}"
+            )
+        unmatched_open = sorted(
+            order.id for order in orders
+            if order.status not in TERMINAL
+            and (order.symbol in instance_symbols or
+                 (options_strategy and OPTION_SYMBOL.search(order.symbol)))
+            and order.id not in all_owned_ids
+        )
+        if unmatched_open:
+            mismatches.append(f"unmatched broker open orders: {unmatched_open}")
+        if mismatches:
+            raise StrategyError("Broker state mismatch; strategy not resumed (" + "; ".join(mismatches) + ")")
+
+    async def save_strategy_state(self, inst: RunningInstance, state: dict) -> None:
+        """Atomically replace an instance's durable checkpoint and its in-memory copy."""
+        checkpoint = dict(state)
+        if checkpoint == inst.strategy_state:
+            return
+        async with db.session() as s, s.begin():
+            row = await s.get(StrategyInstance, inst.id)
+            if row is None:
+                raise StrategyError(f"No strategy instance {inst.id}")
+            row.strategy_state = checkpoint
+        inst.strategy_state = checkpoint
+        inst.config.strategy_state = checkpoint
 
     async def _record(self, signal: StrategySignal, account_id: int) -> None:
         async with db.session() as s, s.begin():

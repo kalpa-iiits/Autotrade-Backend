@@ -134,6 +134,24 @@ def test_deployments_come_from_code(deploy):
     assert b["params"] == {"fast": 5, "slow": 10, "allow_short": False}
 
 
+def test_catalog_and_my_strategies_are_paginated_in_fives(deploy):
+    deps = [dep(f"s{i}") for i in range(1, 8)]
+    c = deploy(*deps)
+
+    first = c.get("/api/strategies/catalog", headers=AUTH).json()
+    second = c.get("/api/strategies/catalog?page=2", headers=AUTH).json()
+    assert [d["key"] for d in first["strategies"]] == [f"s{i}" for i in range(1, 6)]
+    assert [d["key"] for d in second["strategies"]] == ["s6", "s7"]
+    assert first["pagination"] == {"page": 1, "page_size": 5, "total": 7, "total_pages": 2}
+
+    mine = c.get("/api/strategies", headers=AUTH).json()
+    more = c.get("/api/strategies?page=2", headers=AUTH).json()
+    assert [s["deployment_key"] for s in mine["strategies"]] == [f"s{i}" for i in range(1, 6)]
+    assert [s["deployment_key"] for s in more["strategies"]] == ["s6", "s7"]
+    assert mine["pagination"]["total"] == 7 and mine["pagination"]["total_pages"] == 2
+    assert mine["pagination"]["counts"] == {"all": 7, "running": 0, "stopped": 7}
+
+
 def test_logic_and_limits_cannot_be_changed_in_the_app(deploy):
     c = deploy(dep("a"))
     inst = by_key(c, "a")
@@ -720,5 +738,5 @@ def test_option_strategies_take_fixed_quantity_only(deploy):
     r = c.patch(f"/api/strategies/{inst['id']}", json={"size_mode": "capital", "capital_per_trade": 100000}, headers=AUTH)
     assert r.status_code == 422 and "fixed quantity" in r.json()["detail"]
     assert c.patch(f"/api/strategies/{inst['id']}", json={"fixed_quantity": 130}, headers=AUTH).status_code == 200
-    catalog = {d["key"]: d for d in c.get("/api/strategies/catalog", headers=AUTH).json()}
+    catalog = {d["key"]: d for d in c.get("/api/strategies/catalog", headers=AUTH).json()["strategies"]}
     assert catalog["opt"]["capital_sizing"] is False and catalog["opt"]["backtest_note"]
