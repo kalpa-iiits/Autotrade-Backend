@@ -206,3 +206,79 @@ def test_async_live_reversal_waits_for_broker_fill_price():
     asyncio.run(replay())
     assert strategy.stop == 98.75 * 1.008
     assert not strategy._reversal_pending
+
+
+def test_direct_live_ratchet_uses_same_broker_candle_close_as_backtest():
+    first = datetime(2026, 11, 2, 9, 30, tzinfo=IST)
+
+    class HistoricalContext(LiveContext):
+        def __init__(self):
+            super().__init__()
+            self.position = 65
+            self.logs = []
+            self.rows = [
+                Candle(first + timedelta(minutes=i), 25_900, 26_010, 25_890, 26_000)
+                for i in range(5)
+            ]
+
+        async def history(self, resolution="1", days=1):
+            assert resolution == "1" and days == 1
+            return self.rows
+
+        def log(self, message):
+            self.logs.append(message)
+
+    ctx = HistoricalContext()
+    strategy = NiftyTrailingReversal(NiftyTrailingReversal.Params(), ctx, 300)
+
+    async def replay():
+        await strategy.on_start()
+        strategy.seeded = True
+        strategy._direction = 1
+        strategy.stop = 24_800
+        # The tick-built bar closes at 25,000, but broker history—the backtest source—closes
+        # at 26,000. The 09:35 scheduled update must therefore use 26,000.
+        await strategy.on_tick(Tick(SYM, 25_000, first))
+        await strategy.on_tick(Tick(SYM, 25_000, first + timedelta(minutes=4, seconds=59)))
+        await strategy.on_tick(Tick(SYM, 26_000, first + timedelta(minutes=5)))
+
+    asyncio.run(replay())
+    assert strategy.stop == pytest.approx(26_000 * 0.996)
+
+
+def test_restart_finishes_pending_reversal_from_recorded_actual_fill():
+    class PersistentContext(LiveContext):
+        def __init__(self):
+            super().__init__()
+            self.position = -65
+            self.last_fill_price = 98.75
+            self.strategy_state = {
+                "version": 1,
+                "strategy": "nifty_trailing_reversal",
+                "bar_seconds": 300,
+                "params": {},
+                "seeded": True,
+                "direction": -1,
+                "stop": 99.792,
+                "seed_pending": False,
+                "reversal_pending": True,
+                "pre_reversal_stop": 99.2,
+                "fill_bucket": 1,
+            }
+            self.saved = []
+
+        async def save_strategy_state(self, state):
+            self.strategy_state = dict(state)
+            self.saved.append(dict(state))
+
+    ctx = PersistentContext()
+    strategy = NiftyTrailingReversal(NiftyTrailingReversal.Params(), ctx, 300)
+    at = datetime(2026, 11, 2, 10, 0, tzinfo=IST)
+
+    async def resume():
+        await strategy.on_start()
+        await strategy.on_tick(Tick(SYM, 98.8, at))
+
+    asyncio.run(resume())
+    assert strategy.stop == pytest.approx(98.75 * 1.008)
+    assert not strategy._reversal_pending

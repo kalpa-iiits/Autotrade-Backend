@@ -10,6 +10,7 @@ from zoneinfo import ZoneInfo
 
 from pydantic import BaseModel, ConfigDict
 
+from app.brokers import OrderError
 from app.brokers.base import Candle
 from app.strategies.base import Bar, Strategy, Tick
 
@@ -107,7 +108,10 @@ class NiftyTrailingReversal(Strategy):
         self.stop = float(stop) if stop is not None else None
         self._direction = direction
         self._seed_pending = bool(state.get("seed_pending"))
-        self._reversal_pending = bool(self.ctx.order_pending)
+        # Persist the intent as well as consulting the broker. An accepted reversal can finish
+        # while the process is down; in that case there is no longer an open broker order, but
+        # the first tick after restart must still install the stop from its recorded fill.
+        self._reversal_pending = bool(state.get("reversal_pending")) or bool(self.ctx.order_pending)
         self._pre_reversal_stop = (float(pre_reversal_stop)
                                    if pre_reversal_stop is not None else None)
         self._fill_bucket = fill_bucket
@@ -143,6 +147,7 @@ class NiftyTrailingReversal(Strategy):
             "direction": self._direction,
             "stop": self.stop,
             "seed_pending": self._seed_pending,
+            "reversal_pending": self._reversal_pending,
             "pre_reversal_stop": self._pre_reversal_stop,
             "fill_bucket": self._fill_bucket,
         }
@@ -350,7 +355,53 @@ class NiftyTrailingReversal(Strategy):
             await self._save_checkpoint()
             return
         if self.ctx.position and self._scheduled_close(bar.start):
+            # Match the backtest input: use the broker's completed one-minute OHLC aggregated
+            # to the strategy's five-minute candle. The streamed bar is only the clock that
+            # tells us the candle has ended; its last received tick can differ from history.
+            completed = await self._completed_history_bar(
+                (bar.start + timedelta(seconds=bar.seconds)).astimezone(IST), bar,
+            )
+            if completed is None:
+                return
             old_stop = self.stop
-            self._ratchet(bar.close, long=self.ctx.position > 0)
+            self._ratchet(completed.close, long=self.ctx.position > 0)
             if self.stop != old_stop:
                 await self._save_checkpoint()
+
+    async def _completed_history_bar(
+        self, closed_at: datetime, fallback: Bar | None = None,
+    ) -> Candle | Bar | None:
+        """Return the exact completed candle used by replay, or skip an incomplete publication.
+
+        Small unit-test contexts do not expose history; their supplied completed Bar remains a
+        faithful fallback. Real StrategyContext objects always expose broker history.
+        """
+        history = getattr(self.ctx, "history", None)
+        if history is None:
+            return fallback
+        try:
+            candles = await history("1", days=1)
+        except OrderError as exc:
+            self.ctx.log(f"no intraday candle history yet ({exc}); skipping trail update")
+            return None
+
+        bucket = int(closed_at.timestamp()) // self.bar_seconds - 1
+        rows = sorted(
+            (c for c in candles if int(c.start.timestamp()) // self.bar_seconds == bucket
+             and c.start.astimezone(IST) < closed_at),
+            key=lambda c: c.start,
+        )
+        expected = self.bar_seconds // 60
+        if len(rows) != expected:
+            self.ctx.log(
+                f"only {len(rows)}/{expected} minute candles for the bar ending "
+                f"{closed_at:%H:%M}; skipping trail update")
+            return None
+        return Candle(
+            datetime.fromtimestamp(bucket * self.bar_seconds, tz=rows[0].start.tzinfo),
+            rows[0].open,
+            max(c.high for c in rows),
+            min(c.low for c in rows),
+            rows[-1].close,
+            sum(c.volume for c in rows),
+        )

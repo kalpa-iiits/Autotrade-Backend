@@ -269,31 +269,3 @@ class NiftyTrailingReversalOptions(NiftyTrailingReversal):
             if self.stop != old_stop:
                 await self._save_checkpoint()
 
-    async def _completed_history_bar(self, closed_at: datetime) -> Candle | None:
-        try:
-            candles = await self.ctx.history("1", days=1)
-        except OrderError as exc:
-            self.ctx.log(f"no intraday candle history yet ({exc}); skipping trail update")
-            return None
-
-        bucket = int(closed_at.timestamp()) // self.bar_seconds - 1
-        rows = sorted(
-            (c for c in candles if int(c.start.timestamp()) // self.bar_seconds == bucket
-             and c.start.astimezone(IST) < closed_at),
-            key=lambda c: c.start,
-        )
-        expected = self.bar_seconds // 60
-        if len(rows) != expected:
-            self.ctx.log(
-                f"only {len(rows)}/{expected} minute candles for the bar ending "
-                f"{closed_at:%H:%M}; skipping trail update")
-            return None
-        return Candle(
-            datetime.fromtimestamp(bucket * self.bar_seconds, tz=rows[0].start.tzinfo),
-            rows[0].open,
-            max(c.high for c in rows),
-            min(c.low for c in rows),
-            rows[-1].close,
-            sum(c.volume for c in rows),
-        )
-

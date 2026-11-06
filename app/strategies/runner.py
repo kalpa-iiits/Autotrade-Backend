@@ -362,7 +362,8 @@ class StrategyRunner:
             inst.tick_size = await service.broker.get_tick_size(config.symbol)
             if config.size_mode == "capital":
                 inst.lot_size = await service.broker.get_lot_size(config.symbol) or 1
-        inst.position, inst.filled, inst.pending_order_id = await self._load_position(config)
+        (inst.position, inst.filled, inst.pending_order_id,
+         inst.last_fill_price) = await self._load_position(config)
         inst.orders_today = await self._orders_today(instance_id)
         if inst.position:
             inst.held_symbol = await self._held_symbol(config)
@@ -899,23 +900,27 @@ class StrategyRunner:
 
     async def _load_position(
         self, config: StrategyInstance
-    ) -> tuple[int, dict[str, int], str | None]:
-        """Rebuild the instance's position after a restart, from the orders it placed."""
+    ) -> tuple[int, dict[str, int], str | None, float | None]:
+        """Rebuild position, pending order and latest actual fill after a restart."""
         async with db.session() as s:
             rows = (await s.execute(
-                select(OrderRecord.id, OrderRecord.side, OrderRecord.filled_quantity, OrderRecord.status)
+                select(OrderRecord.id, OrderRecord.side, OrderRecord.filled_quantity,
+                       OrderRecord.status, OrderRecord.filled_price)
                 .join(StrategySignal, (StrategySignal.order_id == OrderRecord.id)
                       & (OrderRecord.account_id == config.account_id))
                 .where(StrategySignal.instance_id == config.id, StrategySignal.outcome == "placed")
+                .order_by(StrategySignal.id)
             )).all()
-        position, filled, pending = 0, {}, None
-        for order_id, side, qty, status in rows:
+        position, filled, pending, last_fill = 0, {}, None, None
+        for order_id, side, qty, status, fill_price in rows:
             filled[order_id] = qty or 0
             position += (qty or 0) if side == Side.BUY.value else -(qty or 0)
+            if qty and fill_price is not None:
+                last_fill = float(fill_price)
             if status not in {s.value for s in TERMINAL}:
                 self._order_owner[(config.account_id, order_id)] = config.id
                 pending = order_id
-        return position, filled, pending
+        return position, filled, pending, last_fill
 
     async def _orders_today(self, instance_id: int) -> int:
         async with db.session() as s:
