@@ -133,11 +133,13 @@ class BacktestContext:
 
     # Exact-price helpers are intentionally backtest-only. A strategy port can use them to
     # emulate resting stop orders from its source platform without changing live execution.
-    async def buy_at(self, price: float, at: datetime, reason: str | None = None) -> None:
-        self._sim.request_at(self.quantity, price, at, reason)
+    async def buy_at(self, price: float, at: datetime, reason: str | None = None,
+                     quantity: int | None = None) -> None:
+        self._sim.request_at(quantity or self.quantity, price, at, reason)
 
-    async def sell_at(self, price: float, at: datetime, reason: str | None = None) -> None:
-        self._sim.request_at(-self.quantity, price, at, reason)
+    async def sell_at(self, price: float, at: datetime, reason: str | None = None,
+                      quantity: int | None = None) -> None:
+        self._sim.request_at(-(quantity or self.quantity), price, at, reason)
 
     async def exit_at(self, price: float, at: datetime, reason: str | None = None) -> None:
         if self.position:

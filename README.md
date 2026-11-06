@@ -277,6 +277,7 @@ position is rebuilt from the orders it placed.
 |---|---|
 | `sma_crossover` | fast/slow moving average cross on bar closes; long-only or with shorts |
 | `intraday_breakout` | port of the TradingView "NIFTY 1-minute breakout": from 10:30, trade the first break of the last 5 one-minute candles' high/low; stop 0.25x and trail 0.40x the 14-day average daily range; skip if the 5-candle range is wider than 0.4x it; max 8 entries/day; entries until 14:45; square-off 15:15 (IST). Deployed as `nifty-1m-breakout` on the NIFTY future, 1 lot (65). Roll the symbol to the next contract before monthly expiry. |
+| `nifty_trailing_reversal` | persistent 5-minute NIFTY long/short reversal: fixed 65 units, 0.8% initial stop, 0.4% scheduled-close trail, overnight holding, and no daily reset. Deployed as `nifty-percentage-reversal`. |
 
 Strategies can read the broker's candle history with `await self.ctx.history("D" or "1", days=...)`
 (Fyers, Zerodha; the paper broker makes up candles for its own symbols).

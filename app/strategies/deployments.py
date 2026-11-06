@@ -15,10 +15,24 @@ try a strategy without real money, run it on a paper account.
 
 from app.strategies.builtin.intraday_breakout import IntradayBreakout
 from app.strategies.builtin.intraday_breakout_options import IntradayBreakoutOptions
+from app.strategies.builtin.nifty_trailing_reversal import NiftyTrailingReversal
 from app.strategies.builtin.sma_crossover import SmaCrossover
 from app.strategies.deployment import Deployment
 
 DEPLOYMENTS: list[Deployment] = [
+    # Percentage trailing reversal from the supplied historical-reproduction rules. A reversal
+    # is one 130-unit order: 65 closes the current side and 65 opens the opposite side.
+    Deployment(
+        key="nifty-percentage-reversal",
+        label="NIFTY Percentage Trailing Reversal",
+        strategy=NiftyTrailingReversal,
+        timeframe="5m",
+        quantity=65,
+        max_order_qty=130,
+        max_position=65,
+        max_orders_per_day=100,
+        backtest_fixed_quantity=65,
+    ),
     # Intraday breakout (ported from the TradingView script). By default an instance trades one
     # futures lot (65); users can pick another fixed quantity or capital per trade in the app,
     # up to 5,000 units per order and position (room for capital sizing on stocks, e.g. ₹5L of
