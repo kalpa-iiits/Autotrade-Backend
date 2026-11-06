@@ -35,6 +35,7 @@ class NiftyTrailingReversal(Strategy):
     initial_stop_pct = 0.8
     trailing_stop_pct = 0.4
     cadence_minutes = 10
+    trail_retry_seconds = 5
 
     class Params(BaseModel):
         model_config = ConfigDict(extra="forbid")
@@ -75,6 +76,8 @@ class NiftyTrailingReversal(Strategy):
         self._reversal_pending = False
         self._pre_reversal_stop: float | None = None
         self._fill_bucket: int | None = None
+        self._pending_trails: list[tuple[datetime, int]] = []
+        self._trail_retry_at: datetime | None = None
         self._checkpoint_restored = self._restore_checkpoint()
 
     def _restore_checkpoint(self) -> bool:
@@ -96,6 +99,7 @@ class NiftyTrailingReversal(Strategy):
         stop = state.get("stop")
         fill_bucket = state.get("fill_bucket")
         pre_reversal_stop = state.get("pre_reversal_stop")
+        pending_trails = state.get("pending_trails", [])
         if direction not in (-1, 0, 1):
             return False
         if stop is not None and not isinstance(stop, (int, float)):
@@ -103,6 +107,18 @@ class NiftyTrailingReversal(Strategy):
         if fill_bucket is not None and not isinstance(fill_bucket, int):
             return False
         if pre_reversal_stop is not None and not isinstance(pre_reversal_stop, (int, float)):
+            return False
+        if not isinstance(pending_trails, list):
+            return False
+        try:
+            restored_trails = [
+                (datetime.fromisoformat(value["closed_at"]), value["direction"])
+                for value in pending_trails
+            ]
+        except (KeyError, TypeError, ValueError):
+            return False
+        if any(value.tzinfo is None or direction not in (-1, 1)
+               for value, direction in restored_trails):
             return False
         self.seeded = bool(state.get("seeded"))
         self.stop = float(stop) if stop is not None else None
@@ -115,6 +131,7 @@ class NiftyTrailingReversal(Strategy):
         self._pre_reversal_stop = (float(pre_reversal_stop)
                                    if pre_reversal_stop is not None else None)
         self._fill_bucket = fill_bucket
+        self._pending_trails = restored_trails
         return True
 
     def _checkpoint_params_match(self, saved) -> bool:
@@ -150,6 +167,10 @@ class NiftyTrailingReversal(Strategy):
             "reversal_pending": self._reversal_pending,
             "pre_reversal_stop": self._pre_reversal_stop,
             "fill_bucket": self._fill_bucket,
+            "pending_trails": [
+                {"closed_at": value.isoformat(), "direction": direction}
+                for value, direction in self._pending_trails
+            ],
         }
 
     async def _save_checkpoint(self) -> None:
@@ -252,6 +273,9 @@ class NiftyTrailingReversal(Strategy):
         """Live mode: bar-close ratchets, but protective stops remain active each tick."""
         if bar := self._bars.add(tick):
             await self.on_bar(bar)
+        # A broker may publish its completed minute candles a few seconds after the boundary.
+        # Apply a delayed ratchet before evaluating this tick against the active stop.
+        await self._retry_pending_trails(tick.at)
 
         position = self.ctx.position
         direction = 1 if position > 0 else -1 if position < 0 else 0
@@ -358,15 +382,46 @@ class NiftyTrailingReversal(Strategy):
             # Match the backtest input: use the broker's completed one-minute OHLC aggregated
             # to the strategy's five-minute candle. The streamed bar is only the clock that
             # tells us the candle has ended; its last received tick can differ from history.
-            completed = await self._completed_history_bar(
-                (bar.start + timedelta(seconds=bar.seconds)).astimezone(IST), bar,
-            )
-            if completed is None:
-                return
-            old_stop = self.stop
-            self._ratchet(completed.close, long=self.ctx.position > 0)
-            if self.stop != old_stop:
+            closed_at = (bar.start + timedelta(seconds=bar.seconds)).astimezone(IST)
+            direction = 1 if self.ctx.position > 0 else -1
+            if not any(value == closed_at for value, _ in self._pending_trails):
+                self._pending_trails.append((closed_at, direction))
+                self._pending_trails.sort(key=lambda pending: pending[0])
                 await self._save_checkpoint()
+            await self._retry_pending_trails(closed_at, bar)
+
+    async def on_clock(self, now: datetime) -> None:
+        """Retry a scheduled trail even when no new market tick arrives."""
+        await self._retry_pending_trails(now)
+
+    async def _retry_pending_trails(self, now: datetime, fallback: Bar | None = None) -> None:
+        if not self._pending_trails:
+            return
+        if self._trail_retry_at is not None and now < self._trail_retry_at:
+            return
+
+        changed = False
+        while self._pending_trails:
+            closed_at, scheduled_direction = self._pending_trails[0]
+            completed = await self._completed_history_bar(
+                closed_at, fallback if fallback is not None and
+                closed_at == fallback.start + timedelta(seconds=fallback.seconds) else None,
+            )
+            fallback = None
+            if completed is None:
+                self._trail_retry_at = now + timedelta(seconds=self.trail_retry_seconds)
+                return
+            current_direction = 1 if self.ctx.position > 0 else -1 if self.ctx.position < 0 else 0
+            if current_direction == scheduled_direction:
+                old_stop = self.stop
+                self._ratchet(completed.close, long=scheduled_direction > 0)
+                changed = changed or self.stop != old_stop
+            self._pending_trails.pop(0)
+            changed = True  # persist removal even when the candidate did not tighten the stop
+
+        self._trail_retry_at = None
+        if changed:
+            await self._save_checkpoint()
 
     async def _completed_history_bar(
         self, closed_at: datetime, fallback: Bar | None = None,

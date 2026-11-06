@@ -246,6 +246,58 @@ def test_direct_live_ratchet_uses_same_broker_candle_close_as_backtest():
     assert strategy.stop == pytest.approx(26_000 * 0.996)
 
 
+def test_late_broker_candle_is_retried_instead_of_skipping_trail():
+    first = datetime(2026, 11, 2, 9, 30, tzinfo=IST)
+
+    class DelayedHistoryContext(LiveContext):
+        def __init__(self):
+            super().__init__()
+            self.position = 65
+            self.logs = []
+            self.saved = []
+            self.rows = [
+                Candle(first + timedelta(minutes=i), 25_900, 26_010, 25_890, 26_000)
+                for i in range(4)
+            ]
+
+        async def history(self, resolution="1", days=1):
+            return self.rows
+
+        async def save_strategy_state(self, state):
+            self.saved.append(dict(state))
+
+        def log(self, message):
+            self.logs.append(message)
+
+    ctx = DelayedHistoryContext()
+    strategy = NiftyTrailingReversal(NiftyTrailingReversal.Params(), ctx, 300)
+    boundary = first + timedelta(minutes=5)
+    resumed = None
+
+    async def replay():
+        nonlocal resumed
+        await strategy.on_start()
+        strategy.stop = 24_800
+        await strategy.on_tick(Tick(SYM, 25_000, first))
+        await strategy.on_tick(Tick(SYM, 25_000, first + timedelta(minutes=4, seconds=59)))
+        await strategy.on_tick(Tick(SYM, 26_000, boundary))
+        assert strategy.stop == 24_800
+        assert strategy._pending_trails
+
+        # The pending scheduled close is durable: a restart must continue retrying it.
+        ctx.strategy_state = ctx.saved[-1]
+        resumed = NiftyTrailingReversal(NiftyTrailingReversal.Params(), ctx, 300)
+        await resumed.on_start()
+        assert resumed._pending_trails
+
+        ctx.rows.append(Candle(first + timedelta(minutes=4), 25_900, 26_010, 25_890, 26_000))
+        await resumed.on_clock(boundary + timedelta(seconds=6))
+
+    asyncio.run(replay())
+    assert resumed.stop == pytest.approx(26_000 * 0.996)
+    assert resumed._pending_trails == []
+
+
 def test_restart_finishes_pending_reversal_from_recorded_actual_fill():
     class PersistentContext(LiveContext):
         def __init__(self):

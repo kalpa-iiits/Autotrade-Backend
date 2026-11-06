@@ -14,7 +14,6 @@ from pydantic import Field
 
 from app.brokers import OrderError
 from app.brokers.base import Candle
-from app.strategies.base import Bar
 from app.strategies.builtin.intraday_breakout_options import pick_contract
 from app.strategies.builtin.nifty_trailing_reversal import IST, NiftyTrailingReversal
 
@@ -251,21 +250,4 @@ class NiftyTrailingReversalOptions(NiftyTrailingReversal):
         await super().on_tick(tick)
         if isinstance(self.ctx, ReversalOptionLegs):
             await self.ctx.advance()
-
-    async def on_bar(self, bar: Bar) -> None:
-        """Ratchet only from the broker's completed OHLC, matching commit 3f9c332.
-
-        The streaming bar is used only as the clock telling us a five-minute bucket ended.
-        Missing or not-yet-published minute candles skip that update rather than substituting
-        an incomplete tick-built close.
-        """
-        if not self.ctx.position or not self._scheduled_close(bar.start):
-            return
-        closed_at = (bar.start + timedelta(seconds=bar.seconds)).astimezone(IST)
-        completed = await self._completed_history_bar(closed_at)
-        if completed is not None:
-            old_stop = self.stop
-            self._ratchet(completed.close, long=self.ctx.position > 0)
-            if self.stop != old_stop:
-                await self._save_checkpoint()
 
