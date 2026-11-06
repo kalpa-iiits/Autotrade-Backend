@@ -1,20 +1,17 @@
 """Persistent NIFTY percentage-stop reversal strategy.
 
-This ports the supplied TradingView "Explicit orders v3" script.  By default the first
-loaded regular-session candle queues the initial order, which fills at the next candle open.
-Exact-seed mode instead queues on the candle ending at the configured seed time.  Stops are
-armed after a fill candle closes, ratchet from scheduled closes, and carry overnight.
+This ports the supplied TradingView "Explicit orders v3" script. The first loaded
+regular-session candle queues the initial long order, which fills at the next candle open.
+Stops are armed from the fill, ratchet from scheduled closes, and carry overnight.
 """
 
-from datetime import date, datetime, time, timedelta
-from decimal import ROUND_HALF_UP, Decimal
-from typing import Literal
+from datetime import datetime, time, timedelta
 from zoneinfo import ZoneInfo
 
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, ConfigDict
 
 from app.brokers.base import Candle
-from app.strategies.base import TIMEFRAMES, Bar, Strategy, Tick
+from app.strategies.base import Bar, Strategy, Tick
 
 IST = ZoneInfo("Asia/Kolkata")
 
@@ -27,33 +24,26 @@ class NiftyTrailingReversal(Strategy):
         "behind scheduled closes, with positions carried overnight."
     )
     tags = ("Positional", "NIFTY", "Long & short", "Trailing stop")
-    timeframes = tuple(TIMEFRAMES)
+    timeframes = ("5m",)
     default_timeframe = "5m"
     capital_sizing = True
     backtest_note = (
-        "The 5-minute result follows the Pine script's completed-candle approximation. Other "
-        "timeframes are supported variants: a trail update occurs when their completed bar "
-        "crosses a scheduled cadence boundary. At most one reversal is processed per candle."
+        "The result follows the Pine script's completed-candle approximation. At most one "
+        "reversal is processed per 5-minute candle."
     )
+    initial_stop_pct = 0.8
+    trailing_stop_pct = 0.4
+    cadence_minutes = 10
 
     class Params(BaseModel):
-        initial_stop_pct: float = Field(0.8, gt=0, lt=100, description="Initial stop, % from each fill")
-        trailing_stop_pct: float = Field(0.4, gt=0, lt=100, description="Scheduled-close trail, %")
-        cadence_minutes: int = Field(10, ge=5, multiple_of=5, description="Trail update cadence")
-        initialization: Literal["first_available_bar", "exact_seed_time"] = "first_available_bar"
-        seed_date: date = Field(date(2021, 11, 8), description="Historical seed date (IST)")
-        seed_time: time = Field(time(9, 20), description="Exact seed fill time (IST)")
-        start_long: bool = Field(True, description="Initial direction is long; false starts short")
-        round_to_tick: bool = Field(False, description="Round stop prices to the symbol tick")
+        model_config = ConfigDict(extra="forbid")
 
     @classmethod
     def rules(cls, p: "NiftyTrailingReversal.Params") -> list[dict]:
         return [
             {"kind": "filter", "title": "When it runs", "conditions": [
-                "Selected-timeframe NIFTY candles; one position at a time (5-minute preserves the Pine behavior)",
-                ("The first loaded regular-session candle queues the initial order"
-                 if p.initialization == "first_available_bar" else
-                 f"The candle before {p.seed_time:%H:%M} IST on {p.seed_date:%-d %b %Y} queues the initial order"),
+                "5-minute NIFTY candles; one position at a time",
+                "The first loaded regular-session candle queues the initial long order",
                 "The position and stop carry overnight; there is no daily reset or square-off",
             ]},
             {"kind": "entry_long", "title": "Long / reverse to long", "conditions": [
@@ -65,8 +55,8 @@ class NiftyTrailingReversal(Strategy):
                 "A gap beyond the stop fills at the adverse candle open in historical replay",
             ]},
             {"kind": "risk", "title": "Protective and trailing stop", "conditions": [
-                f"After its fill candle, each position gets a stop {p.initial_stop_pct:g}% from the fill",
-                f"Every {p.cadence_minutes} minutes from 09:15, plus 15:30 IST, ratchet to {p.trailing_stop_pct:g}% behind the completed close",
+                f"From its fill, each position gets a stop {cls.initial_stop_pct:g}% from the fill",
+                f"Every {cls.cadence_minutes} minutes from 09:15 IST, ratchet to {cls.trailing_stop_pct:g}% behind the completed close",
                 "The stop only tightens while the direction is unchanged; there is no profit target",
             ]},
             {"kind": "exit", "title": "Close and reverse", "conditions": [
@@ -82,6 +72,7 @@ class NiftyTrailingReversal(Strategy):
         self._direction = 1 if self.ctx.position > 0 else -1 if self.ctx.position < 0 else 0
         self._seed_pending = False
         self._reversal_pending = False
+        self._pre_reversal_stop: float | None = None
         self._fill_bucket: int | None = None
         self._checkpoint_restored = self._restore_checkpoint()
 
@@ -96,24 +87,51 @@ class NiftyTrailingReversal(Strategy):
             "bar_seconds": self.bar_seconds,
             "params": self.params.model_dump(mode="json"),
         }
-        if any(state.get(key) != value for key, value in expected.items()):
+        if any(state.get(key) != value for key, value in expected.items() if key != "params"):
+            return False
+        if not self._checkpoint_params_match(state.get("params")):
             return False
         direction = state.get("direction")
         stop = state.get("stop")
         fill_bucket = state.get("fill_bucket")
+        pre_reversal_stop = state.get("pre_reversal_stop")
         if direction not in (-1, 0, 1):
             return False
         if stop is not None and not isinstance(stop, (int, float)):
             return False
         if fill_bucket is not None and not isinstance(fill_bucket, int):
             return False
+        if pre_reversal_stop is not None and not isinstance(pre_reversal_stop, (int, float)):
+            return False
         self.seeded = bool(state.get("seeded"))
         self.stop = float(stop) if stop is not None else None
         self._direction = direction
         self._seed_pending = bool(state.get("seed_pending"))
         self._reversal_pending = bool(self.ctx.order_pending)
+        self._pre_reversal_stop = (float(pre_reversal_stop)
+                                   if pre_reversal_stop is not None else None)
         self._fill_bucket = fill_bucket
         return True
+
+    def _checkpoint_params_match(self, saved) -> bool:
+        """Accept checkpoints from the former configurable form only when it used these rules."""
+        if not isinstance(saved, dict):
+            return False
+        legacy_fixed = {
+            "initial_stop_pct": 0.8,
+            "trailing_stop_pct": 0.4,
+            "cadence_minutes": 10,
+            "initialization": "first_available_bar",
+            "seed_date": "2021-11-08",
+            "seed_time": "09:20:00",
+            "start_long": True,
+            "round_to_tick": False,
+        }
+        remaining = dict(saved)
+        for key, expected in legacy_fixed.items():
+            if key in remaining and remaining.pop(key) != expected:
+                return False
+        return remaining == self.params.model_dump(mode="json")
 
     def _checkpoint(self) -> dict:
         return {
@@ -125,6 +143,7 @@ class NiftyTrailingReversal(Strategy):
             "direction": self._direction,
             "stop": self.stop,
             "seed_pending": self._seed_pending,
+            "pre_reversal_stop": self._pre_reversal_stop,
             "fill_bucket": self._fill_bucket,
         }
 
@@ -135,24 +154,17 @@ class NiftyTrailingReversal(Strategy):
 
     @property
     def _initial_fraction(self) -> float:
-        return self.params.initial_stop_pct / 100
+        return self.initial_stop_pct / 100
 
     @property
     def _trail_fraction(self) -> float:
-        return self.params.trailing_stop_pct / 100
+        return self.trailing_stop_pct / 100
 
     def _initial_stop(self, fill: float, long: bool) -> float:
-        return self._price_level(fill * (1 - self._initial_fraction if long else 1 + self._initial_fraction))
-
-    def _price_level(self, value: float) -> float:
-        tick = self.ctx.tick_size if self.params.round_to_tick else None
-        if not tick:
-            return value
-        steps = (Decimal(str(value)) / Decimal(str(tick))).quantize(Decimal("1"), rounding=ROUND_HALF_UP)
-        return float(steps * Decimal(str(tick)))
+        return fill * (1 - self._initial_fraction if long else 1 + self._initial_fraction)
 
     def _ratchet(self, close: float, long: bool) -> None:
-        candidate = self._price_level(close * (1 - self._trail_fraction if long else 1 + self._trail_fraction))
+        candidate = close * (1 - self._trail_fraction if long else 1 + self._trail_fraction)
         if self.stop is None:
             self.stop = candidate
         elif long:
@@ -174,27 +186,18 @@ class NiftyTrailingReversal(Strategy):
         local_end = local_start + timedelta(seconds=self.bar_seconds)
         session_start = datetime.combine(local_start.date(), time(9, 15), tzinfo=IST)
         session_end = datetime.combine(local_start.date(), time(15, 30), tzinfo=IST)
-        due = session_start + timedelta(minutes=self.params.cadence_minutes)
+        due = session_start + timedelta(minutes=self.cadence_minutes)
         while due < session_end:
             if local_start < due <= local_end:
                 return True
-            due += timedelta(minutes=self.params.cadence_minutes)
-        return local_start < session_end <= local_end
+            due += timedelta(minutes=self.cadence_minutes)
+        return False
 
     def _queues_seed(self, start: datetime) -> bool:
-        if not self._regular_bar(start):
-            return False
-        if self.params.initialization == "first_available_bar":
-            return True
-        seed_at = datetime.combine(self.params.seed_date, self.params.seed_time, tzinfo=IST)
-        return start < seed_at <= start + timedelta(seconds=self.bar_seconds)
+        return self._regular_bar(start)
 
     async def _open_seed_at(self, price: float, at: datetime) -> None:
-        reason = "initial LONG" if self.params.start_long else "initial SHORT"
-        if self.params.start_long:
-            await self.ctx.buy_at(price, at, reason)
-        else:
-            await self.ctx.sell_at(price, at, reason)
+        await self.ctx.buy_at(price, at, "initial LONG")
 
     async def on_backtest_candle(self, candle: Candle) -> None:
         """Apply Pine's next-open fills and one-confirmed-calculation-per-bar model."""
@@ -204,8 +207,10 @@ class NiftyTrailingReversal(Strategy):
             if self._seed_pending:
                 await self._open_seed_at(candle.open, candle.start)
                 self.seeded, self._seed_pending = True, False
-                # Pine learns the fill and installs the first stop at this candle's close.
-                self.stop = None
+                # The entry is filled at this candle's open, so its protective stop is active
+                # for the rest of this candle. The single if/elif below still permits at most
+                # one reversal in the candle.
+                self.stop = self._initial_stop(candle.open, long=self.ctx.position > 0)
             else:
                 self.ctx.mark(candle.close, candle.start + timedelta(seconds=self.bar_seconds))
                 if self._queues_seed(candle.start):
@@ -229,8 +234,8 @@ class NiftyTrailingReversal(Strategy):
             )
             self.stop = self._initial_stop(fill, long=True)
 
-        # No stop exists during the seed fill candle, and a reversal stop is not retested in
-        # its fill candle. At the close Pine initializes it, then applies any due ratchet.
+        # A reversal stop is not retested in its fill candle. At the close, apply any due
+        # completed-candle ratchet.
         close_at = candle.start + timedelta(seconds=self.bar_seconds)
         self.ctx.mark(candle.close, close_at)
         if self.ctx.position and self.stop is None:
@@ -245,12 +250,35 @@ class NiftyTrailingReversal(Strategy):
 
         position = self.ctx.position
         direction = 1 if position > 0 else -1 if position < 0 else 0
-        if direction and direction != self._direction:
+        bucket = int(tick.at.timestamp()) // self.bar_seconds
+        if direction and direction != self._direction and not self._reversal_pending:
+            seed_fill = self._seed_pending
             self._direction, self._reversal_pending = direction, False
             if self._seed_pending:
                 self.seeded, self._seed_pending = True, False
-            self.stop = self._initial_stop(tick.price, long=direction > 0)
-            self._fill_bucket = int(tick.at.timestamp()) // self.bar_seconds
+            # Direct-instrument live orders use the broker's reported fill. Option legs expose
+            # no underlying fill price, so their NIFTY signal correctly falls back to this tick.
+            fill = getattr(self.ctx, "last_fill_price", None) or tick.price
+            self.stop = self._initial_stop(fill, long=direction > 0)
+            # The initial entry's stop is active immediately. A reversal fill, however, blocks
+            # another reversal until the next candle, preserving the one-reversal rule.
+            self._fill_bucket = None if seed_fill else bucket
+            await self._save_checkpoint()
+        elif direction and self._reversal_pending and not self.ctx.order_pending:
+            # The intended reversal was recorded before an asynchronous broker fill. Now that
+            # the order is terminal, either install its actual-fill stop or restore the old side
+            # after a rejection/cancellation.
+            if direction == self._direction:
+                fill = getattr(self.ctx, "last_fill_price", None) or tick.price
+                self.stop = self._initial_stop(fill, long=direction > 0)
+                self._fill_bucket = bucket
+            else:
+                self._direction = direction
+                if self._pre_reversal_stop is not None:
+                    self.stop = self._pre_reversal_stop
+                self._fill_bucket = None
+            self._reversal_pending = False
+            self._pre_reversal_stop = None
             await self._save_checkpoint()
 
         if not self.seeded and position == 0:
@@ -262,13 +290,13 @@ class NiftyTrailingReversal(Strategy):
             self.stop = self._initial_stop(tick.price, long=position > 0)
             await self._save_checkpoint()
 
-        bucket = int(tick.at.timestamp()) // self.bar_seconds
         if not position or self.stop is None or self._reversal_pending or bucket == self._fill_bucket:
             return
         if position > 0 and tick.price <= self.stop:
             old_stop = self.stop
             old_fill_bucket = self._fill_bucket
             desired_direction = -1
+            self._pre_reversal_stop = old_stop
             self._direction = desired_direction
             self.stop = self._initial_stop(tick.price, long=False)
             self._fill_bucket = bucket
@@ -282,6 +310,7 @@ class NiftyTrailingReversal(Strategy):
             old_stop = self.stop
             old_fill_bucket = self._fill_bucket
             desired_direction = 1
+            self._pre_reversal_stop = old_stop
             self._direction = desired_direction
             self.stop = self._initial_stop(tick.price, long=True)
             self._fill_bucket = bucket
@@ -295,6 +324,11 @@ class NiftyTrailingReversal(Strategy):
         new_direction = 1 if self.ctx.position > 0 else -1 if self.ctx.position < 0 else 0
         if new_direction == desired_direction:  # filled synchronously, or option target changed
             self._reversal_pending = self.ctx.order_pending
+            if not self._reversal_pending:
+                fill = getattr(self.ctx, "last_fill_price", None) or tick.price
+                self.stop = self._initial_stop(fill, long=desired_direction > 0)
+                self._fill_bucket = bucket
+                self._pre_reversal_stop = None
         elif self.ctx.order_pending:
             # Direct-instrument broker order accepted but has not filled yet.
             self._reversal_pending = True
@@ -304,15 +338,13 @@ class NiftyTrailingReversal(Strategy):
             self._direction, self.stop = direction, old_stop
             self._fill_bucket = old_fill_bucket
             self._reversal_pending = False
+            self._pre_reversal_stop = None
         await self._save_checkpoint()
 
     async def on_bar(self, bar: Bar) -> None:
         if not self.seeded and not self._seed_pending and self.ctx.position == 0 and self._queues_seed(bar.start):
             self._seed_pending = True
-            if self.params.start_long:
-                await self.ctx.buy(reason="initial LONG at next bar open")
-            else:
-                await self.ctx.sell(reason="initial SHORT at next bar open")
+            await self.ctx.buy(reason="initial LONG at next bar open")
             if self.ctx.position == 0 and not self.ctx.order_pending:
                 self._seed_pending = False  # rejected/cancelled synchronously: retry next bar
             await self._save_checkpoint()

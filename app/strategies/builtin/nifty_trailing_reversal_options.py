@@ -81,6 +81,11 @@ class ReversalOptionLegs:
     def position(self) -> int:
         return self.target * self._ctx.quantity
 
+    @property
+    def last_fill_price(self) -> None:
+        """Stops are in NIFTY points, never in the held option's premium."""
+        return None
+
     async def buy(self, quantity=None, reason=None) -> None:
         self.target, self.reason = 1, reason
         await self.advance()

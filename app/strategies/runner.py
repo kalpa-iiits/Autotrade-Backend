@@ -144,6 +144,11 @@ class StrategyContext:
         return self._inst.tick_size
 
     @property
+    def last_fill_price(self) -> float | None:
+        """Broker-reported average price of the most recently filled order."""
+        return self._inst.last_fill_price
+
+    @property
     def order_pending(self) -> bool:
         """Whether this strategy instance currently has a non-terminal broker order."""
         return self._inst.pending_order_id is not None
@@ -218,6 +223,7 @@ class RunningInstance:
         self.last_price: float | None = None
         self.lot_size = 1  # the instrument's trading lot, for capital sizing
         self.tick_size: float | None = None
+        self.last_fill_price: float | None = None
         self.held_symbol: str | None = None  # another instrument it bought (an option), if any
         self.strategy_state: dict = dict(config.strategy_state or {})
         self.pending_order_id: str | None = None
@@ -560,6 +566,8 @@ class StrategyRunner:
         if new > 0:
             inst.filled[order.id] = filled
             inst.position += new if order.side == Side.BUY else -new
+            if order.filled_price is not None:
+                inst.last_fill_price = float(order.filled_price)
         if order.status in TERMINAL and inst.pending_order_id == order.id:
             inst.pending_order_id = None
 
@@ -606,6 +614,7 @@ class StrategyRunner:
             if blocked := self._check(inst, side, quantity):
                 signal.outcome, signal.message = "blocked", blocked
             else:
+                inst.last_fill_price = None
                 await self._place(inst, side, quantity, signal)
             if symbol != inst.symbol and side == Side.BUY and signal.outcome == "placed":
                 inst.held_symbol = symbol
