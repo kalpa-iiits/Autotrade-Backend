@@ -125,6 +125,16 @@ page), up to `AUTOTRADE_MAX_ACCOUNTS_PER_USER` (10). Each has a label unique to 
   twice, and again at startup if it comes up later with no token for today.
   `POST /api/accounts/{id}/auto-login` runs it now. It uses Fyers' web-login endpoints, which
   are not part of the documented API and may change; the browser login keeps working either way.
+- **Zerodha auto-login** (optional): add the account's Kite `user_id`, login `password` and
+  `totp_secret` (the key shown when you enable external TOTP on Kite) to its credentials, all
+  three or none. It runs on the same schedule as Fyers (`AUTOTRADE_FYERS_AUTO_LOGIN_TIME`) and
+  through the same `POST /api/accounts/{id}/auto-login`. It logs in the way the Kite web login
+  does, opens the Kite Connect login for the account's app and reads the request token off the
+  redirect to `/auth/zerodha/callback` (it never calls the callback). Log in once through the
+  browser first, so Kite has authorized the app. A wrong password isn't retried, because
+  repeated failures can lock the Kite account. These are Kite's web-login endpoints, not the
+  documented Kite Connect API, and Zerodha discourages automated logins, so they may change or
+  stop working; the browser login keeps working either way.
 - **Deleting** an account wipes its credentials and token and disconnects it; its order and
   trade history stays yours. Stop its strategies first (they're archived).
 - **Isolation.** Another user's account id gets the same 404 as one that doesn't exist, on

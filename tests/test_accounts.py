@@ -263,7 +263,8 @@ def test_supported_brokers(client):
     body = client.get("/api/accounts/brokers", headers=AUTH).json()
     assert body["fyers"]["credentials"] == ["client_id", "secret_key", "fy_id", "pin", "totp_secret"]
     assert body["fyers"]["optional_credentials"] == ["fy_id", "pin", "totp_secret"]
-    assert body["zerodha"]["credentials"] == ["api_key", "api_secret"] and body["paper"]["credentials"] == []
+    assert body["zerodha"]["credentials"] == ["api_key", "api_secret", "user_id", "password", "totp_secret"] and body["paper"]["credentials"] == []
+    assert body["zerodha"]["optional_credentials"] == ["user_id", "password", "totp_secret"]
 
 
 # ---------- API tokens and sign-up ----------

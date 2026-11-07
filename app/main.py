@@ -11,7 +11,7 @@ from sqlalchemy import text
 from starlette.middleware.sessions import SessionMiddleware
 from starlette.middleware.trustedhost import TrustedHostMiddleware
 
-from app.accounts.autologin import FyersAutoLogin
+from app.accounts.autologin import AutoLogin
 from app.accounts.registry import AccountRegistry
 from app.accounts.router import router as accounts_router
 from app.accounts.vault import vault
@@ -69,7 +69,7 @@ async def _services(app: FastAPI):
     await app.state.login_throttle.prune()
     app.state.accounts = accounts
     app.state.strategy_runner = runner
-    app.state.auto_login = FyersAutoLogin(accounts, settings)
+    app.state.auto_login = AutoLogin(accounts, settings)
 
     # Accounts without credentials or today's login stay disconnected (not an error). Order
     # books are checked against our records below, once running strategies own their open
@@ -81,7 +81,7 @@ async def _services(app: FastAPI):
         # then let each strategy reconcile positions and open orders before it accepts ticks.
         await accounts.resync_all()
         await runner.resume()  # ones that were running before the restart
-        app.state.auto_login.start()  # each morning's Fyers login (and a catch-up now if due)
+        app.state.auto_login.start()  # each morning's Fyers / Zerodha login (and a catch-up now if due)
     except BaseException:
         # Startup failed after brokers connected: close their sockets, or their threads
         # keep the process alive in a state that serves nothing.

@@ -1,4 +1,4 @@
-"""Fyers morning auto-login: TOTP, the stored login details, the headless flow and scheduling."""
+"""Morning auto-login (Fyers, Zerodha): TOTP, the stored login details, the headless flows and scheduling."""
 
 import base64
 import json
@@ -9,7 +9,7 @@ import pytest
 
 import app.accounts.autologin as autologin
 from app.accounts import store
-from app.accounts.autologin import AutoLoginError, FyersAutoLogin, fyers_login, totp
+from app.accounts.autologin import AutoLogin, AutoLoginError, AutoLoginRefused, fyers_login, totp, zerodha_login
 from app.accounts.store import IST
 from tests.conftest import AUTH, run
 
@@ -133,7 +133,7 @@ def test_morning_run_logs_in_only_accounts_that_need_it(client, monkeypatch):
     monkeypatch.setattr(autologin, "fyers_login", flaky)
     due = add_fyers(client).json()["id"]
     add_fyers(client, {"client_id": "XB9-100", "secret_key": "s"})  # no login details: skipped
-    job: FyersAutoLogin = client.app.state.auto_login
+    job: AutoLogin = client.app.state.auto_login
     job.retry_delay = 0
     run(client, job.run_once)
     assert attempts == ["XB12345-100", "XB12345-100"]
@@ -144,6 +144,136 @@ def test_morning_run_logs_in_only_accounts_that_need_it(client, monkeypatch):
 
 
 def test_schedule_time(client):
-    job: FyersAutoLogin = client.app.state.auto_login
+    job: AutoLogin = client.app.state.auto_login
     now = datetime(2026, 11, 9, 7, 0, tzinfo=IST)
     assert job._today_at(now) == datetime(2026, 11, 9, 8, 45, tzinfo=IST)
+
+
+# ---------- Zerodha ----------
+
+ZERODHA_AUTO = {"api_key": "kiteapikey", "api_secret": "kite-secret-value",
+                "user_id": "AB1234", "password": "hunter2-pass", "totp_secret": TOTP_KEY}
+
+
+def add_zerodha(client, credentials=ZERODHA_AUTO):
+    add_zerodha.n = getattr(add_zerodha, "n", 0) + 1
+    return client.post("/api/accounts", json={"broker": "zerodha", "label": f"Kite {add_zerodha.n}",
+                                              "credentials": credentials}, headers=AUTH)
+
+
+def test_zerodha_login_details_are_optional_all_or_none_and_never_shown(client):
+    r = add_zerodha(client, {"api_key": "k", "api_secret": "s"})
+    assert r.status_code == 201 and r.json()["auto_login"]["enabled"] is False
+
+    r = add_zerodha(client, {"api_key": "k", "api_secret": "s", "user_id": "AB1234"})
+    assert r.status_code == 422 and "auto-login needs all of" in r.text
+    assert add_zerodha(client, {**ZERODHA_AUTO, "totp_secret": "not base32!"}).status_code == 422
+
+    view = add_zerodha(client).json()
+    assert view["auto_login"]["enabled"] is True
+    assert view["credentials"]["password"] == view["credentials"]["totp_secret"] == "set"
+    assert view["credentials"]["user_id"] == "••••"  # an identifier, masked (short ones fully)
+    dumped = json.dumps(view)
+    assert "hunter2-pass" not in dumped and TOTP_KEY not in dumped
+
+
+def kite_handler(seen, password_ok=True, authorized=True):
+    def handler(request: httpx.Request) -> httpx.Response:
+        seen.append(request.url.path)
+        if request.url.path == "/api/login":
+            form = dict(httpx.QueryParams(request.content.decode()))
+            assert form["user_id"] == "AB1234"
+            if not password_ok or form["password"] != "hunter2-pass":
+                return httpx.Response(403, json={"status": "error", "message": "Invalid username or password."})
+            return httpx.Response(200, json={"status": "success", "data": {"request_id": "rid", "twofa_type": "totp"}})
+        if request.url.path == "/api/twofa":
+            form = dict(httpx.QueryParams(request.content.decode()))
+            assert form["request_id"] == "rid" and form["twofa_value"] == totp(TOTP_KEY)
+            return httpx.Response(200, json={"status": "success", "data": {}})
+        if request.url.path == "/connect/login":
+            assert request.url.params["api_key"] == "kiteapikey"
+            return httpx.Response(302, headers={"location": "/connect/finish?sess_id=s1&api_key=kiteapikey"})
+        if request.url.path == "/connect/finish":
+            if not authorized:
+                return httpx.Response(200, text="<html>Authorize app</html>")
+            return httpx.Response(302, headers={
+                "location": "http://127.0.0.1:8000/auth/zerodha/callback?request_token=RT&action=login&status=success"})
+        raise AssertionError(f"unexpected request to {request.url}")  # never our own callback
+    return handler
+
+
+def _run_zerodha(handler):
+    import asyncio
+
+    async def go():
+        async with httpx.AsyncClient(transport=httpx.MockTransport(handler)) as http:
+            return await zerodha_login(ZERODHA_AUTO, http)
+
+    return asyncio.run(go())
+
+
+def test_zerodha_headless_flow(monkeypatch):
+    monkeypatch.setattr(autologin, "_exchange_request_token", lambda creds, rt: f"token-for-{rt}")
+    seen = []
+    assert _run_zerodha(kite_handler(seen)) == "token-for-RT"
+    assert seen == ["/api/login", "/api/twofa", "/connect/login", "/connect/finish"]
+
+
+def test_zerodha_wrong_password_and_unauthorized_app_are_not_retryable():
+    with pytest.raises(AutoLoginRefused, match="password login: Invalid username or password"):
+        _run_zerodha(kite_handler([], password_ok=False))
+    with pytest.raises(AutoLoginRefused, match="authorize this Kite app"):
+        _run_zerodha(kite_handler([], authorized=False))
+
+
+def test_zerodha_auto_login_endpoint_and_no_retry_on_refusal(client, monkeypatch):
+    calls = []
+
+    async def fake_login(creds, http=None):
+        calls.append(creds["user_id"])
+        return "kite-token"
+
+    monkeypatch.setattr(autologin, "zerodha_login", fake_login)
+    acct = add_zerodha(client).json()["id"]
+    r = client.post(f"/api/accounts/{acct}/auto-login", headers=AUTH)
+    assert r.status_code == 200, r.text
+    view = client.get(f"/api/accounts/{acct}", headers=AUTH).json()
+    assert view["logged_in_today"] is True and view["auto_login"]["last"]["ok"] is True
+    assert calls == ["AB1234"]
+
+    no_details = add_zerodha(client, {"api_key": "k", "api_secret": "s"}).json()["id"]
+    r = client.post(f"/api/accounts/{no_details}/auto-login", headers=AUTH)
+    assert r.status_code == 422 and "Kite user id, password and TOTP secret" in r.text
+
+    async def wrong_password(creds, http=None):
+        calls.append("refused")
+        raise AutoLoginRefused("password login: Invalid username or password.")
+
+    monkeypatch.setattr(autologin, "zerodha_login", wrong_password)
+    job: AutoLogin = client.app.state.auto_login
+    job.retry_delay = 0
+    other = add_zerodha(client).json()["id"]
+    with pytest.raises(AutoLoginRefused):
+        run(client, job.login, run(client, store.get_account, other))
+    assert calls.count("refused") == 1  # tried once: retrying a wrong password risks a lockout
+    assert job.last[other]["ok"] is False
+
+
+def test_morning_run_covers_fyers_and_zerodha(client, monkeypatch):
+    done = []
+
+    async def fake_fyers(creds, redirect_uri, http=None):
+        done.append("fyers")
+        return "f"
+
+    async def fake_kite(creds, http=None):
+        done.append("zerodha")
+        return "z"
+
+    monkeypatch.setattr(autologin, "fyers_login", fake_fyers)
+    monkeypatch.setattr(autologin, "zerodha_login", fake_kite)
+    kite = add_zerodha(client).json()["id"]
+    add_fyers(client)
+    run(client, client.app.state.auto_login.run_once)
+    assert sorted(done) == ["fyers", "zerodha"]
+    assert run(client, store.token_of, run(client, store.get_account, kite)) == "z"

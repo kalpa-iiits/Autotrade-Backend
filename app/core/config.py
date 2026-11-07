@@ -59,7 +59,9 @@ class Settings(BaseSettings):
     fyers_redirect_uri: str = "http://127.0.0.1:8000/auth/fyers/callback"
     fyers_log_dir: str = "logs"
     # IST time (HH:MM) to log in, each day, every Fyers account that has its user id, PIN and
-    # TOTP secret stored (app/accounts/autologin.py). Empty: no auto-login.
+    # TOTP secret stored, and every Zerodha account that has its user id, password and TOTP
+    # secret stored (app/accounts/autologin.py). Despite the name, it is for both brokers.
+    # Empty: no auto-login.
     fyers_auto_login_time: str = Field("08:45", pattern=r"^(([01]\d|2[0-3]):[0-5]\d)?$")
 
     # ---------- reliability ----------
