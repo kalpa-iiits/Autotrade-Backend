@@ -10,9 +10,10 @@ from pydantic import BaseModel, Field
 from sqlalchemy import update
 
 from app.accounts import store
+from app.accounts.autologin import AutoLoginError, has_auto_login
 from app.accounts.dependencies import owned_account
 from app.accounts.models import BrokerAccount
-from app.accounts.specs import SPECS, BrokerName
+from app.accounts.specs import AUTO_LOGIN_FIELDS, SPECS, BrokerName
 from app.accounts.store import AccountError
 from app.accounts.vault import VaultError
 from app.auth.dependencies import require_user
@@ -51,7 +52,12 @@ def _errors(e: Exception) -> HTTPException:
 
 def _view(request: Request, account: BrokerAccount) -> dict:
     runtime = request.app.state.accounts.get(account.id)
-    return store.public_view(account) | {"connection": runtime.health() if runtime else None}
+    view = store.public_view(account) | {"connection": runtime.health() if runtime else None}
+    if account.broker == "fyers":
+        creds = view["credentials"] or {}
+        view["auto_login"] = {"enabled": all(creds.get(f) for f in AUTO_LOGIN_FIELDS),
+                              "last": request.app.state.auto_login.last.get(account.id)}
+    return view
 
 
 @router.get("/brokers")
@@ -60,6 +66,7 @@ async def supported_brokers(user: User = Depends(require_user)):
     return {
         name: {
             "credentials": list(spec.credentials.model_fields) if spec.credentials else [],
+            "optional_credentials": list(spec.optional),
             "options": spec.options.model_json_schema()["properties"],
             "daily_login": spec.daily_login,
         }
@@ -123,6 +130,26 @@ async def paste_access_token(request: Request, body: AccessToken, account: Broke
     except VaultError as e:
         raise _errors(e)
     runtime = await request.app.state.accounts.reconnect(account.id)
+    return {"connected": bool(runtime and runtime.service.connected),
+            "reason": runtime.service.not_connected_reason if runtime and not runtime.service.connected else None}
+
+
+@router.post("/{account_id}/auto-login")
+async def auto_login_now(request: Request, account: BrokerAccount = Depends(owned_account)):
+    """Run the Fyers auto-login for this account now (normally it runs each morning) and
+    reconnect. Needs the account's Fyers user id, PIN and TOTP secret."""
+    if account.broker != "fyers":
+        raise HTTPException(status.HTTP_422_UNPROCESSABLE_CONTENT, "Auto-login is for Fyers accounts")
+    try:
+        if not has_auto_login(store.credentials_of(account)):
+            raise HTTPException(status.HTTP_422_UNPROCESSABLE_CONTENT,
+                                "Add the Fyers user id, PIN and TOTP secret to this account first")
+        await request.app.state.auto_login.login(account, attempts=1)
+    except VaultError as e:
+        raise _errors(e)
+    except AutoLoginError as e:
+        raise HTTPException(status.HTTP_502_BAD_GATEWAY, f"Fyers auto-login failed: {e}")
+    runtime = request.app.state.accounts.get(account.id)
     return {"connected": bool(runtime and runtime.service.connected),
             "reason": runtime.service.not_connected_reason if runtime and not runtime.service.connected else None}
 

@@ -1,14 +1,17 @@
 """What each broker needs from the user: credentials (secret, stored encrypted) and options
 (not secret, stored as JSON). Validation happens here, before anything is saved."""
 
+import base64
+import binascii
 from dataclasses import dataclass
 from typing import Literal
 
-from pydantic import BaseModel, ConfigDict, Field
+from pydantic import BaseModel, ConfigDict, Field, field_validator, model_validator
 
 from app.core.config import settings
 
 BrokerName = Literal["paper", "fyers", "zerodha"]
+AUTO_LOGIN_FIELDS = ("fy_id", "pin", "totp_secret")  # Fyers: optional, for the morning auto-login
 
 
 class _Strict(BaseModel):
@@ -18,6 +21,29 @@ class _Strict(BaseModel):
 class FyersCredentials(_Strict):
     client_id: str = Field(min_length=1, max_length=64, description='Fyers app id, e.g. "XB12345-100"')
     secret_key: str = Field(min_length=1, max_length=256, description="Fyers app secret")
+    # Optional, all three or none: lets the server log in each morning by itself
+    # (app.accounts.autologin) instead of the daily browser login.
+    fy_id: str | None = Field(default=None, min_length=1, max_length=32, description='Fyers user id, e.g. "XA12345"')
+    pin: str | None = Field(default=None, pattern=r"^\d{4}$", description="4-digit Fyers login PIN")
+    totp_secret: str | None = Field(default=None, max_length=128, description="TOTP key from Fyers' external 2FA setup")
+
+    @field_validator("totp_secret")
+    @classmethod
+    def _base32(cls, v: str | None) -> str | None:
+        v = (v or "").replace(" ", "").upper() or None
+        if v:
+            try:
+                base64.b32decode(v + "=" * (-len(v) % 8))
+            except (binascii.Error, ValueError):
+                raise ValueError("not a TOTP key (base32 letters A-Z and digits 2-7)") from None
+        return v
+
+    @model_validator(mode="after")
+    def _all_or_none(self):
+        given = [bool(getattr(self, f)) for f in AUTO_LOGIN_FIELDS]
+        if any(given) and not all(given):
+            raise ValueError("auto-login needs all of fy_id, pin and totp_secret")
+        return self
 
 
 class FyersOptions(_Strict):
@@ -45,11 +71,13 @@ class BrokerSpec:
     # are never shown, only whether they are set.
     identifiers: tuple[str, ...] = ()
     daily_login: bool = False
+    optional: tuple[str, ...] = ()  # credential fields that may be left empty
 
 
 SPECS: dict[str, BrokerSpec] = {
     "paper": BrokerSpec(None, PaperOptions),
-    "fyers": BrokerSpec(FyersCredentials, FyersOptions, identifiers=("client_id",), daily_login=True),
+    "fyers": BrokerSpec(FyersCredentials, FyersOptions, identifiers=("client_id", "fy_id"), daily_login=True,
+                        optional=AUTO_LOGIN_FIELDS),
     "zerodha": BrokerSpec(ZerodhaCredentials, ZerodhaOptions, identifiers=("api_key",), daily_login=True),
 }
 

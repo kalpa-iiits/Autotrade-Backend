@@ -118,6 +118,13 @@ page), up to `AUTOTRADE_MAX_ACCOUNTS_PER_USER` (10). Each has a label unique to 
   Register **one redirect URL per broker for all accounts** on your broker app:
   `http://<server>/auth/fyers/callback` (also `AUTOTRADE_FYERS_REDIRECT_URI`) or
   `http://<server>/auth/zerodha/callback`. The login's `state` says which account it was for.
+- **Fyers auto-login** (optional): add the account's Fyers user id (`fy_id`), 4-digit login
+  `pin` and `totp_secret` (the key shown when you enable external 2FA / TOTP on Fyers) to its
+  credentials, all three or none. Every day at `AUTOTRADE_FYERS_AUTO_LOGIN_TIME` (IST, default
+  `08:45`; empty turns it off) the server logs those accounts in without a browser, retrying
+  twice, and again at startup if it comes up later with no token for today.
+  `POST /api/accounts/{id}/auto-login` runs it now. It uses Fyers' web-login endpoints, which
+  are not part of the documented API and may change; the browser login keeps working either way.
 - **Deleting** an account wipes its credentials and token and disconnects it; its order and
   trade history stays yours. Stop its strategies first (they're archived).
 - **Isolation.** Another user's account id gets the same 404 as one that doesn't exist, on
@@ -400,6 +407,7 @@ credentials key on the server.
 | | `GET/PATCH/DELETE /api/accounts/{id}` | `connection` holds its live status |
 | | `GET /api/accounts/{id}/broker-login?redirect=false` | `{url}`: send the browser there |
 | | `POST /api/accounts/{id}/access-token` `{access_token}`, `/broker-logout`, `/reconnect` | |
+| | `POST /api/accounts/{id}/auto-login` | Fyers: log in now with the stored PIN + TOTP |
 | **Market** | `GET /api/accounts/{id}/market/quotes?symbols=A,B` | `{symbol: last price}` |
 | | `GET /api/accounts/{id}/market/candles?symbol=&resolution=1\|D&start=&end=` | OHLCV for charts |
 | | `WS /api/accounts/{id}/ws/tickers` | `subscribe` / `unsubscribe`, pushes `tick` |

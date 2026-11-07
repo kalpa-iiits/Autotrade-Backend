@@ -90,7 +90,8 @@ def test_api_never_returns_secrets(client):
                  client.get("/api/accounts", headers=AUTH).json()):
         assert "super-secret-value" not in str(body) and "XB12345-100" not in str(body)
     creds = created.json()["credentials"]
-    assert creds == {"client_id": "XB12…00", "secret_key": "set"}  # masked id, secret only "set"
+    # masked id, secret only "set", optional auto-login details not given
+    assert creds == {"client_id": "XB12…00", "secret_key": "set", "fy_id": None, "pin": None, "totp_secret": None}
 
 
 def test_no_key_no_real_broker_credentials(client, monkeypatch):
@@ -260,7 +261,8 @@ def test_accounts_survive_restart(client):
 
 def test_supported_brokers(client):
     body = client.get("/api/accounts/brokers", headers=AUTH).json()
-    assert body["fyers"]["credentials"] == ["client_id", "secret_key"]
+    assert body["fyers"]["credentials"] == ["client_id", "secret_key", "fy_id", "pin", "totp_secret"]
+    assert body["fyers"]["optional_credentials"] == ["fy_id", "pin", "totp_secret"]
     assert body["zerodha"]["credentials"] == ["api_key", "api_secret"] and body["paper"]["credentials"] == []
 
 

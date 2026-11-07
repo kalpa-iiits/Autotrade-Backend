@@ -30,7 +30,7 @@ def _context(account_id: int, field: str) -> str:
 
 def _validated(model, data: dict | None, what: str) -> dict:
     try:
-        return model(**(data or {})).model_dump(mode="json")
+        return model(**(data or {})).model_dump(mode="json", exclude_none=True)
     except ValidationError as e:
         problems = "; ".join(f"{'.'.join(map(str, err['loc'])) or what}: {err['msg']}" for err in e.errors())
         raise AccountError(f"Invalid {what}: {problems}") from None
