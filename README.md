@@ -256,7 +256,7 @@ python -m app.auth.users token <username> [name]   # a personal API token (shown
 
 - **App login.** Everything except `/login` and `/health` needs a signed-in session. Users
   live in the `users` table (see above). The session is a signed, HttpOnly, SameSite=Lax cookie
-  that lasts `AUTOTRADE_SESSION_MAX_AGE` (12 h). Five failed logins from one IP lock that IP out
+  that lasts `AUTOTRADE_SESSION_MAX_AGE` (30 days). Five failed logins from one IP lock that IP out
   for 5 minutes, even across restarts. Changing a password or disabling a user signs out their
   existing sessions. WebSockets use the same cookie and reject pages from other
   origins. Behind HTTPS, set `AUTOTRADE_SECURE_COOKIES=true`.

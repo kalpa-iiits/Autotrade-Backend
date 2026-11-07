@@ -23,7 +23,7 @@ class Settings(BaseSettings):
     #   python -m app.auth.users create <username>
     # Signs session cookies. If empty, a random one is made at startup (logins end on restart).
     session_secret: str = ""
-    session_max_age: int = 12 * 60 * 60  # seconds a login lasts
+    session_max_age: int = 30 * 24 * 60 * 60  # seconds a login lasts (30 days)
     # Set true when serving over HTTPS so the session cookie is never sent over plain HTTP.
     secure_cookies: bool = False
     # Anyone may create an account with POST /api/auth/signup. Off: users are created with
