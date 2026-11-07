@@ -46,7 +46,7 @@ class AccessToken(BaseModel):
 def _errors(e: Exception) -> HTTPException:
     if isinstance(e, VaultError):
         return HTTPException(status.HTTP_503_SERVICE_UNAVAILABLE, str(e))
-    return HTTPException(status.HTTP_422_UNPROCESSABLE_ENTITY, str(e))
+    return HTTPException(status.HTTP_422_UNPROCESSABLE_CONTENT, str(e))
 
 
 def _view(request: Request, account: BrokerAccount) -> dict:
@@ -117,7 +117,7 @@ async def delete_account(request: Request, account: BrokerAccount = Depends(owne
 async def paste_access_token(request: Request, body: AccessToken, account: BrokerAccount = Depends(owned_account)):
     """Use an access token generated elsewhere for today, instead of the broker login."""
     if not SPECS[account.broker].daily_login:
-        raise HTTPException(status.HTTP_422_UNPROCESSABLE_ENTITY, f"{account.broker} accounts don't use tokens")
+        raise HTTPException(status.HTTP_422_UNPROCESSABLE_CONTENT, f"{account.broker} accounts don't use tokens")
     try:
         await store.save_token(account.id, body.access_token.strip())
     except VaultError as e:

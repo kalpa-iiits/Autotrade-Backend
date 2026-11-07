@@ -60,7 +60,7 @@ async def quotes(
     """Last traded price per symbol: {"NSE:SBIN-EQ": 812.3, ...}. Unknown symbols are left out."""
     wanted = [s.strip() for s in symbols.split(",") if s.strip()]
     if not wanted or len(wanted) > 50:
-        raise HTTPException(status.HTTP_422_UNPROCESSABLE_ENTITY, "Give 1 to 50 symbols")
+        raise HTTPException(status.HTTP_422_UNPROCESSABLE_CONTENT, "Give 1 to 50 symbols")
     async with broker_errors():
         return await broker_or_503(runtime.service).get_quotes(wanted)
 
@@ -77,9 +77,9 @@ async def candles(
     end = end or datetime.now(IST).date()
     start = start or end - timedelta(days=5 if resolution == "1" else 365)
     if start > end:
-        raise HTTPException(status.HTTP_422_UNPROCESSABLE_ENTITY, "start is after end")
+        raise HTTPException(status.HTTP_422_UNPROCESSABLE_CONTENT, "start is after end")
     if (end - start).days > MAX_DAYS[resolution]:
-        raise HTTPException(status.HTTP_422_UNPROCESSABLE_ENTITY,
+        raise HTTPException(status.HTTP_422_UNPROCESSABLE_CONTENT,
                             f"At most {MAX_DAYS[resolution]} days for resolution {resolution}")
     async with broker_errors():
         rows = await broker_or_503(runtime.service).get_history(symbol, resolution, start, end)

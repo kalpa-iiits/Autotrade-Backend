@@ -26,6 +26,6 @@ async def broker_errors():
     except BrokerNotConnected as e:
         raise HTTPException(status.HTTP_503_SERVICE_UNAVAILABLE, str(e))
     except OrderError as e:
-        raise HTTPException(status.HTTP_422_UNPROCESSABLE_ENTITY, str(e))
+        raise HTTPException(status.HTTP_422_UNPROCESSABLE_CONTENT, str(e))
     except Exception as e:
         raise HTTPException(status.HTTP_502_BAD_GATEWAY, f"Broker error: {e}")

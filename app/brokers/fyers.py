@@ -16,7 +16,7 @@ from zoneinfo import ZoneInfo
 
 import httpx
 
-from app.brokers._fyers_compat import install_pkg_resources_bridge
+from app.brokers._fyers_compat import install_pkg_resources_bridge, prepare_order_socket_close
 
 install_pkg_resources_bridge()
 
@@ -271,13 +271,14 @@ class FyersBroker(Broker):
 
     async def stop(self) -> None:
         # Close each socket on its own: an SDK error on one must not leave the other running.
-        # (FyersOrderSocket.close_connection joins a thread that only exists if the SDK's
-        # keep_running() was called, so it raises AttributeError after the socket is closed.)
+        if self._order_socket is not None:
+            prepare_order_socket_close(self._order_socket)
         for sock in (self._data_socket, self._order_socket):
             if sock is None:
                 continue
             try:
-                await asyncio.to_thread(sock.close_connection)
+                # Bounded: a stuck SDK thread must never hang server shutdown.
+                await asyncio.wait_for(asyncio.to_thread(sock.close_connection), timeout=10)
             except Exception:
                 log.warning("Error while closing %s", type(sock).__name__, exc_info=True)
         self._data_socket = self._order_socket = None

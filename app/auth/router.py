@@ -116,7 +116,7 @@ async def broker_login(request: Request, redirect: bool = True, account: BrokerA
         login_url = KiteConnect(api_key=creds["api_key"]).login_url()
         url = f"{login_url}&{urlencode({'redirect_params': urlencode({'state': _start_login(request, account)})})}"
     else:
-        raise HTTPException(status.HTTP_422_UNPROCESSABLE_ENTITY, f"{account.broker} accounts need no login")
+        raise HTTPException(status.HTTP_422_UNPROCESSABLE_CONTENT, f"{account.broker} accounts need no login")
     return RedirectResponse(url) if redirect else {"url": url}
 
 

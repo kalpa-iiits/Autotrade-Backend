@@ -71,17 +71,17 @@ def _sizing(body: Sizing, current: StrategyInstance | None, limits: dict, dep: D
     against the strategy's limits."""
     mode = body.size_mode or (current.size_mode if current else "fixed")
     if mode == "capital" and dep is not None and not dep.strategy.capital_sizing:
-        raise HTTPException(status.HTTP_422_UNPROCESSABLE_ENTITY,
+        raise HTTPException(status.HTTP_422_UNPROCESSABLE_CONTENT,
                             "This strategy is sized by fixed quantity only (it trades option lots)")
     fields = body.model_fields_set
     fixed = body.fixed_quantity if "fixed_quantity" in fields else (current.fixed_quantity if current else None)
     capital = body.capital_per_trade if "capital_per_trade" in fields else (current.capital_per_trade if current else None)
     cap = min(limits["max_order_qty"], limits["max_position"])
     if mode == "fixed" and fixed is not None and fixed > cap:
-        raise HTTPException(status.HTTP_422_UNPROCESSABLE_ENTITY,
+        raise HTTPException(status.HTTP_422_UNPROCESSABLE_CONTENT,
                             f"This strategy allows at most {cap} units per trade")
     if mode == "capital" and not capital:
-        raise HTTPException(status.HTTP_422_UNPROCESSABLE_ENTITY, "Capital sizing needs an amount per trade")
+        raise HTTPException(status.HTTP_422_UNPROCESSABLE_CONTENT, "Capital sizing needs an amount per trade")
     return {"size_mode": mode, "fixed_quantity": fixed, "capital_per_trade": capital}
 
 
@@ -131,7 +131,7 @@ def _check_timeframe(runner: StrategyRunner, deployment_key: str, timeframe: str
     try:
         dep.check_timeframe(timeframe)
     except ValueError as e:
-        raise HTTPException(status.HTTP_422_UNPROCESSABLE_ENTITY, str(e))
+        raise HTTPException(status.HTTP_422_UNPROCESSABLE_CONTENT, str(e))
 
 
 async def _check_symbol(runner: StrategyRunner, account_id: int, symbol: str) -> str | None:
@@ -143,7 +143,7 @@ async def _check_symbol(runner: StrategyRunner, account_id: int, symbol: str) ->
     try:
         await service.broker.get_history(symbol, "D", today - timedelta(days=7), today)
     except OrderError as e:
-        raise HTTPException(status.HTTP_422_UNPROCESSABLE_ENTITY, f"{symbol}: {e}")
+        raise HTTPException(status.HTTP_422_UNPROCESSABLE_CONTENT, f"{symbol}: {e}")
     return None
 
 
@@ -245,7 +245,7 @@ async def _backtest(request: Request, user: User, key: str, account_id: int, sym
         raise HTTPException(status.HTTP_404_NOT_FOUND, "No such broker account")
     _check_timeframe(runner, key, timeframe)
     if size_mode == "fixed" and not quantity:
-        raise HTTPException(status.HTTP_422_UNPROCESSABLE_ENTITY, "A fixed order size needs a quantity")
+        raise HTTPException(status.HTTP_422_UNPROCESSABLE_CONTENT, "A fixed order size needs a quantity")
     fixed = quantity if size_mode == "fixed" else None if size_mode == "pct" else DEPLOYMENT_SIZE
     service = runner.service(account_id)
     if service is None:
@@ -257,7 +257,7 @@ async def _backtest(request: Request, user: User, key: str, account_id: int, sym
             return await runner.backtester.run(account_id, broker, dep, symbol.strip(), timeframe, start, end,
                                                capital, size_pct, fixed)
         except BacktestError as e:
-            raise HTTPException(status.HTTP_422_UNPROCESSABLE_ENTITY, str(e))
+            raise HTTPException(status.HTTP_422_UNPROCESSABLE_CONTENT, str(e))
 
 
 @router.get("/catalog")

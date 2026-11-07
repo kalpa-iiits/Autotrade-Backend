@@ -262,6 +262,8 @@ class StrategyRunner:
         self.accounts = accounts
         self.settings = settings
         self.running: dict[int, RunningInstance] = {}
+        # Taken out of `running` but status not yet saved: drain() must still wait for these.
+        self._stopping: dict[int, RunningInstance] = {}
         self.deployments: dict[str, Deployment] = {}
         self.backtester = Backtester()  # the strategy pages' performance reports
         # (account id, order id) -> instance that placed it. Order ids are only unique per account.
@@ -392,13 +394,19 @@ class StrategyRunner:
     async def stop(self, instance_id: int, status: str = "stopped", error: str | None = None) -> None:
         inst = self.running.pop(instance_id, None)
         if inst is not None:
-            await self._end_worker(inst)
-            if inst.strategy is not None:
-                try:
-                    await inst.strategy.on_stop()
-                except Exception:
-                    log.exception("Strategy %s on_stop failed", instance_id)
-        await self._set_status(instance_id, status, error)
+            self._stopping[instance_id] = inst
+        try:
+            if inst is not None:
+                await self._end_worker(inst)
+                if inst.strategy is not None:
+                    try:
+                        await inst.strategy.on_stop()
+                    except Exception:
+                        log.exception("Strategy %s on_stop failed", instance_id)
+            await self._set_status(instance_id, status, error)
+        finally:
+            if inst is not None and self._stopping.get(instance_id) is inst:
+                del self._stopping[instance_id]
         service = self.service(inst.account_id) if inst is not None else None
         if service is not None and service.connected and inst.symbol not in service.watched_symbols():
             try:
@@ -533,6 +541,11 @@ class StrategyRunner:
         for inst in list(self.running.values()):
             if inst.worker is not None and not inst.worker.done():
                 await inst.ticks.join()
+        # A worker stopping itself after an error keeps its current tick unfinished until the
+        # error status is saved, so joining here waits for that. (An outside stop() has already
+        # emptied the queue, so this returns at once.)
+        for inst in list(self._stopping.values()):
+            await inst.ticks.join()
 
     def health(self) -> dict:
         return {

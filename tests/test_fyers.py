@@ -422,3 +422,32 @@ def test_market_depth_and_modify():
             await broker.modify_order("done", 801.0)
 
     asyncio.run(run())
+
+
+def test_order_socket_closes_without_sdk_attribute_error(tmp_path):
+    """The SDK's close joins threads that don't exist unless keep_running() was called."""
+    import pytest
+    from fyers_apiv3.FyersWebsocket.order_ws import FyersOrderSocket
+
+    from app.brokers._fyers_compat import prepare_order_socket_close
+
+    class FakeWs:
+        closed = False
+
+        def close(self):
+            self.closed = True
+
+    def opened_socket():
+        sock = FyersOrderSocket(access_token="test-app:test-token", write_to_file=False, log_path=str(tmp_path))
+        ws = FakeWs()
+        sock._FyersOrderSocket__ws_object = ws  # as if connected; no real network
+        return sock, ws
+
+    sock, _ = opened_socket()
+    with pytest.raises(AttributeError):  # the bug, as the SDK ships it
+        sock.close_connection()
+
+    sock, ws = opened_socket()
+    prepare_order_socket_close(sock)
+    sock.close_connection()
+    assert ws.closed and sock._FyersOrderSocket__ws_object is None

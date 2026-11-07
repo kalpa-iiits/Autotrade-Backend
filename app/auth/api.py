@@ -80,7 +80,7 @@ async def change_password(request: Request, body: PasswordChange,
     try:
         await set_password(user.username, body.new_password)
     except UserError as e:
-        raise HTTPException(status.HTTP_422_UNPROCESSABLE_ENTITY, str(e))
+        raise HTTPException(status.HTTP_422_UNPROCESSABLE_CONTENT, str(e))
     request.session["pw"] = password_fingerprint(await get_user(user.id))
 
 
@@ -102,7 +102,7 @@ async def signup(request: Request, body: Credentials, response: Response):
     except UserError as e:
         await throttle.record(client, body.username, success=False)
         message = "An account with this email already exists." if "already exists" in str(e) else str(e)
-        raise HTTPException(status.HTTP_422_UNPROCESSABLE_ENTITY, message)
+        raise HTTPException(status.HTTP_422_UNPROCESSABLE_CONTENT, message)
     user = await sign_in(request, email, body.password)
     response.headers["Cache-Control"] = "no-store"
     return _me(user)

@@ -423,6 +423,23 @@ def test_exception_stops_strategy_with_error(deploy):
     assert inst["id"] not in quiet.app.state.strategy_runner.running
 
 
+def test_error_state_is_saved_before_drain_returns(deploy, monkeypatch):
+    """Regression: stop() takes the instance out of `running` before it saves the error, so
+    drain() used to return early whenever the stop was slow (seen as a flaky CI failure)."""
+    async def slow_on_stop(self):
+        await asyncio.sleep(0.2)
+    monkeypatch.setattr(Scripted, "on_stop", slow_on_stop)
+    quiet = deploy(dep("a"))
+    inst = start_strategy(quiet, "a")
+    SCRIPT.append(("raise",))
+    runner = quiet.app.state.strategy_runner
+    run(quiet, runner.on_tick, ACCOUNT, SYM, 100.0)
+    run(quiet, asyncio.sleep, 0.05)  # the worker is now inside stop(), awaiting on_stop
+    run(quiet, runner.drain)
+    got = instance(quiet, inst["id"])
+    assert got["status"] == "error" and "boom" in got["last_error"]
+
+
 def test_clock_events_arrive_without_ticks(deploy, monkeypatch):
     monkeypatch.setattr(settings, "strategy_clock_interval", 0.01)
     quiet = deploy(dep("a"))

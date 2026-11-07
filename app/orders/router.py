@@ -71,7 +71,7 @@ async def place_order(body: OrderCreate, runtime: AccountRuntime = Depends(accou
     try:
         req = PlaceOrder(action="place_order", **body.model_dump())
     except ValidationError as e:
-        raise HTTPException(status.HTTP_422_UNPROCESSABLE_ENTITY, e.errors(include_url=False, include_context=False))
+        raise HTTPException(status.HTTP_422_UNPROCESSABLE_CONTENT, e.errors(include_url=False, include_context=False))
     async with broker_errors():
         return await runtime.service.place_order(req)
 
