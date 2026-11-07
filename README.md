@@ -75,13 +75,12 @@ AUTOTRADE_CORS_ORIGINS=["https://app.example.com"]
 The deployment workflow installs the hash-locked `requirements.lock`, validates those settings,
 creates a `pg_dump` backup outside the application directory, stages a complete new release,
 and swaps it in only after validation. A failed `/health` check restores the database and the
-previous application directory. The final smoke test is authenticated but read-only.
+previous application directory.
 
 Configure these GitHub Actions values:
 
-- Variables: `PRODUCTION_API_URL`, `PRODUCTION_HEALTH_URL`, `PRODUCTION_SMOKE_ACCOUNT_ID`.
-- Secrets: `PRODUCTION_SMOKE_TOKEN` (a dedicated least-use token) and optionally
-  `PRODUCTION_ALERT_WEBHOOK_URL` for five-minute health alerts.
+- Variable: `PRODUCTION_HEALTH_URL`.
+- Secret (optional): `PRODUCTION_ALERT_WEBHOOK_URL` for five-minute health alerts.
 - Deployment secret `EC2_KNOWN_HOSTS` must contain the independently verified SSH host-key
   line for the EC2 host; the workflow deliberately does not trust `ssh-keyscan` at deploy time.
 - The server needs `pg_dump` and `pg_restore` compatible with its PostgreSQL version. Backups

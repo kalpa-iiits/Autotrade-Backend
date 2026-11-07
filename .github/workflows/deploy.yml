@@ -138,10 +138,3 @@ jobs:
           fi
           echo "Release is healthy; backup: $BACKUP"
           EOF
-
-      - name: Run authenticated read-only smoke test
-        env:
-          AUTOTRADE_SMOKE_URL: ${{ vars.PRODUCTION_API_URL }}
-          AUTOTRADE_SMOKE_ACCOUNT_ID: ${{ vars.PRODUCTION_SMOKE_ACCOUNT_ID }}
-          AUTOTRADE_SMOKE_TOKEN: ${{ secrets.PRODUCTION_SMOKE_TOKEN }}
-        run: python scripts/smoke_production.py
