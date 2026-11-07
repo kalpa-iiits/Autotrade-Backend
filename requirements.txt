@@ -10,5 +10,6 @@ itsdangerous>=2.2
 python-multipart>=0.0.9
 sqlalchemy[asyncio]>=2.0
 aiosqlite>=0.20
+asyncpg>=0.29
 alembic>=1.13
 cryptography>=42

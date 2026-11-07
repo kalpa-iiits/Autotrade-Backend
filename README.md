@@ -123,8 +123,20 @@ page), up to `AUTOTRADE_MAX_ACCOUNTS_PER_USER` (10). Each has a label unique to 
 
 ## Database
 
-SQLite at `./autotrade.db` for now (`AUTOTRADE_DATABASE_URL`). Moving to Postgres later is a
-URL change (`postgresql+asyncpg://...`, plus `pip install asyncpg`).
+The database is selected with `AUTOTRADE_DATABASE_URL`. SQLite is the local default; Postgres
+uses an async SQLAlchemy URL such as `postgresql+asyncpg://user:password@host/database`.
+
+To export an existing SQLite database for Postgres/Supabase, stop the app and run:
+
+```bash
+python scripts/export_sqlite_to_postgres.py autotrade.db /tmp/autotrade.sql
+```
+
+Run the resulting SQL against a new, empty Postgres database, compare the table row counts,
+then change `AUTOTRADE_DATABASE_URL`. Keep the original SQLite file as a rollback copy until
+the Postgres-backed app has been verified. For Supabase, the session-pooler URI is generally
+the most portable choice because it works from IPv4-only hosts; replace its `postgresql://`
+prefix with `postgresql+asyncpg://` for this app.
 
 ### Migrations (Alembic)
 
