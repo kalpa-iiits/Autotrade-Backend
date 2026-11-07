@@ -9,6 +9,7 @@ from fastapi.openapi.docs import get_swagger_ui_html
 from fastapi.responses import FileResponse, Response
 from sqlalchemy import text
 from starlette.middleware.sessions import SessionMiddleware
+from starlette.middleware.trustedhost import TrustedHostMiddleware
 
 from app.accounts.registry import AccountRegistry
 from app.accounts.router import router as accounts_router
@@ -21,7 +22,7 @@ from app.auth.router import callback_router
 from app.auth.router import router as broker_login_router
 from app.auth.throttle import LoginThrottle
 from app.core import db
-from app.core.config import obsolete_settings, settings
+from app.core.config import obsolete_settings, production_config_errors, settings
 from app.core.instance_lock import InstanceLock, lock_path
 from app.orders.router import router as orders_router
 from app.strategies import deployments
@@ -47,6 +48,8 @@ async def lifespan(app: FastAPI):
 
 @asynccontextmanager
 async def _services(app: FastAPI):
+    if errors := production_config_errors():
+        raise RuntimeError("Unsafe production configuration:\n- " + "\n- ".join(errors))
     if obsolete := obsolete_settings():
         log.warning("Ignoring settings that no longer exist: %s. Broker credentials now live in "
                     "each user's broker accounts (add them in the app), not in .env.", ", ".join(obsolete))
@@ -99,6 +102,8 @@ app = FastAPI(
     # Docs are served below at /api/docs, behind the login, instead of the public defaults.
     docs_url=None, redoc_url=None, openapi_url=None,
 )
+if settings.environment == "production":
+    app.add_middleware(TrustedHostMiddleware, allowed_hosts=settings.trusted_hosts)
 app.add_middleware(
     SessionMiddleware,
     secret_key=settings.session_secret or secrets.token_urlsafe(32),
@@ -107,6 +112,18 @@ app.add_middleware(
     same_site="lax",  # cookie not sent on cross-site POSTs/WebSockets
     https_only=settings.secure_cookies,
 )
+
+
+@app.middleware("http")
+async def security_headers(request: Request, call_next):
+    response = await call_next(request)
+    response.headers.setdefault("X-Content-Type-Options", "nosniff")
+    response.headers.setdefault("X-Frame-Options", "DENY")
+    response.headers.setdefault("Referrer-Policy", "same-origin")
+    response.headers.setdefault("Permissions-Policy", "camera=(), microphone=(), geolocation=()")
+    if settings.environment == "production":
+        response.headers.setdefault("Strict-Transport-Security", "max-age=31536000; includeSubDomains")
+    return response
 class SettingsCORSMiddleware(CORSMiddleware):
     """CORS for the frontend origins in AUTOTRADE_CORS_ORIGINS (read on each request, the
     same list the WebSocket origin check uses). Lets a frontend on another origin, e.g. a

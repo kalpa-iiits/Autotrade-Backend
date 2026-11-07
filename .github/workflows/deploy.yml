@@ -20,21 +20,31 @@ jobs:
         with:
           python-version: "3.11"
           enable-cache: true
-          cache-dependency-glob: requirements.txt
+          cache-dependency-glob: requirements.lock
 
       - name: Install dependencies
         run: |
           uv venv .venv
-          uv pip install -r requirements.txt
+          uv pip install --no-deps --require-hashes -r requirements.lock
 
       - name: Run tests
         run: .venv/bin/python -m pytest -q
 
+      - name: Audit locked dependencies
+        run: |
+          SITE_PACKAGES=$(.venv/bin/python -c 'import sysconfig; print(sysconfig.get_paths()["purelib"])')
+          uvx pip-audit --path "$SITE_PACKAGES"
+
   deploy:
     needs: test
     runs-on: ubuntu-latest
+    environment: production
+    timeout-minutes: 15
     env:
       APP_DIR: /home/${{ secrets.EC2_USER }}/autotrade_backend
+      NEXT_DIR: /home/${{ secrets.EC2_USER }}/autotrade_backend.next
+      PREVIOUS_DIR: /home/${{ secrets.EC2_USER }}/autotrade_backend.previous
+      BACKUP_DIR: /home/${{ secrets.EC2_USER }}/autotrade_backups
     steps:
       - uses: actions/checkout@v4
 
@@ -43,33 +53,85 @@ jobs:
           mkdir -p ~/.ssh
           echo "${{ secrets.EC2_SSH_KEY }}" > ~/.ssh/deploy_key
           chmod 600 ~/.ssh/deploy_key
-          ssh-keyscan -H "${{ secrets.EC2_HOST }}" >> ~/.ssh/known_hosts
+          echo "${{ secrets.EC2_KNOWN_HOSTS }}" > ~/.ssh/known_hosts
+          chmod 600 ~/.ssh/known_hosts
 
-      # .env, the SQLite database, logs and the venv live only on the server.
-      - name: Upload code
+      - name: Prepare staged release
+        run: |
+          ssh -i ~/.ssh/deploy_key "${{ secrets.EC2_USER }}@${{ secrets.EC2_HOST }}" \
+            "rm -rf '$NEXT_DIR' && mkdir -p '$NEXT_DIR'"
+
+      # Upload into a staging directory. The running release is untouched until its
+      # dependencies, production configuration and database backup have all succeeded.
+      - name: Upload staged code
         run: |
           rsync -az --delete \
             --exclude '.git/' --exclude '.github/' \
             --exclude '.venv/' --exclude '__pycache__/' --exclude '.pytest_cache/' \
-            --exclude '.env' --exclude 'autotrade.db*' --exclude '*.lock' --exclude 'logs/' \
+            --exclude '.env' --exclude 'autotrade.db*' --exclude 'autotrade.lock' --exclude 'logs/' \
             -e "ssh -i ~/.ssh/deploy_key" \
-            ./ "${{ secrets.EC2_USER }}@${{ secrets.EC2_HOST }}:$APP_DIR/"
+            ./ "${{ secrets.EC2_USER }}@${{ secrets.EC2_HOST }}:$NEXT_DIR/"
 
-      # Migrations run on app startup (app/core/db.py), so a restart is enough.
-      - name: Install dependencies and restart
+      - name: Validate, back up, release, and verify
         run: |
-          ssh -i ~/.ssh/deploy_key "${{ secrets.EC2_USER }}@${{ secrets.EC2_HOST }}" "APP_DIR=$APP_DIR bash -s" <<'EOF'
+          ssh -i ~/.ssh/deploy_key "${{ secrets.EC2_USER }}@${{ secrets.EC2_HOST }}" \
+            "APP_DIR=$APP_DIR NEXT_DIR=$NEXT_DIR PREVIOUS_DIR=$PREVIOUS_DIR BACKUP_DIR=$BACKUP_DIR bash -s" <<'EOF'
           set -euo pipefail
           export PATH="$HOME/.local/bin:$PATH"
-          cd "$APP_DIR"
-          [ -d .venv ] || uv venv .venv --python 3.11
-          uv pip install --python .venv/bin/python -r requirements.txt
-          sudo systemctl restart autotrade
+          cp "$APP_DIR/.env" "$NEXT_DIR/.env"
+          chmod 600 "$NEXT_DIR/.env"
+          cd "$NEXT_DIR"
+          uv venv .venv --python 3.11
+          uv pip install --no-deps --require-hashes --python .venv/bin/python -r requirements.lock
+          .venv/bin/python -m app.core.preflight
+          DATABASE_NAME=$(.venv/bin/python -c 'from sqlalchemy.engine import make_url; from app.core.config import settings; print(make_url(settings.database_url).database)')
+          PUBLIC_HOST=$(.venv/bin/python -c 'from app.core.config import settings; print(settings.trusted_hosts[0])')
+
+          # Freeze application writes before the backup so an automatic rollback cannot lose
+          # orders accepted between a live backup and the release swap.
+          sudo systemctl stop autotrade
+          if ! BACKUP=$(.venv/bin/python -m scripts.backup_database --output-dir "$BACKUP_DIR"); then
+            sudo systemctl start autotrade
+            exit 1
+          fi
+          if ! rm -rf "$PREVIOUS_DIR" || ! mv "$APP_DIR" "$PREVIOUS_DIR"; then
+            sudo systemctl start autotrade
+            exit 1
+          fi
+          if ! mv "$NEXT_DIR" "$APP_DIR"; then
+            mv "$PREVIOUS_DIR" "$APP_DIR"
+            sudo systemctl start autotrade
+            exit 1
+          fi
+          sudo systemctl start autotrade
+
+          healthy=false
           for i in $(seq 1 20); do
-            if curl -fsS -o /dev/null http://127.0.0.1:8000/; then echo "App is up"; exit 0; fi
+            if curl -fsS -H "Host: $PUBLIC_HOST" http://127.0.0.1:8000/health \
+              | "$APP_DIR/.venv/bin/python" -c 'import json,sys; assert json.load(sys.stdin)["status"] == "ok"'; then
+              healthy=true
+              break
+            fi
             sleep 2
           done
-          echo "App did not come up" >&2
-          sudo journalctl -u autotrade -n 50 --no-pager >&2
-          exit 1
+          if [ "$healthy" != true ]; then
+            echo "Release failed its health check; restoring database and previous release" >&2
+            sudo systemctl stop autotrade || true
+            cd "$APP_DIR"
+            .venv/bin/python -m scripts.restore_database "$BACKUP" --confirm-database "$DATABASE_NAME"
+            rm -rf "$NEXT_DIR.failed"
+            mv "$APP_DIR" "$NEXT_DIR.failed"
+            mv "$PREVIOUS_DIR" "$APP_DIR"
+            sudo systemctl start autotrade
+            sudo journalctl -u autotrade -n 50 --no-pager >&2
+            exit 1
+          fi
+          echo "Release is healthy; backup: $BACKUP"
           EOF
+
+      - name: Run authenticated read-only smoke test
+        env:
+          AUTOTRADE_SMOKE_URL: ${{ vars.PRODUCTION_API_URL }}
+          AUTOTRADE_SMOKE_ACCOUNT_ID: ${{ vars.PRODUCTION_SMOKE_ACCOUNT_ID }}
+          AUTOTRADE_SMOKE_TOKEN: ${{ secrets.PRODUCTION_SMOKE_TOKEN }}
+        run: python scripts/smoke_production.py

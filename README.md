@@ -28,7 +28,7 @@ Brokers (each account is one of these):
 ```bash
 uv venv .venv --python 3.11        # or: python3 -m venv .venv
 source .venv/bin/activate
-uv pip install -r requirements.txt  # or: pip install -r requirements.txt
+uv pip install --no-deps --require-hashes -r requirements.lock
 cp .env.example .env
 python -c "import secrets; print(secrets.token_urlsafe(32))"   # -> AUTOTRADE_SESSION_SECRET
 python -m app.accounts.vault generate-key                        # -> AUTOTRADE_CREDENTIALS_KEY
@@ -53,6 +53,43 @@ Run **one** server process (no `--workers 2`): strategies, the broker connection
 de-duplication live in it, so a second process would place every order twice. The server
 holds a lock file while it runs (next to the SQLite file, or `AUTOTRADE_LOCK_FILE`) and a
 second one refuses to start.
+
+## Production release checklist
+
+Production mode is fail-closed. Set all of these in the server's owner-only `.env` before a
+release; `python -m app.core.preflight` prints only setting names, never secret values:
+
+```dotenv
+AUTOTRADE_ENVIRONMENT=production
+AUTOTRADE_DATABASE_URL=postgresql+asyncpg://...
+AUTOTRADE_SESSION_SECRET=<at-least-32-random-characters>
+AUTOTRADE_CREDENTIALS_KEY=<vault-key>
+AUTOTRADE_SECURE_COOKIES=true
+AUTOTRADE_ENABLE_DOCS=false
+AUTOTRADE_TRUSTED_HOSTS=["trade.example.com"]
+AUTOTRADE_FYERS_REDIRECT_URI=https://trade.example.com/auth/fyers/callback
+AUTOTRADE_FRONTEND_URL=https://app.example.com/accounts
+AUTOTRADE_CORS_ORIGINS=["https://app.example.com"]
+```
+
+The deployment workflow installs the hash-locked `requirements.lock`, validates those settings,
+creates a `pg_dump` backup outside the application directory, stages a complete new release,
+and swaps it in only after validation. A failed `/health` check restores the database and the
+previous application directory. The final smoke test is authenticated but read-only.
+
+Configure these GitHub Actions values:
+
+- Variables: `PRODUCTION_API_URL`, `PRODUCTION_HEALTH_URL`, `PRODUCTION_SMOKE_ACCOUNT_ID`.
+- Secrets: `PRODUCTION_SMOKE_TOKEN` (a dedicated least-use token) and optionally
+  `PRODUCTION_ALERT_WEBHOOK_URL` for five-minute health alerts.
+- Deployment secret `EC2_KNOWN_HOSTS` must contain the independently verified SSH host-key
+  line for the EC2 host; the workflow deliberately does not trust `ssh-keyscan` at deploy time.
+- The server needs `pg_dump` and `pg_restore` compatible with its PostgreSQL version. Backups
+  are written to `~/autotrade_backups`; apply an encrypted off-host retention policy there.
+
+Direct Python dependencies are maintained in `requirements.in`. Regenerate the lockfile with
+`uv pip compile requirements.in -o requirements.lock --override requirements-overrides.txt --generate-hashes --python-version 3.11`,
+review the diff, then run the entire test suite.
 
 ## Broker accounts and credentials
 

@@ -1,5 +1,7 @@
+import base64
 import os
 from pathlib import Path
+from typing import Literal
 
 from pydantic import Field
 from pydantic_settings import BaseSettings, SettingsConfigDict
@@ -12,6 +14,7 @@ class Settings(BaseSettings):
     model_config = SettingsConfigDict(env_file=".env", env_prefix=ENV_PREFIX, extra="ignore")
 
     app_name: str = "AutoTrade"
+    environment: Literal["development", "test", "production"] = "development"
 
     # SQLite for now; any SQLAlchemy async URL works later (e.g. postgresql+asyncpg://...).
     database_url: str = "sqlite+aiosqlite:///./autotrade.db"
@@ -31,6 +34,8 @@ class Settings(BaseSettings):
     # Browser origins of a separately hosted frontend, e.g. ["http://localhost:5173"]
     # (JSON list in .env). Allowed for CORS with credentials and for WebSocket connections.
     cors_origins: list[str] = []
+    # Host names accepted by the production API (without scheme or path).
+    trusted_hosts: list[str] = []
     # Where to send the browser after a broker login, e.g. "http://localhost:5173/settings".
     # Empty: show a small "login successful" page instead.
     frontend_url: str = ""
@@ -105,3 +110,34 @@ def obsolete_settings(env_file: str = ".env") -> list[str]:
 
 
 settings = Settings()
+
+
+def production_config_errors(value: Settings = settings) -> list[str]:
+    """Return unsafe/missing production settings without exposing their values."""
+    if value.environment != "production":
+        return []
+    errors: list[str] = []
+    if len(value.session_secret) < 32:
+        errors.append("AUTOTRADE_SESSION_SECRET must contain at least 32 characters")
+    if not value.secure_cookies:
+        errors.append("AUTOTRADE_SECURE_COOKIES must be true")
+    try:
+        key = base64.b64decode(value.credentials_key + "=" * (-len(value.credentials_key) % 4),
+                               altchars=b"-_", validate=True)
+    except (ValueError, TypeError):
+        key = b""
+    if len(key) != 32:
+        errors.append("AUTOTRADE_CREDENTIALS_KEY must be a valid generated 32-byte key")
+    if not value.database_url.startswith(("postgresql+asyncpg://", "postgres+asyncpg://")):
+        errors.append("AUTOTRADE_DATABASE_URL must use PostgreSQL with asyncpg")
+    if not value.trusted_hosts:
+        errors.append("AUTOTRADE_TRUSTED_HOSTS must contain the public API host")
+    if value.enable_docs:
+        errors.append("AUTOTRADE_ENABLE_DOCS must be false")
+    if not value.fyers_redirect_uri.startswith("https://"):
+        errors.append("AUTOTRADE_FYERS_REDIRECT_URI must use HTTPS")
+    if value.frontend_url and not value.frontend_url.startswith("https://"):
+        errors.append("AUTOTRADE_FRONTEND_URL must use HTTPS")
+    if any(not origin.startswith("https://") for origin in value.cors_origins):
+        errors.append("every AUTOTRADE_CORS_ORIGINS entry must use HTTPS")
+    return errors

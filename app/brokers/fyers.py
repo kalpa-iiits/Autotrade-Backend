@@ -16,6 +16,10 @@ from zoneinfo import ZoneInfo
 
 import httpx
 
+from app.brokers._fyers_compat import install_pkg_resources_bridge
+
+install_pkg_resources_bridge()
+
 from fyers_apiv3 import fyersModel
 from fyers_apiv3.FyersWebsocket import data_ws, order_ws
 
