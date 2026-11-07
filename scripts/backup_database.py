@@ -14,7 +14,9 @@ from app.core.config import settings
 
 
 def _postgres_args(url):
-    args = ["pg_dump", "--format=custom", "--no-owner"]
+    # Only the app's own schema: on managed Postgres (Supabase) a whole-database dump includes
+    # provider-owned objects (event triggers, auth/storage schemas) that a restore cannot drop.
+    args = ["pg_dump", "--format=custom", "--no-owner", "--schema=public"]
     if url.host:
         args += ["--host", url.host]
     if url.port:

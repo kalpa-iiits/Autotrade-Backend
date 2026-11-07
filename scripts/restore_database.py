@@ -5,12 +5,21 @@ import os
 import shutil
 import sqlite3
 import subprocess
+import tempfile
 from pathlib import Path
 
 from sqlalchemy.engine import make_url
 
 from app.core.config import settings
 from scripts.backup_database import _postgres_args
+
+
+def _is_schema_entry(line: str) -> bool:
+    """TOC lines for the schema itself (SCHEMA, COMMENT ON SCHEMA, its ACL), e.g.
+    '3; 2615 2200 SCHEMA - public pg_database_owner'."""
+    fields = line.split(";", 1)[-1].split()
+    return not line.startswith(";") and len(fields) >= 3 and (
+        fields[2] == "SCHEMA" or (fields[2] in ("COMMENT", "ACL") and fields[3:5] == ["-", "SCHEMA"]))
 
 
 def restore(source: Path, confirmed_database: str) -> None:
@@ -28,8 +37,19 @@ def restore(source: Path, confirmed_database: str) -> None:
         env.setdefault("PGSSLMODE", "require")
         command = [arg.replace("pg_dump", "pg_restore") for arg in _postgres_args(url)]
         command.remove("--format=custom")
-        command += ["--clean", "--if-exists", "--exit-on-error", str(source)]
-        subprocess.run(command, check=True, env=env)
+        # Restore the app's objects only, never the schema itself: with --clean the schema
+        # entry would DROP SCHEMA public, which on managed Postgres also drops provider grants.
+        toc = subprocess.run(["pg_restore", "--list", str(source)], check=True, env=env,
+                             capture_output=True, text=True).stdout
+        entries = [line for line in toc.splitlines() if not _is_schema_entry(line)]
+        with tempfile.NamedTemporaryFile("w", suffix=".list", delete=False) as listing:
+            listing.write("\n".join(entries) + "\n")
+        try:
+            command += ["--clean", "--if-exists", "--exit-on-error",
+                        "--use-list", listing.name, str(source)]
+            subprocess.run(command, check=True, env=env)
+        finally:
+            os.unlink(listing.name)
     elif url.get_backend_name() == "sqlite":
         destination = Path(url.database).resolve()
         temporary = destination.with_suffix(destination.suffix + ".restore")

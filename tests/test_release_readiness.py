@@ -81,3 +81,22 @@ def test_external_health_check(monkeypatch):
 
     monkeypatch.setattr(check_health.urllib.request, "urlopen", lambda *_args, **_kwargs: Response())
     assert check_health.check("https://trade.example.com/health")["status"] == "ok"
+
+
+def test_restore_skips_schema_level_entries():
+    from scripts.restore_database import _is_schema_entry
+
+    skipped = [
+        "3; 2615 2200 SCHEMA - public pg_database_owner",
+        "4; 0 0 COMMENT - SCHEMA public pg_database_owner",
+        "5; 0 0 ACL - SCHEMA public pg_database_owner",
+    ]
+    kept = [
+        "; Archive created at 2026-11-07 07:43:44 UTC",
+        "220; 1259 17000 TABLE public orders postgres",
+        "221; 0 0 ACL public TABLE orders postgres",
+        "3400; 0 17000 TABLE DATA public orders postgres",
+        "230; 1259 17010 SEQUENCE public positions_id_seq postgres",
+    ]
+    assert all(_is_schema_entry(line) for line in skipped)
+    assert not any(_is_schema_entry(line) for line in kept)

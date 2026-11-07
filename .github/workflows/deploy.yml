@@ -81,7 +81,9 @@ jobs:
           cp "$APP_DIR/.env" "$NEXT_DIR/.env"
           chmod 600 "$NEXT_DIR/.env"
           cd "$NEXT_DIR"
-          uv venv .venv --python 3.11
+          # Relocatable: this directory is renamed to $APP_DIR below, and a normal venv's
+          # entry points (e.g. the uvicorn systemd runs) hard-code their original path.
+          uv venv .venv --python 3.11 --relocatable
           uv pip install --no-deps --require-hashes --python .venv/bin/python -r requirements.lock
           .venv/bin/python -m app.core.preflight
           DATABASE_NAME=$(.venv/bin/python -c 'from sqlalchemy.engine import make_url; from app.core.config import settings; print(make_url(settings.database_url).database)')
@@ -117,13 +119,21 @@ jobs:
           if [ "$healthy" != true ]; then
             echo "Release failed its health check; restoring database and previous release" >&2
             sudo systemctl stop autotrade || true
+            sudo journalctl -u autotrade -n 50 --no-pager >&2 || true
             cd "$APP_DIR"
-            .venv/bin/python -m scripts.restore_database "$BACKUP" --confirm-database "$DATABASE_NAME"
+            # A failed database restore must not leave production stopped: always put the
+            # previous release back and start it, then report the restore failure loudly.
+            restore_failed=false
+            .venv/bin/python -m scripts.restore_database "$BACKUP" --confirm-database "$DATABASE_NAME" \
+              || restore_failed=true
+            cd "$HOME"
             rm -rf "$NEXT_DIR.failed"
             mv "$APP_DIR" "$NEXT_DIR.failed"
             mv "$PREVIOUS_DIR" "$APP_DIR"
             sudo systemctl start autotrade
-            sudo journalctl -u autotrade -n 50 --no-pager >&2
+            if [ "$restore_failed" = true ]; then
+              echo "DATABASE RESTORE FAILED; previous release restarted on the current database. Backup: $BACKUP" >&2
+            fi
             exit 1
           fi
           echo "Release is healthy; backup: $BACKUP"
