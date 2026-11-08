@@ -11,6 +11,7 @@ from app.brokers import Broker, MissingCredentials, OrderError
 from app.brokers.base import OrderListener, TickListener
 from app.core.config import Settings
 from app.core.db import utcnow
+from app.core.market import in_market_hours
 from app.core.ratelimit import RateLimiter
 from app.orders.history import find_by_client_order_id, recorded_states
 from app.orders.schemas import Order, OrderStatus, PlaceOrder, moves_backwards, new_client_order_id
@@ -167,9 +168,15 @@ class BrokerService:
             return replayed
 
     async def _resync_loop(self) -> None:
+        was_open = in_market_hours()
         while True:
             await asyncio.sleep(self.settings.resync_interval)
-            await self.resync()
+            is_open = in_market_hours()
+            # Outside market hours nothing changes at the broker; check once more just after
+            # the close to pick up the broker's end-of-day square-offs, then wait.
+            if is_open or was_open:
+                await self.resync()
+            was_open = is_open
 
     def health(self) -> dict:
         return {

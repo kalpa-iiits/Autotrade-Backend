@@ -42,6 +42,7 @@ from app.core import db
 from app.core.broker_service import BrokerService
 from app.core.config import Settings
 from app.core.db import utcnow
+from app.core.market import in_market_hours, seconds_until_market_hours
 from app.orders.models import OrderRecord
 from app.orders.schemas import Order, OrderStatus, OrderType, PlaceOrder, Side
 from app.strategies.backtest import Backtester
@@ -299,6 +300,7 @@ class StrategyRunner:
         self._retries: dict[int, tuple[float, float]] = {}  # instance id -> (next try, delay)
         self._retry_wake = asyncio.Event()
         self._retry_task: asyncio.Task | None = None
+        self._retry_forced = False  # retry_now: try even outside market hours
 
     def service(self, account_id: int) -> BrokerService | None:
         runtime = self.accounts.get(account_id)
@@ -480,6 +482,8 @@ class StrategyRunner:
         """Periodically prove that every real-broker strategy still matches broker truth."""
         while True:
             await asyncio.sleep(self.settings.strategy_reconcile_interval)
+            if not in_market_hours():
+                continue  # positions and orders can't change: don't spend the broker's API quota
             try:
                 await self._reconcile_running()
             except Exception:
@@ -559,6 +563,7 @@ class StrategyRunner:
             return
         now = asyncio.get_running_loop().time()
         self._retries = {i: (now, delay) for i, (_, delay) in self._retries.items()}
+        self._retry_forced = True  # e.g. the 08:45 login: resume before the market opens
         self._retry_wake.set()
 
     async def _retry_loop(self) -> None:
@@ -567,6 +572,13 @@ class StrategyRunner:
             self._retry_wake.clear()
             now = loop.time()
             due = [i for i, (at, _) in self._retries.items() if at <= now]
+            if due and not self._retry_forced and not in_market_hours():
+                # Every retry costs broker calls. Wait for the market (or a reconnect).
+                later = now + seconds_until_market_hours()
+                for instance_id in due:
+                    self._retries[instance_id] = (later, self._retries[instance_id][1])
+                due = []
+            self._retry_forced = False
             for instance_id in due:
                 try:
                     await self._retry_one(instance_id)

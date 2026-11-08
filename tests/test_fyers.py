@@ -646,3 +646,25 @@ def test_order_book_checked_often_while_order_socket_is_down_then_backs_off(monk
         await broker.stop()
 
     asyncio.run(run())
+
+
+def test_no_fast_order_book_checks_after_market_hours(monkeypatch):
+    import app.brokers.fyers as fyers_mod
+    monkeypatch.setattr(fyers_mod, "in_market_hours", lambda: False)
+
+    async def run():
+        broker = make_flaky_broker()
+        resyncs = []
+
+        async def on_reconnect():
+            resyncs.append(1)
+
+        broker.on_reconnect(on_reconnect)
+        await broker.start()
+        _, order_sock = FakeSocket.instances
+        order_sock.up = False  # Fyers dropped the socket overnight
+        await asyncio.sleep(0.2)
+        assert resyncs == []
+        await broker.stop()
+
+    asyncio.run(run())

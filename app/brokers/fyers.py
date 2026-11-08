@@ -25,6 +25,7 @@ from fyers_apiv3 import fyersModel
 from fyers_apiv3.FyersWebsocket import data_ws, order_ws
 
 from app.brokers.base import Broker, Candle, Depth, Instrument, MissingCredentials, OptionContract, OrderError, Resolution
+from app.core.market import in_market_hours
 from app.orders.schemas import (
     Order,
     OrderStatus,
@@ -355,7 +356,7 @@ class FyersBroker(Broker):
                 down[which] += 1
                 if which == "order":
                     self._order_resync_due = True
-                    if down[which] <= SOCKET_FAST_RESYNC_CHECKS:
+                    if down[which] <= SOCKET_FAST_RESYNC_CHECKS and in_market_hours():
                         self._schedule(self._emit_reconnect())
                 if down[which] < SOCKET_DOWN_CHECKS:
                     continue  # a short miss can be an SDK retry still in flight

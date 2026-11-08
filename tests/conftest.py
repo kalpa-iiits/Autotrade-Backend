@@ -11,6 +11,9 @@ from app.core.config import Settings, settings
 for _name, _field in Settings.model_fields.items():
     setattr(settings, _name, _field.get_default(call_default_factory=True))
 
+# Background broker checks run at any hour in tests (they'd otherwise depend on the clock).
+settings.background_hours = ""
+
 ADMIN_PASSWORD = "correct horse battery"
 settings.credentials_key = generate_key()
 

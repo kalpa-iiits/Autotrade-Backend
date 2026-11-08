@@ -71,6 +71,11 @@ class Settings(BaseSettings):
     lock_file: str = ""
     # Order placements + cancels sent per account per second (Fyers and Kite allow 10).
     broker_orders_per_second: float = 8.0
+    # IST window (weekdays, "HH:MM-HH:MM") in which periodic broker checks run: the order-book
+    # resync, strategy reconciliation and resume retries (app/core/market.py). Outside it
+    # nothing can change at the broker, so the checks would only spend its daily API quota.
+    # Empty = always.
+    background_hours: str = Field("09:00-15:45", pattern=r"^(([01]\d|2[0-3]):[0-5]\d-([01]\d|2[0-3]):[0-5]\d)?$")
     # Seconds between checks of each account's order book against our records (0 = only on
     # (re)connect). Catches order updates a socket never delivered.
     resync_interval: float = 60.0
