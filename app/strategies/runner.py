@@ -79,6 +79,29 @@ class StrategyError(ValueError):
     """A request about strategy instances that can't be done (bad params, not stopped, ...)."""
 
 
+class BrokerUnavailable(StrategyError):
+    """The broker couldn't be checked right now (not connected, a failed call, the ledger
+    behind). Unlike a real mismatch this clears up on its own, so the instance is retried."""
+
+
+# An instance stopped by a temporary broker problem keeps status "error" with this note on its
+# last_error, is retried with backoff (and right after its account reconnects), and is resumed
+# on the next server start too. Stopping it by hand ends the retries.
+RETRY_NOTE = " (retrying automatically)"
+RETRY_FIRST_DELAY = 30.0
+RETRY_MAX_DELAY = 300.0
+
+
+def _retryable(exc: BaseException) -> bool:
+    # A real mismatch or bad state is a StrategyError and stays stopped; anything else that
+    # broke a start (a network error fetching tick sizes, ...) is worth another try.
+    return isinstance(exc, BrokerUnavailable) or not isinstance(exc, StrategyError)
+
+
+def _with_retry_note(message: str) -> str:
+    return message[: 1024 - len(RETRY_NOTE)] + RETRY_NOTE
+
+
 def _today_ist() -> date:
     return datetime.now(IST).date()
 
@@ -272,6 +295,10 @@ class StrategyRunner:
         self._recent_orders: OrderedDict[tuple[int, str], Order] = OrderedDict()
         self._chases: set[asyncio.Task] = set()  # repricing of unfilled option orders
         self._reconcile_task: asyncio.Task | None = None
+        self._start_locks: dict[int, asyncio.Lock] = {}  # a retry and a manual start never overlap
+        self._retries: dict[int, tuple[float, float]] = {}  # instance id -> (next try, delay)
+        self._retry_wake = asyncio.Event()
+        self._retry_task: asyncio.Task | None = None
 
     def service(self, account_id: int) -> BrokerService | None:
         runtime = self.accounts.get(account_id)
@@ -317,16 +344,24 @@ class StrategyRunner:
     async def resume(self) -> None:
         """At startup: restart instances that were running when the server stopped."""
         async with db.session() as s:
-            ids = list(await s.scalars(
-                select(StrategyInstance.id).where(StrategyInstance.status == "running")
-            ))
+            rows = await s.execute(
+                select(StrategyInstance.id, StrategyInstance.status, StrategyInstance.last_error)
+                .where(StrategyInstance.status.in_(("running", "error")))
+            )
+            ids = [i for i, status, error in rows
+                   if status == "running" or (error or "").endswith(RETRY_NOTE)]
         for instance_id in ids:
             try:
                 await self.start(instance_id)
             except Exception as e:
-                await self._set_status(instance_id, "error", f"Could not resume: {e}")
+                await self._start_failed(instance_id, e)
 
     async def start(self, instance_id: int) -> None:
+        async with self._start_locks.setdefault(instance_id, asyncio.Lock()):
+            await self._start(instance_id)
+        self._retries.pop(instance_id, None)
+
+    async def _start(self, instance_id: int) -> None:
         if instance_id in self.running:
             return
         async with db.session() as s:
@@ -351,12 +386,12 @@ class StrategyRunner:
         # checkpoints (stop, direction, etc.) are trusted.
         if service.name != "paper":
             if not service.connected:
-                raise StrategyError(f"Broker not connected: {service.not_connected_reason}")
+                raise BrokerUnavailable(f"Broker not connected: {service.not_connected_reason}")
             await service.resync()
             if service.last_resync_error:
-                raise StrategyError(f"Broker order reconciliation failed: {service.last_resync_error}")
+                raise BrokerUnavailable(f"Broker order reconciliation failed: {service.last_resync_error}")
             if not service.records_reliable():
-                raise StrategyError("Trade ledger has unsaved broker updates")
+                raise BrokerUnavailable("Trade ledger has unsaved broker updates")
             await self._reconcile_broker_state(config, service)
 
         inst = RunningInstance(config, self.settings.strategy_queue_size)
@@ -426,6 +461,10 @@ class StrategyRunner:
         if self._reconcile_task is not None:
             self._reconcile_task.cancel()
             self._reconcile_task = None
+        if self._retry_task is not None:
+            # Waiting instances keep their retry note, so the next start resumes them too.
+            self._retry_task.cancel()
+            self._retry_task = None
         for task in list(self._chases):
             task.cancel()
         for inst in self.running.values():
@@ -458,6 +497,7 @@ class StrategyRunner:
         for account_id, instances in by_account.items():
             service = self.service(account_id)
             failure: str | None = None
+            retry = False
             acquired: list[asyncio.Lock] = []
             try:
                 # Freeze strategy order submission on this account while broker and database
@@ -467,12 +507,12 @@ class StrategyRunner:
                     acquired.append(inst.lock)
                 if service is None or not service.connected:
                     reason = service.not_connected_reason if service else "account unavailable"
-                    raise StrategyError(f"Periodic broker reconciliation unavailable: {reason}")
+                    raise BrokerUnavailable(f"Periodic broker reconciliation unavailable: {reason}")
                 await service.resync()
                 if service.last_resync_error:
-                    raise StrategyError(f"Periodic order reconciliation failed: {service.last_resync_error}")
+                    raise BrokerUnavailable(f"Periodic order reconciliation failed: {service.last_resync_error}")
                 if not service.records_reliable():
-                    raise StrategyError("Trade ledger has unsaved broker updates")
+                    raise BrokerUnavailable("Trade ledger has unsaved broker updates")
                 broker = service.require()
                 snapshot = await asyncio.gather(broker.get_positions(), broker.get_orders())
                 for inst in instances:
@@ -480,6 +520,7 @@ class StrategyRunner:
                         await self._reconcile_broker_state(inst.config, service, snapshot)
             except Exception as exc:
                 failure = f"{type(exc).__name__}: {exc}"
+                retry = _retryable(exc)
             finally:
                 for lock in reversed(acquired):
                     lock.release()
@@ -487,7 +528,75 @@ class StrategyRunner:
             if failure:
                 for inst in instances:
                     if self.running.get(inst.id) is inst:
-                        await self.stop(inst.id, "error", failure)
+                        await self.stop(inst.id, "error", _with_retry_note(failure) if retry else failure)
+                        if retry:
+                            self._schedule_retry(inst.id)
+
+    # ---------- retrying instances stopped by a temporary broker problem ----------
+
+    async def _start_failed(self, instance_id: int, exc: Exception) -> None:
+        message = f"Could not resume: {exc}"
+        if _retryable(exc):
+            log.warning("Strategy %s: %s; will retry", instance_id, message)
+            await self._set_status(instance_id, "error", _with_retry_note(message))
+            self._schedule_retry(instance_id)
+        else:
+            self._retries.pop(instance_id, None)
+            await self._set_status(instance_id, "error", message)
+
+    def _schedule_retry(self, instance_id: int) -> None:
+        loop = asyncio.get_running_loop()
+        previous = self._retries.get(instance_id)
+        delay = RETRY_FIRST_DELAY if previous is None else min(previous[1] * 2, RETRY_MAX_DELAY)
+        self._retries[instance_id] = (loop.time() + delay, delay)
+        if self._retry_task is None or self._retry_task.done():
+            self._retry_task = asyncio.create_task(self._retry_loop(), name="strategy-resume-retry")
+        self._retry_wake.set()
+
+    def retry_now(self) -> None:
+        """An account (re)connected: try every waiting instance now instead of at its next slot."""
+        if not self._retries:
+            return
+        now = asyncio.get_running_loop().time()
+        self._retries = {i: (now, delay) for i, (_, delay) in self._retries.items()}
+        self._retry_wake.set()
+
+    async def _retry_loop(self) -> None:
+        loop = asyncio.get_running_loop()
+        while True:
+            self._retry_wake.clear()
+            now = loop.time()
+            due = [i for i, (at, _) in self._retries.items() if at <= now]
+            for instance_id in due:
+                try:
+                    await self._retry_one(instance_id)
+                except Exception:
+                    log.exception("Strategy %s: resume retry failed", instance_id)
+            if due:
+                continue
+            next_at = min((at for at, _ in self._retries.values()), default=None)
+            timeout = None if next_at is None else max(0.0, next_at - loop.time())
+            try:
+                await asyncio.wait_for(self._retry_wake.wait(), timeout)
+            except asyncio.TimeoutError:
+                pass
+
+    async def _retry_one(self, instance_id: int) -> None:
+        if instance_id in self.running:
+            self._retries.pop(instance_id, None)
+            return
+        async with db.session() as s:
+            row = await s.get(StrategyInstance, instance_id)
+        if row is None or row.status != "error" or not (row.last_error or "").endswith(RETRY_NOTE):
+            self._retries.pop(instance_id, None)  # stopped, started or changed since: leave it
+            return
+        try:
+            await self.start(instance_id)
+        except Exception as e:
+            await self._start_failed(instance_id, e)  # backs off, or stops retrying for good
+        else:
+            log.warning("Strategy %s resumed after a temporary broker problem: %s",
+                        instance_id, row.last_error)
 
     async def _work(self, inst: RunningInstance) -> None:
         """The instance's worker: hands it its ticks one at a time, in order."""
@@ -798,7 +907,7 @@ class StrategyRunner:
             try:
                 positions, orders = await asyncio.gather(broker.get_positions(), broker.get_orders())
             except Exception as exc:
-                raise StrategyError(f"Could not read broker positions/orders: {exc}") from exc
+                raise BrokerUnavailable(f"Could not read broker positions/orders: {exc}") from exc
         else:
             positions, orders = snapshot
 

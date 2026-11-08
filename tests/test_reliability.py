@@ -30,7 +30,7 @@ from app.strategies.runner import StrategyError
 from app.trades.models import Fill
 from tests.conftest import TOKEN, run
 from tests.test_fyers import FakeSocket, make_broker
-from tests.test_strategies import SCRIPT, SYM, deploy, dep, signals, start_strategy, tick  # noqa: F401
+from tests.test_strategies import SCRIPT, SYM, by_key, deploy, dep, signals, start_strategy, tick  # noqa: F401
 from tests.test_zerodha import FakeKite, FakeWS
 
 AUTH = {"Authorization": f"Bearer {TOKEN}"}
@@ -108,6 +108,135 @@ def test_periodic_reconciliation_stops_strategy_on_broker_mismatch(deploy):
     got = c.get(f"/api/strategies/{inst['id']}", headers=AUTH).json()
     assert got["status"] == "error"
     assert "database 1, broker 2" in got["last_error"]
+
+def _status(c, instance_id):
+    return c.get(f"/api/strategies/{instance_id}", headers=AUTH).json()
+
+
+def _wait_running(c, instance_id, running=True, timeout=3.0):
+    runner = c.app.state.strategy_runner
+    deadline = time.monotonic() + timeout
+    while time.monotonic() < deadline:
+        if (instance_id in runner.running) == running:
+            return True
+        time.sleep(0.02)
+    return False
+
+
+def _break_order_book(service, monkeypatch):
+    """Make the broker's order book fail; returns a function that makes it answer again."""
+    original = service.broker.get_orders
+
+    async def down():
+        raise ConnectionError("Fyers unreachable")
+    monkeypatch.setattr(service.broker, "get_orders", down)
+    return lambda: monkeypatch.setattr(service.broker, "get_orders", original)
+
+
+def test_strategy_stopped_by_a_broker_blip_resumes_when_the_broker_is_back(deploy, monkeypatch):
+    c = deploy(dep("blip"))
+    inst = start_strategy(c, "blip")
+    SCRIPT.append(("buy",))
+    tick(c)  # an open position
+    runner = c.app.state.strategy_runner
+    service = c.app.state.accounts.get(1).service
+    service.name = "fyers"  # exercise the real-account gate with the deterministic fake broker
+
+    restore = _break_order_book(service, monkeypatch)
+    run(c, runner._reconcile_running)
+    assert inst["id"] not in runner.running
+    got = _status(c, inst["id"])
+    assert got["status"] == "error" and got["last_error"].endswith("(retrying automatically)")
+
+    restore()  # Fyers answers again
+    run(c, runner.retry_now)  # e.g. the account reconnected
+    assert _wait_running(c, inst["id"])
+    assert _status(c, inst["id"])["status"] == "running"
+    assert runner.running[inst["id"]].position == 1  # resumed holding its position
+
+
+def test_failed_retry_backs_off_and_keeps_trying(deploy, monkeypatch):
+    import app.strategies.runner as runner_mod
+    c = deploy(dep("backoff"))
+    inst = start_strategy(c, "backoff")
+    runner = c.app.state.strategy_runner
+    service = c.app.state.accounts.get(1).service
+    service.name = "fyers"
+    _break_order_book(service, monkeypatch)
+    run(c, runner._reconcile_running)
+
+    first_delay = runner._retries[inst["id"]][1]
+    run(c, runner.retry_now)
+    time.sleep(0.3)  # the retry runs and fails again
+    assert inst["id"] not in runner.running
+    assert runner._retries[inst["id"]][1] == min(first_delay * 2, runner_mod.RETRY_MAX_DELAY)
+    assert _status(c, inst["id"])["last_error"].endswith("(retrying automatically)")
+
+
+def test_real_mismatch_is_not_retried(deploy):
+    c = deploy(dep("mismatch"))
+    inst = start_strategy(c, "mismatch")
+    SCRIPT.append(("buy",))
+    tick(c)
+    runner = c.app.state.strategy_runner
+    service = c.app.state.accounts.get(1).service
+    service.name = "fyers"
+    service.broker.positions[SYM].quantity = 2  # e.g. changed by hand in the Fyers app
+    run(c, runner._reconcile_running)
+    assert inst["id"] not in runner._retries
+    assert not _status(c, inst["id"])["last_error"].endswith("(retrying automatically)")
+
+
+def test_stopping_by_hand_ends_the_retries(deploy, monkeypatch):
+    c = deploy(dep("hand-stop"))
+    inst = start_strategy(c, "hand-stop")
+    runner = c.app.state.strategy_runner
+    service = c.app.state.accounts.get(1).service
+    service.name = "fyers"
+    restore = _break_order_book(service, monkeypatch)
+    run(c, runner._reconcile_running)
+    restore()
+
+    r = c.post(f"/api/strategies/{inst['id']}/stop", headers=AUTH)
+    assert r.status_code == 200, r.text
+    run(c, runner.retry_now)
+    assert not _wait_running(c, inst["id"], timeout=0.5)
+    assert _status(c, inst["id"])["status"] == "stopped"
+    assert inst["id"] not in runner._retries
+
+
+def test_server_start_resumes_an_instance_that_was_waiting_to_retry(deploy):
+    from app.strategies.runner import RETRY_NOTE
+    c = deploy(dep("restart-retry"))
+    inst = start_strategy(c, "restart-retry")
+    runner = c.app.state.strategy_runner
+    run(c, runner.stop, inst["id"], "error", "Could not resume: Broker not connected" + RETRY_NOTE)
+    assert inst["id"] not in runner.running
+
+    run(c, runner.resume)  # what startup does
+    assert inst["id"] in runner.running
+
+
+def test_concurrent_starts_run_one_instance(deploy):
+    c = deploy(dep("double-start"))
+    inst = by_key_id(c, "double-start")
+    runner = c.app.state.strategy_runner
+    created = []
+    original = runner._start
+
+    async def counting(instance_id):
+        before = instance_id in runner.running
+        await original(instance_id)
+        if not before and instance_id in runner.running:
+            created.append(runner.running[instance_id])
+
+    runner._start = counting
+
+    async def both():
+        await asyncio.gather(runner.start(inst), runner.start(inst))
+
+    run(c, both)
+    assert len(created) == 1
 
 def test_resync_applies_updates_the_socket_never_delivered(client, monkeypatch):
     brokers = client.app.state.accounts.get(1).service
@@ -423,3 +552,7 @@ def test_health_reports_components(client):
     detail = client.get("/api/accounts/1", headers=AUTH).json()["connection"]
     assert {"ticks_received", "stream_error", "last_resync_at"} <= set(detail["broker"])
     assert set(detail["websockets"]) == {"orders", "tickers"}
+
+
+def by_key_id(client, key):
+    return by_key(client, key)["id"]

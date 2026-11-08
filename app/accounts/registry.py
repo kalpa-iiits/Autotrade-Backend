@@ -124,6 +124,8 @@ class AccountRegistry:
             return await self.add(account) if account and account.status == "active" else None
         async with self._lock(account_id):
             await runtime.service.restart()
+        if self.runner is not None:
+            self.runner.retry_now()  # strategies stopped while it was down can resume now
         return runtime
 
     async def disconnect(self, account_id: int, reason: str) -> None:
