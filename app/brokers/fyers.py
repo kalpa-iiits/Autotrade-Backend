@@ -42,6 +42,30 @@ _nse_instruments: tuple[date, list[Instrument]] | None = None
 _nse_instruments_lock = asyncio.Lock()
 _options: tuple[date, dict[str, list[OptionContract]]] | None = None  # underlying name -> options
 _options_lock = asyncio.Lock()
+# The SDK's ceiling. Its backoff grows 5s every 5 tries, so this is ~20 minutes of retrying.
+SOCKET_RECONNECT_RETRIES = 50
+SOCKET_WATCHDOG_INTERVAL = 30.0  # seconds between liveness checks
+
+
+def _socket_alive(sock) -> bool:
+    """Whether the SDK socket really has an open connection. is_connected() alone only says a
+    WebSocketApp object exists, so also look at the underlying socket when we can reach it."""
+    is_connected = getattr(sock, "is_connected", None)
+    if is_connected is None:
+        return True  # not an SDK socket (tests): nothing to judge by
+    if not is_connected():
+        return False
+    ws = getattr(sock, f"_{type(sock).__name__}__ws_object", None)
+    if ws is None:
+        return True
+    inner = getattr(ws, "sock", None)
+    return inner is not None and bool(getattr(inner, "connected", False))
+
+
+def _sdk_gave_up(sock) -> bool:
+    return getattr(sock, "reconnect_attempts", 0) >= getattr(sock, "max_reconnect_attempts", float("inf"))
+
+
 _specs: dict[str, tuple[date, dict[str, tuple[float, int]]]] = {}  # master URL -> (day, symbol -> (tick, lot))
 _specs_lock = asyncio.Lock()
 
@@ -208,6 +232,7 @@ class FyersBroker(Broker):
         model=None,
         data_socket_factory=None,
         order_socket_factory=None,
+        watchdog_interval: float = SOCKET_WATCHDOG_INTERVAL,
     ) -> None:
         super().__init__()
         if not client_id or not access_token:
@@ -238,6 +263,8 @@ class FyersBroker(Broker):
         self._symbols: set[str] = set()
         self._order_connects = 0
         self._socket_errors: dict[str, str] = {}  # "data"/"order" -> last error, until it reconnects
+        self._watchdog_interval = watchdog_interval
+        self._watchdog: asyncio.Task | None = None
 
     # ---------- lifecycle ----------
 
@@ -251,6 +278,7 @@ class FyersBroker(Broker):
             litemode=True,  # LTP only; switch off for full quote/depth fields
             write_to_file=False,
             reconnect=True,
+            reconnect_retry=SOCKET_RECONNECT_RETRIES,
             on_connect=self._on_data_connect,
             on_message=self._on_tick_message,
             on_error=lambda msg: self._on_socket_error("data", msg),
@@ -261,6 +289,7 @@ class FyersBroker(Broker):
             log_path=self._log_dir,
             write_to_file=False,
             reconnect=True,
+            reconnect_retry=SOCKET_RECONNECT_RETRIES,
             on_connect=self._on_order_connect,
             on_orders=self._on_order_message,
             on_general=lambda msg: None,  # otherwise the SDK print()s these
@@ -269,8 +298,16 @@ class FyersBroker(Broker):
         )
         await asyncio.to_thread(self._data_socket.connect)
         await asyncio.to_thread(self._order_socket.connect)
+        self._watchdog = asyncio.create_task(self._run_watchdog())
 
     async def stop(self) -> None:
+        if self._watchdog is not None:
+            self._watchdog.cancel()
+            try:
+                await self._watchdog
+            except asyncio.CancelledError:
+                pass
+            self._watchdog = None
         # Close each socket on its own: an SDK error on one must not leave the other running.
         if self._order_socket is not None:
             prepare_order_socket_close(self._order_socket)
@@ -294,6 +331,35 @@ class FyersBroker(Broker):
         while self._events is not None and not self._events.empty():
             self._events.get_nowait().close()  # never-run coroutines: no "never awaited" warning
 
+    async def _run_watchdog(self) -> None:
+        """The SDK retries a dropped socket on its own, then gives up for good. Keep the banner
+        honest while it retries, and start it over once it has given up."""
+        down = {"data": 0, "order": 0}
+        while True:
+            await asyncio.sleep(self._watchdog_interval)
+            for which, sock in (("data", self._data_socket), ("order", self._order_socket)):
+                if sock is None:
+                    continue
+                if _socket_alive(sock):
+                    down[which] = 0
+                    self._clear_socket_error(which)
+                    continue
+                down[which] += 1
+                if down[which] < 2:
+                    continue  # one miss can be an SDK retry still in flight
+                if which not in self._socket_errors:
+                    self._socket_errors[which] = f"Fyers {which} socket: disconnected, reconnecting"
+                    self._refresh_stream_error()
+                if _sdk_gave_up(sock):
+                    log.warning("Fyers %s socket: SDK stopped retrying; starting over", which)
+                    sock.reconnect_attempts = 0
+                    sock.reconnect_delay = 0
+                    down[which] = 0
+                    try:
+                        await asyncio.to_thread(sock.connect)
+                    except Exception:
+                        log.warning("Fyers %s socket: reconnect failed", which, exc_info=True)
+
     async def _run_events(self) -> None:
         while True:
             coro = await self._events.get()
@@ -306,12 +372,15 @@ class FyersBroker(Broker):
 
     def _on_data_connect(self) -> None:
         # Also fires after a reconnect, so re-subscribe everything we were watching.
-        self._clear_socket_error("data")
+        # The SDK calls this ~2s into every attempt, even a failing one: clear only if really up.
+        if _socket_alive(self._data_socket):
+            self._clear_socket_error("data")
         if self._symbols:
             self._data_socket.subscribe(symbols=sorted(self._symbols), data_type="SymbolUpdate")
 
     def _on_order_connect(self) -> None:
-        self._clear_socket_error("order")
+        if _socket_alive(self._order_socket):
+            self._clear_socket_error("order")
         self._order_socket.subscribe(data_type="OnOrders")
         self._order_connects += 1
         if self._order_connects > 1:
@@ -330,7 +399,8 @@ class FyersBroker(Broker):
         self._refresh_stream_error()
 
     def _refresh_stream_error(self) -> None:
-        self.stream_error = "; ".join(self._socket_errors[k] for k in sorted(self._socket_errors)) or None
+        errors = self._socket_errors.copy()  # SDK threads may change it while we read
+        self.stream_error = "; ".join(v for _, v in sorted(errors.items())) or None
 
     def _on_tick_message(self, message) -> None:
         if isinstance(message, dict) and "ltp" in message and "symbol" in message:

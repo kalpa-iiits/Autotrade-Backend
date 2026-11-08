@@ -473,3 +473,103 @@ def test_socket_error_clears_when_that_socket_reconnects():
         await broker.stop()
 
     asyncio.run(run())
+
+
+class FlakySocket(FakeSocket):
+    """FakeSocket with the SDK's connection state: starts up, can be dropped, and can be
+    put in the state the SDK leaves it in after it has used up its retries."""
+
+    def __init__(self, **kwargs):
+        super().__init__(**kwargs)
+        self.up = True
+        self.connects = 0
+        self.reconnect_attempts = 0
+        self.reconnect_delay = 0
+        self.max_reconnect_attempts = kwargs.get("reconnect_retry", 5)
+
+    def is_connected(self):
+        return self.up
+
+    def connect(self):
+        self.connects += 1
+        if self.connects > 1:
+            self.up = True  # this attempt succeeds
+        super().connect()
+
+
+def make_flaky_broker():
+    FakeSocket.instances = []
+    return FyersBroker(
+        client_id="XB12345-100", access_token="tok", log_dir="/tmp/autotrade-test-logs",
+        model=FakeModel(), data_socket_factory=FlakySocket, order_socket_factory=FlakySocket,
+        watchdog_interval=0.01,
+    )
+
+
+def test_sockets_ask_sdk_for_max_retries():
+    async def run():
+        broker = make_flaky_broker()
+        await broker.start()
+        assert all(s.kwargs["reconnect_retry"] == 50 for s in FakeSocket.instances)
+        await broker.stop()
+
+    asyncio.run(run())
+
+
+def test_connect_callback_on_a_failed_attempt_keeps_the_error():
+    async def run():
+        broker = make_flaky_broker()
+        broker._watchdog_interval = 3600  # keep the watchdog out of this one
+        await broker.start()
+        _, order_sock = FakeSocket.instances
+        order_sock.up = False
+        order_sock.kwargs["on_error"]("Connection to remote host was lost.")
+        order_sock.kwargs["on_connect"]()  # SDK fires this ~2s into a retry that is failing
+        assert broker.stream_error == "Fyers order socket: Connection to remote host was lost."
+        await broker.stop()
+
+    asyncio.run(run())
+
+
+def test_watchdog_restarts_a_socket_the_sdk_gave_up_on():
+    async def run():
+        broker = make_flaky_broker()
+        await broker.start()
+        data_sock, order_sock = FakeSocket.instances
+        order_sock.up = False
+        order_sock.reconnect_attempts = order_sock.max_reconnect_attempts  # SDK abandoned it
+        order_sock.reconnect_delay = 50
+
+        for _ in range(200):
+            await asyncio.sleep(0.01)
+            if order_sock.connects > 1:
+                break
+        assert order_sock.connects == 2 and order_sock.reconnect_attempts == 0
+        assert order_sock.reconnect_delay == 0
+        assert data_sock.connects == 1  # the healthy socket is left alone
+
+        for _ in range(100):
+            await asyncio.sleep(0.01)
+            if broker.stream_error is None:
+                break
+        assert broker.stream_error is None
+        await broker.stop()
+
+    asyncio.run(run())
+
+
+def test_watchdog_reports_a_socket_still_retrying_without_restarting_it():
+    async def run():
+        broker = make_flaky_broker()
+        await broker.start()
+        _, order_sock = FakeSocket.instances
+        order_sock.up = False  # down, but the SDK still has retries left
+        for _ in range(100):
+            await asyncio.sleep(0.01)
+            if broker.stream_error:
+                break
+        assert broker.stream_error == "Fyers order socket: disconnected, reconnecting"
+        assert order_sock.connects == 1
+        await broker.stop()
+
+    asyncio.run(run())
