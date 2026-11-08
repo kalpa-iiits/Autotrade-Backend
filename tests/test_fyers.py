@@ -451,3 +451,25 @@ def test_order_socket_closes_without_sdk_attribute_error(tmp_path):
     prepare_order_socket_close(sock)
     sock.close_connection()
     assert ws.closed and sock._FyersOrderSocket__ws_object is None
+
+
+def test_socket_error_clears_when_that_socket_reconnects():
+    """A transient drop (common off-hours) must not leave a stale banner after the SDK reconnects,
+    and one socket coming back must not hide the other's still-open error."""
+    async def run():
+        broker, _ = make_broker()
+        await broker.start()
+        data_sock, order_sock = FakeSocket.instances
+
+        order_sock.kwargs["on_error"]("Connection to remote host was lost.")
+        data_sock.kwargs["on_error"]("Connection to remote host was lost.")
+        assert "order socket" in broker.stream_error and "data socket" in broker.stream_error
+
+        data_sock.kwargs["on_connect"]()  # data came back; order still down
+        assert broker.stream_error == "Fyers order socket: Connection to remote host was lost."
+
+        order_sock.kwargs["on_connect"]()  # the SDK reconnected the order socket
+        assert broker.stream_error is None
+        await broker.stop()
+
+    asyncio.run(run())

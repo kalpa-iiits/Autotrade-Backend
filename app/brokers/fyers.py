@@ -237,6 +237,7 @@ class FyersBroker(Broker):
         self._order_socket = None
         self._symbols: set[str] = set()
         self._order_connects = 0
+        self._socket_errors: dict[str, str] = {}  # "data"/"order" -> last error, until it reconnects
 
     # ---------- lifecycle ----------
 
@@ -305,11 +306,12 @@ class FyersBroker(Broker):
 
     def _on_data_connect(self) -> None:
         # Also fires after a reconnect, so re-subscribe everything we were watching.
-        self.stream_error = None
+        self._clear_socket_error("data")
         if self._symbols:
             self._data_socket.subscribe(symbols=sorted(self._symbols), data_type="SymbolUpdate")
 
     def _on_order_connect(self) -> None:
+        self._clear_socket_error("order")
         self._order_socket.subscribe(data_type="OnOrders")
         self._order_connects += 1
         if self._order_connects > 1:
@@ -317,8 +319,18 @@ class FyersBroker(Broker):
             self._schedule(self._emit_reconnect())
 
     def _on_socket_error(self, which: str, message) -> None:
-        self.stream_error = f"Fyers {which} socket: {message}"
-        log.warning("%s", self.stream_error)
+        self._socket_errors[which] = f"Fyers {which} socket: {message}"
+        log.warning("%s", self._socket_errors[which])
+        self._refresh_stream_error()
+
+    def _clear_socket_error(self, which: str) -> None:
+        # The SDK reconnects on its own; once a socket is back, its earlier drop is no longer news.
+        if self._socket_errors.pop(which, None) is not None:
+            log.info("Fyers %s socket reconnected", which)
+        self._refresh_stream_error()
+
+    def _refresh_stream_error(self) -> None:
+        self.stream_error = "; ".join(self._socket_errors[k] for k in sorted(self._socket_errors)) or None
 
     def _on_tick_message(self, message) -> None:
         if isinstance(message, dict) and "ltp" in message and "symbol" in message:
