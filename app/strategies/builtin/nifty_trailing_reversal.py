@@ -12,7 +12,7 @@ from pydantic import BaseModel, ConfigDict
 
 from app.brokers import OrderError
 from app.brokers.base import Candle
-from app.strategies.base import Bar, Strategy, Tick
+from app.strategies.base import Bar, Strategy, Tick, before_market_open
 
 IST = ZoneInfo("Asia/Kolkata")
 
@@ -271,6 +271,8 @@ class NiftyTrailingReversal(Strategy):
 
     async def on_tick(self, tick: Tick) -> None:
         """Live mode: bar-close ratchets, but protective stops remain active each tick."""
+        if before_market_open(tick.at):
+            return  # pre-open values: a stop "hit" now could only send orders the exchange refuses
         if bar := self._bars.add(tick):
             await self.on_bar(bar)
         # A broker may publish its completed minute candles a few seconds after the boundary.

@@ -16,6 +16,7 @@ from app.brokers import OrderError
 from app.brokers.base import Candle
 from app.strategies.builtin.intraday_breakout_options import pick_contract
 from app.strategies.builtin.nifty_trailing_reversal import IST, NiftyTrailingReversal
+from app.strategies.base import before_market_open
 
 
 class _ReplayContext:
@@ -243,6 +244,8 @@ class NiftyTrailingReversalOptions(NiftyTrailingReversal):
         return True
 
     async def on_tick(self, tick) -> None:
+        if before_market_open(tick.at):
+            return  # nothing to buy or sell before 09:15: don't move the option legs either
         if isinstance(self.ctx, ReversalOptionLegs):
             if not await self._warm_from_history(tick.at.astimezone(IST)):
                 return

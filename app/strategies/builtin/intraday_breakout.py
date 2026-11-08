@@ -31,7 +31,7 @@ from pydantic import BaseModel, Field, model_validator
 
 from app.brokers import OrderError
 from app.brokers.base import Candle
-from app.strategies.base import Bar, Strategy, Tick
+from app.strategies.base import Bar, Strategy, Tick, before_market_open
 
 IST = ZoneInfo("Asia/Kolkata")
 HISTORY_RETRY = timedelta(seconds=60)  # wait before asking the broker for daily candles again
@@ -228,6 +228,8 @@ class IntradayBreakout(Strategy):
     # ---------- events ----------
 
     async def on_tick(self, tick: Tick) -> None:
+        if before_market_open(tick.at):
+            return  # pre-open values: no entries, stops or overnight exits until 09:15
         now = tick.at.astimezone(IST)
         if now.date() != self.day:
             self._new_day(now.date())

@@ -305,3 +305,12 @@ def test_history_through_the_real_runner(tmp_path, monkeypatch):
         running = c.app.state.strategy_runner.running[inst["id"]]
         candles = run(c, running.strategy.ctx.history, "D", 30)
         assert len(candles) >= 14 and all(c_.high > c_.low for c_ in candles)
+
+
+def test_overnight_position_exit_waits_for_market_open():
+    strat, ctx = make()
+    ctx.position = 65  # left over from yesterday
+    asyncio.run(strat.on_tick(Tick(SYM, 1000, at("09:08"))))
+    assert ctx.calls == []  # pre-open: the exchange would refuse the order
+    asyncio.run(strat.on_tick(Tick(SYM, 1000, at("09:15"))))
+    assert ctx.calls and ctx.calls[0][0] == "exit"

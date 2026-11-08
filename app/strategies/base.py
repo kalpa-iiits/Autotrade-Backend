@@ -22,7 +22,7 @@ runner, which applies the instance's mode (signal or live) and risk limits first
 
 from abc import ABC
 from dataclasses import dataclass
-from datetime import datetime, timezone
+from datetime import datetime, time, timezone
 from typing import TYPE_CHECKING, ClassVar
 
 from pydantic import BaseModel
@@ -32,6 +32,17 @@ if TYPE_CHECKING:
 
 
 # Bar timeframes an instance can run on (chosen in the app, per instance).
+# NSE's continuous session opens at 09:15 IST. Values published during the 09:00-09:08
+# pre-open are not tradable prices for F&O (orders sent then are refused), so live
+# strategies ignore ticks stamped before this.
+MARKET_OPEN = time(9, 15)
+
+
+def before_market_open(at: datetime) -> bool:
+    from zoneinfo import ZoneInfo
+    return at.astimezone(ZoneInfo("Asia/Kolkata")).time() < MARKET_OPEN
+
+
 TIMEFRAMES: dict[str, int] = {
     "1m": 60, "3m": 180, "5m": 300, "10m": 600, "15m": 900, "30m": 1800, "60m": 3600,
 }

@@ -757,3 +757,15 @@ def test_option_strategies_take_fixed_quantity_only(deploy):
     assert c.patch(f"/api/strategies/{inst['id']}", json={"fixed_quantity": 130}, headers=AUTH).status_code == 200
     catalog = {d["key"]: d for d in c.get("/api/strategies/catalog", headers=AUTH).json()["strategies"]}
     assert catalog["opt"]["capital_sizing"] is False and catalog["opt"]["backtest_note"]
+
+
+def test_before_market_open_boundary_in_ist():
+    from datetime import timezone as tz
+    from zoneinfo import ZoneInfo
+
+    from app.strategies.base import before_market_open
+    IST = ZoneInfo("Asia/Kolkata")
+    assert before_market_open(datetime(2026, 11, 2, 9, 14, 59, tzinfo=IST))
+    assert not before_market_open(datetime(2026, 11, 2, 9, 15, tzinfo=IST))
+    assert not before_market_open(datetime(2026, 11, 2, 3, 45, tzinfo=tz.utc))  # 09:15 IST
+    assert before_market_open(datetime(2026, 11, 2, 3, 44, tzinfo=tz.utc))

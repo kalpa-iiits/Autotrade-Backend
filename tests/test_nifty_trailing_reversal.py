@@ -334,3 +334,29 @@ def test_restart_finishes_pending_reversal_from_recorded_actual_fill():
     asyncio.run(resume())
     assert strategy.stop == pytest.approx(98.75 * 1.008)
     assert not strategy._reversal_pending
+
+
+def test_live_stop_waits_for_market_open_then_fires_on_the_first_tick():
+    """A pre-open (09:00-09:08) value beyond the stop must not send orders the exchange would
+    refuse; the first tick at 09:15 still catches the gap."""
+    ctx = LiveContext()
+    strategy = NiftyTrailingReversal(NiftyTrailingReversal.Params(), ctx, 300)
+    day1 = datetime(2026, 11, 2, 9, 15, tzinfo=IST)
+    day2 = datetime(2026, 11, 3, tzinfo=IST)
+
+    async def replay():
+        await strategy.on_start()
+        await strategy.on_tick(Tick(SYM, 100, day1))
+        await strategy.on_tick(Tick(SYM, 100, day1 + timedelta(minutes=5)))  # seeds the long
+        assert [(side, qty) for side, qty, _ in ctx.orders] == [("BUY", 65)]
+        stop = strategy.stop
+
+        for hh, mm, ss in ((9, 0, 0), (9, 8, 0), (9, 14, 59)):  # gap down, during pre-open
+            await strategy.on_tick(Tick(SYM, 90, day2.replace(hour=hh, minute=mm, second=ss)))
+        assert [(side, qty) for side, qty, _ in ctx.orders] == [("BUY", 65)]
+        assert strategy.stop == stop
+
+        await strategy.on_tick(Tick(SYM, 90, day2.replace(hour=9, minute=15)))  # market opens
+        assert [(side, qty) for side, qty, _ in ctx.orders] == [("BUY", 65), ("SELL", 130)]
+
+    asyncio.run(replay())
