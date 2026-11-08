@@ -10,6 +10,7 @@ import asyncio
 import csv
 import io
 import logging
+import re
 from datetime import date, datetime, timedelta, timezone
 from pathlib import Path
 from zoneinfo import ZoneInfo
@@ -44,7 +45,11 @@ _options: tuple[date, dict[str, list[OptionContract]]] | None = None  # underlyi
 _options_lock = asyncio.Lock()
 # The SDK's ceiling. Its backoff grows 5s every 5 tries, so this is ~20 minutes of retrying.
 SOCKET_RECONNECT_RETRIES = 50
-SOCKET_WATCHDOG_INTERVAL = 30.0  # seconds between liveness checks
+SOCKET_WATCHDOG_INTERVAL = 10.0  # seconds between liveness checks
+SOCKET_DOWN_CHECKS = 3  # ~30s down before we report a socket or restart it
+SOCKET_FAST_RESYNC_CHECKS = 60  # check the order book every 10s for the first ~10 min of an outage
+# A refused handshake or token: retrying with the same token can never succeed.
+_AUTH_REJECTED = re.compile(r"Handshake status 40[13]\b|valid token", re.IGNORECASE)
 
 
 def _socket_alive(sock) -> bool:
@@ -263,6 +268,8 @@ class FyersBroker(Broker):
         self._symbols: set[str] = set()
         self._order_connects = 0
         self._socket_errors: dict[str, str] = {}  # "data"/"order" -> last error, until it reconnects
+        self._auth_rejected: set[str] = set()  # sockets Fyers refused the token on
+        self._order_resync_due = False  # order socket was down; check the order book once it is back
         self._watchdog_interval = watchdog_interval
         self._watchdog: asyncio.Task | None = None
 
@@ -333,20 +340,25 @@ class FyersBroker(Broker):
 
     async def _run_watchdog(self) -> None:
         """The SDK retries a dropped socket on its own, then gives up for good. Keep the banner
-        honest while it retries, and start it over once it has given up."""
+        honest while it retries, start it over once it has given up, and while the order socket
+        is down, catch fills from the order book so strategies are not left waiting."""
         down = {"data": 0, "order": 0}
         while True:
             await asyncio.sleep(self._watchdog_interval)
             for which, sock in (("data", self._data_socket), ("order", self._order_socket)):
-                if sock is None:
-                    continue
+                if sock is None or which in self._auth_rejected:
+                    continue  # retrying cannot fix a rejected login; wait for a new one
                 if _socket_alive(sock):
                     down[which] = 0
-                    self._clear_socket_error(which)
+                    self._socket_up(which)
                     continue
                 down[which] += 1
-                if down[which] < 2:
-                    continue  # one miss can be an SDK retry still in flight
+                if which == "order":
+                    self._order_resync_due = True
+                    if down[which] <= SOCKET_FAST_RESYNC_CHECKS:
+                        self._schedule(self._emit_reconnect())
+                if down[which] < SOCKET_DOWN_CHECKS:
+                    continue  # a short miss can be an SDK retry still in flight
                 if which not in self._socket_errors:
                     self._socket_errors[which] = f"Fyers {which} socket: disconnected, reconnecting"
                     self._refresh_stream_error()
@@ -354,7 +366,6 @@ class FyersBroker(Broker):
                     log.warning("Fyers %s socket: SDK stopped retrying; starting over", which)
                     sock.reconnect_attempts = 0
                     sock.reconnect_delay = 0
-                    down[which] = 0
                     try:
                         await asyncio.to_thread(sock.connect)
                     except Exception:
@@ -372,24 +383,43 @@ class FyersBroker(Broker):
 
     def _on_data_connect(self) -> None:
         # Also fires after a reconnect, so re-subscribe everything we were watching.
-        # The SDK calls this ~2s into every attempt, even a failing one: clear only if really up.
-        if _socket_alive(self._data_socket):
-            self._clear_socket_error("data")
         if self._symbols:
             self._data_socket.subscribe(symbols=sorted(self._symbols), data_type="SymbolUpdate")
+        # The SDK calls this ~2s into every attempt, even a failing one: only a live socket counts.
+        if _socket_alive(self._data_socket):
+            self._socket_up("data")
 
     def _on_order_connect(self) -> None:
-        if _socket_alive(self._order_socket):
-            self._clear_socket_error("order")
         self._order_socket.subscribe(data_type="OnOrders")
         self._order_connects += 1
         if self._order_connects > 1:
-            # Order updates sent while the socket was down are lost: reconcile.
+            self._order_resync_due = True  # updates sent while it was down are lost
+        if _socket_alive(self._order_socket):
+            self._socket_up("order")
+
+    def _socket_up(self, which: str) -> None:
+        """A socket is really connected (seen by the connect callback or the watchdog)."""
+        self._auth_rejected.discard(which)
+        self._clear_socket_error(which)
+        if which == "order" and self._order_resync_due:
+            # One order-book check per real reconnect, not one per failed attempt.
+            self._order_resync_due = False
             self._schedule(self._emit_reconnect())
 
     def _on_socket_error(self, which: str, message) -> None:
-        self._socket_errors[which] = f"Fyers {which} socket: {message}"
-        log.warning("%s", self._socket_errors[which])
+        if _AUTH_REJECTED.search(str(message)):
+            # An expired or revoked token: every retry would be refused the same way.
+            sock = self._data_socket if which == "data" else self._order_socket
+            if sock is not None:
+                sock.restart_flag = False
+            self._auth_rejected.add(which)
+            self._socket_errors[which] = (
+                f"Fyers {which} socket: Fyers rejected the login (token expired?); log in again"
+            )
+            log.error("%s (%s)", self._socket_errors[which], message)
+        else:
+            self._socket_errors[which] = f"Fyers {which} socket: {message}"
+            log.warning("%s", self._socket_errors[which])
         self._refresh_stream_error()
 
     def _clear_socket_error(self, which: str) -> None:

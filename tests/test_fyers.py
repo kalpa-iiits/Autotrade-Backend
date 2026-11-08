@@ -486,6 +486,7 @@ class FlakySocket(FakeSocket):
         self.reconnect_attempts = 0
         self.reconnect_delay = 0
         self.max_reconnect_attempts = kwargs.get("reconnect_retry", 5)
+        self.restart_flag = True
 
     def is_connected(self):
         return self.up
@@ -570,6 +571,78 @@ def test_watchdog_reports_a_socket_still_retrying_without_restarting_it():
                 break
         assert broker.stream_error == "Fyers order socket: disconnected, reconnecting"
         assert order_sock.connects == 1
+        await broker.stop()
+
+    asyncio.run(run())
+
+
+def test_rejected_login_stops_retrying_and_says_log_in_again():
+    async def run():
+        broker = make_flaky_broker()
+        await broker.start()
+        _, order_sock = FakeSocket.instances
+        order_sock.up = False
+        order_sock.kwargs["on_error"]("Handshake status 403 Forbidden -+-+- {'content-length': '0'}")
+        assert order_sock.restart_flag is False  # the SDK will not retry this token
+        assert "log in again" in broker.stream_error
+
+        order_sock.reconnect_attempts = order_sock.max_reconnect_attempts  # SDK done
+        await asyncio.sleep(0.1)  # many watchdog checks
+        assert order_sock.connects == 1  # nor does the watchdog
+        assert "log in again" in broker.stream_error
+        await broker.stop()
+
+    asyncio.run(run())
+
+
+def test_order_book_checked_once_per_real_reconnect_not_per_attempt():
+    async def run():
+        broker = make_flaky_broker()
+        broker._watchdog_interval = 3600  # keep the watchdog out of this one
+        resyncs = []
+
+        async def on_reconnect():
+            resyncs.append(1)
+
+        broker.on_reconnect(on_reconnect)
+        await broker.start()
+        _, order_sock = FakeSocket.instances
+        order_sock.up = False
+        for _ in range(5):  # failed SDK attempts each fire on_connect
+            order_sock.kwargs["on_connect"]()
+        await asyncio.sleep(0.05)
+        assert resyncs == []
+
+        order_sock.up = True
+        order_sock.kwargs["on_connect"]()  # this attempt worked
+        await asyncio.sleep(0.05)
+        assert resyncs == [1]
+        await broker.stop()
+
+    asyncio.run(run())
+
+
+def test_order_book_checked_often_while_order_socket_is_down_then_backs_off(monkeypatch):
+    import app.brokers.fyers as fyers_mod
+    monkeypatch.setattr(fyers_mod, "SOCKET_FAST_RESYNC_CHECKS", 3)
+
+    async def run():
+        broker = make_flaky_broker()
+        resyncs = []
+
+        async def on_reconnect():
+            resyncs.append(1)
+
+        broker.on_reconnect(on_reconnect)
+        await broker.start()
+        _, order_sock = FakeSocket.instances
+        order_sock.up = False
+        await asyncio.sleep(0.2)  # ~20 watchdog checks, SDK still retrying
+        assert len(resyncs) == 3  # only the first few checks of the outage
+
+        order_sock.up = True
+        await asyncio.sleep(0.05)
+        assert len(resyncs) == 4  # plus one when it is really back
         await broker.stop()
 
     asyncio.run(run())
