@@ -15,12 +15,33 @@ try a strategy without real money, run it on a paper account.
 
 from app.strategies.builtin.intraday_breakout import IntradayBreakout
 from app.strategies.builtin.intraday_breakout_options import IntradayBreakoutOptions
+from app.strategies.builtin.nifty_intraday_limited import NiftyIntradayLimited
 from app.strategies.builtin.nifty_trailing_reversal import NiftyTrailingReversal
 from app.strategies.builtin.nifty_trailing_reversal_options import NiftyTrailingReversalOptions
 from app.strategies.builtin.sma_crossover import SmaCrossover
 from app.strategies.deployment import Deployment
 
 DEPLOYMENTS: list[Deployment] = [
+    Deployment(
+        key="nifty-intraday-limited",
+        label="NIFTY Limited-Trade Strategy · Intraday + Overnight",
+        strategy=NiftyIntradayLimited,
+        timeframe="5m",
+        params=NiftyIntradayLimited.Params(
+            lookback=18,
+            z_threshold=1.0,
+            stop_points=50,
+            target_points=300,
+            max_entries_per_day=3,
+        ),
+        quantity=65,
+        max_order_qty=65,
+        max_position=65,
+        max_orders_per_day=10,
+        backtest_initial_capital=500_000,
+        backtest_fixed_quantity=65,
+        backtest_commission_per_unit=0,
+    ),
     # Direct-instrument version: one 130-unit order reverses a 65-unit future/index position.
     Deployment(
         key="nifty-percentage-reversal",
