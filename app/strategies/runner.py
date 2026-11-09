@@ -10,10 +10,9 @@ paper account to try a strategy). Safety rules, applied to every buy/sell before
   - max order quantity, max absolute position, max orders per day (IST) — except for orders
     that only shrink the position (exits are never blocked by limits)
   - live orders also pause while the trade ledger has updates it couldn't save
-  - options are ordered at a limit price, never at market (brokers cap or refuse market
-    orders on options): a little through the best ask / bid, repriced every few seconds while
-    unfilled. Exits are chased until they fill; entries give up after a few tries or too far
-    a move (see the option_* settings)
+  - options use protected limit orders: ask-based entries and bid-based exits, with LTP only
+    when depth is unavailable. Protective exits refresh immediately and then every 0.5 seconds
+    until filled; they are never sent as market orders
 A strategy that raises an exception is stopped with status "error".
 
 Each running instance has its own tick queue and worker task, so a strategy that is slow
@@ -741,7 +740,10 @@ class StrategyRunner:
         symbol = symbol or inst.symbol
         async with inst.lock:
             cfg = inst.config
-            price = inst.last_price if symbol == inst.symbol else await self._quote(inst.account_id, symbol)
+            # Do not fetch an option LTP up front: pricing checks executable depth first and
+            # requests LTP only as its fallback.
+            price = (inst.last_price if symbol == inst.symbol else
+                     None if OPTION_SYMBOL.search(symbol) else await self._quote(inst.account_id, symbol))
             signal = StrategySignal(
                 instance_id=inst.id, symbol=symbol, side=side.value, quantity=quantity,
                 price=price, reason=(reason or "")[:512] or None,
@@ -773,17 +775,23 @@ class StrategyRunner:
             return None
 
     async def _option_price(self, account_id: int, symbol: str, side: Side,
-                            last: float | None = None) -> tuple[float, str] | None:
-        """Limit price for an option order, and what it's based on: the best ask (buying) or
-        bid (selling), else the last price (`last`, or a fresh quote). None with neither."""
+                            buffer_pct: float | None = None) -> tuple[float, str] | None:
+        """Option limit from best ask for a buy or best bid for a sell.
+
+        LTP is queried only when the relevant market depth is unavailable, and is still used
+        to build a protected limit order rather than a market order.
+        """
         depth = await self._depth(account_id, symbol)
         best = (depth.ask if side == Side.BUY else depth.bid) if depth else 0
         if best:
-            basis = f"{'ask' if side == Side.BUY else 'bid'} {best:g}"
-            return option_limit_price(best, side, self.settings.option_limit_buffer_pct), basis
-        last = last or await self._quote(account_id, symbol)
+            book_name = "ask" if side == Side.BUY else "bid"
+            basis = f"{book_name} {best:g}"
+            buffer_pct = (self.settings.option_limit_buffer_pct
+                          if buffer_pct is None else buffer_pct)
+            return option_limit_price(best, side, buffer_pct), basis
+        last = await self._quote(account_id, symbol)
         if last:
-            return option_limit_price(last, side, self.settings.option_ltp_buffer_pct), f"last {last:g}"
+            return option_limit_price(last, side, self.settings.option_ltp_buffer_pct), f"last {last:g}; no depth"
         return None
 
     async def _place(self, inst: RunningInstance, side: Side, quantity: int, signal: StrategySignal) -> None:
@@ -791,13 +799,20 @@ class StrategyRunner:
         signal.broker = service.name
         order_type, limit_price = OrderType.MARKET, None
         closing = inst.position > 0 if side == Side.SELL else inst.position < 0
-        if OPTION_SYMBOL.search(signal.symbol):
-            if priced := await self._option_price(inst.account_id, signal.symbol, side, signal.price):
+        option = bool(OPTION_SYMBOL.search(signal.symbol))
+        if option:
+            buffer_pct = (self.settings.option_exit_limit_buffer_pct if closing
+                          else self.settings.option_limit_buffer_pct)
+            if priced := await self._option_price(
+                    inst.account_id, signal.symbol, side, buffer_pct):
                 order_type = OrderType.LIMIT
                 limit_price, basis = priced
                 signal.message = f"Limit {limit_price:.2f} ({basis})"
-            else:  # nothing to price it from: the broker's own market protection applies
-                log.warning("Strategy %s: no price for %s; placing a market order", inst.id, signal.symbol)
+            else:
+                signal.outcome = "rejected"
+                signal.message = "No executable ask/bid depth or LTP; option order not sent"
+                return
+
         try:
             order = await service.place_order(PlaceOrder(
                 action="place_order", symbol=signal.symbol, side=side, quantity=quantity,
@@ -830,18 +845,22 @@ class StrategyRunner:
 
     async def _chase(self, inst: RunningInstance, order_id: str, symbol: str, side: Side,
                      first_limit: float, closing: bool) -> None:
-        """Keep an unfilled option order where it can fill. Every option_reprice_interval, if
-        the best ask (buying) or bid (selling) + buffer has moved past its limit, move the limit
-        there. An exit (`closing`) is chased until it fills. An entry is cancelled, and the trade
+        """Keep an unfilled option order where it can fill. Protective exits check a fresh book
+        immediately and then frequently; entries wait the conservative option_reprice_interval.
+        If the best ask (buying) or bid (selling) + buffer has moved past the limit, move the
+        limit there. An exit (`closing`) is chased until it fills. An entry is cancelled, and the trade
         skipped, after option_entry_max_reprices checks or rather than go more than
         option_entry_max_chase_pct past `first_limit`. While it's open the instance can't place
         another order. Ends when the order is done or the instance stops."""
         cfg = self.settings
         sign = 1 if side == Side.BUY else -1  # "further" = higher to buy, lower to sell
         cap = first_limit * (1 + sign * cfg.option_entry_max_chase_pct / 100)
-        limit, checks = first_limit, 0
+        limit, checks, first_check = first_limit, 0, True
         while True:
-            await asyncio.sleep(cfg.option_reprice_interval)
+            if not (closing and first_check):
+                await asyncio.sleep(
+                    cfg.option_exit_reprice_interval if closing else cfg.option_reprice_interval)
+            first_check = False
             if inst.pending_order_id != order_id or self.running.get(inst.id) is not inst:
                 return  # filled, cancelled or rejected; or the strategy stopped
             service = self.service(inst.account_id)
@@ -849,7 +868,10 @@ class StrategyRunner:
                 continue
             checks += 1
             try:
-                priced = await self._option_price(inst.account_id, symbol, side)
+                buffer_pct = (cfg.option_exit_limit_buffer_pct if closing
+                              else cfg.option_limit_buffer_pct)
+                priced = await self._option_price(
+                    inst.account_id, symbol, side, buffer_pct=buffer_pct)
                 target = priced[0] if priced else None
                 if not closing:
                     if checks > cfg.option_entry_max_reprices:

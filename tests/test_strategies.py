@@ -288,6 +288,7 @@ def options(deploy, monkeypatch):
     BOOK.clear()
     monkeypatch.setattr(PaperBroker, "get_depth", depth)
     monkeypatch.setattr(settings, "option_reprice_interval", 0.02)
+    monkeypatch.setattr(settings, "option_exit_reprice_interval", 0.02)
 
     def start(**overrides):
         c = deploy(dep("a", **overrides))
@@ -306,7 +307,7 @@ def wait(client, seconds=0.15):
     run(client, asyncio.sleep, seconds)
 
 
-def test_live_option_orders_are_priced_from_market_depth(options):
+def test_option_entry_and_exit_use_depth_priced_limits(options):
     quiet, inst = options()
     SCRIPT.extend([("buy", None, "entry", OPT), ("sell", 1, "exit", OPT)])
     tick(quiet)
@@ -315,14 +316,14 @@ def test_live_option_orders_are_priced_from_market_depth(options):
 
     assert option_orders(quiet) == [
         ("BUY", 201.0, "FILLED"),   # best ask 200 + 0.5%
-        ("SELL", 199.0, "FILLED"),  # best bid 200 - 0.5%
+        ("SELL", 199.0, "FILLED"),  # protective exit: best bid 200 - 0.5%
     ]
     assert [s["message"] for s in reversed(signals(quiet, inst["id"]))] == [
         "Limit 201.00 (ask 200)", "Limit 199.00 (bid 200)"]
     assert instance(quiet, inst["id"])["position"] == 0
 
 
-def test_without_depth_option_orders_use_the_last_price(options, monkeypatch):
+def test_without_depth_option_orders_use_ltp_for_a_protected_limit(options, monkeypatch):
     from app.brokers.paper import PaperBroker
 
     async def no_depth(self, symbol):
@@ -332,8 +333,29 @@ def test_without_depth_option_orders_use_the_last_price(options, monkeypatch):
     quiet, inst = options()
     SCRIPT.append(("buy", None, "entry", OPT))
     tick(quiet)
-    assert option_orders(quiet) == [("BUY", 206.0, "FILLED")]  # last 200 + 3%
-    assert signals(quiet, inst["id"])[0]["message"] == "Limit 206.00 (last 200)"
+    assert option_orders(quiet) == [("BUY", 206.0, "FILLED")]
+    signal = signals(quiet, inst["id"])[0]
+    assert signal["outcome"] == "placed"
+    assert signal["message"] == "Limit 206.00 (last 200; no depth)"
+
+
+def test_without_bid_option_exit_uses_ltp_limit(options, monkeypatch):
+    from app.brokers.paper import PaperBroker
+
+    quiet, inst = options()
+    SCRIPT.append(("buy", None, "entry", OPT))
+    tick(quiet)
+
+    async def no_depth(self, symbol):
+        return None
+
+    monkeypatch.setattr(PaperBroker, "get_depth", no_depth)
+    SCRIPT.append(("sell", 1, "stop", OPT))
+    tick(quiet)
+
+    assert option_orders(quiet)[1] == ("SELL", 194.0, "FILLED")
+    signal = signals(quiet, inst["id"])[0]
+    assert signal["message"] == "Limit 194.00 (last 200; no depth)"
 
 
 def test_unfilled_entry_is_repriced_to_the_new_ask(options, monkeypatch):
@@ -380,22 +402,27 @@ def test_entry_is_cancelled_after_max_reprices(options, monkeypatch):
     assert option_orders(quiet) == [("BUY", 190.95, "CANCELLED")]
 
 
-def test_unfilled_exit_is_chased_until_it_fills(options, monkeypatch):
-    monkeypatch.setattr(settings, "option_entry_max_reprices", 1)  # entries only
-    monkeypatch.setattr(settings, "option_entry_max_chase_pct", 1)
+def test_option_exit_uses_bid_without_ltp_override(options):
     quiet, inst = options()
     SCRIPT.extend([("buy", None, "entry", OPT), ("sell", 1, "stop", OPT)])
     tick(quiet)
-    BOOK["bid"] = 260.0  # stale: the sell goes in at 258.70, far above the market at 200
+    BOOK["bid"] = 260.0
     tick(quiet)
-    wait(quiet)  # many checks: an exit is never given up on
+    assert option_orders(quiet)[1] == ("SELL", 258.7, "OPEN")
+    assert signals(quiet, inst["id"])[0]["message"] == "Limit 258.70 (bid 260)"
+
+
+def test_unfilled_option_exit_reprices_until_filled(options, monkeypatch):
+    monkeypatch.setattr(settings, "option_exit_reprice_interval", 0.05)
+    quiet, inst = options()
+    SCRIPT.extend([("buy", None, "entry", OPT), ("sell", 1, "stop", OPT)])
+    tick(quiet)
+    BOOK["bid"] = 260.0
+    tick(quiet)
     assert option_orders(quiet)[1] == ("SELL", 258.7, "OPEN")
 
-    BOOK["bid"] = 230.0  # 11% lower: past any entry cap, still chased
-    wait(quiet)
-    assert option_orders(quiet)[1] == ("SELL", 228.85, "OPEN")
-    del BOOK["bid"]  # the real bid, 200
-    wait(quiet)
+    BOOK["bid"] = 200.0
+    wait(quiet, 0.12)
     assert option_orders(quiet)[1] == ("SELL", 199.0, "FILLED")
     assert instance(quiet, inst["id"])["position"] == 0
 

@@ -94,11 +94,14 @@ class Settings(BaseSettings):
     # them on later expiries). Priced from market depth: buys at the best ask + this %, sells
     # at the best bid - this %, on the 0.05 tick, so they fill straight away.
     option_limit_buffer_pct: float = 0.5
-    # Without market depth: from the last traded price, this % through it.
-    option_ltp_buffer_pct: float = 3.0
+    # Protective exits have their own marketable buffer and faster repricing policy.
+    option_exit_limit_buffer_pct: float = Field(0.5, ge=0)
+    # Used only when the relevant ask/bid depth is unavailable. The order remains a limit.
+    option_ltp_buffer_pct: float = Field(3.0, ge=0)
     # Seconds between checks of an unfilled option order: if the market has moved past it, it
     # is repriced to the new best ask / bid + buffer. Exits are repriced until they fill.
     option_reprice_interval: float = Field(5.0, gt=0)
+    option_exit_reprice_interval: float = Field(0.5, gt=0)
     # Entries give up instead: the order is cancelled and the trade skipped after this many
     # checks, or rather than reprice more than option_entry_max_chase_pct past its first price.
     option_entry_max_reprices: int = Field(6, ge=0)
