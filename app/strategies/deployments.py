@@ -15,7 +15,7 @@ try a strategy without real money, run it on a paper account.
 
 from app.strategies.builtin.intraday_breakout import IntradayBreakout
 from app.strategies.builtin.intraday_breakout_options import IntradayBreakoutOptions
-from app.strategies.builtin.nifty_intraday_limited import NiftyIntradayLimited
+from app.strategies.builtin.nifty_intraday_limited_options import NiftyIntradayLimitedOptions
 from app.strategies.builtin.nifty_trailing_reversal import NiftyTrailingReversal
 from app.strategies.builtin.nifty_trailing_reversal_options import NiftyTrailingReversalOptions
 from app.strategies.builtin.sma_crossover import SmaCrossover
@@ -24,15 +24,17 @@ from app.strategies.deployment import Deployment
 DEPLOYMENTS: list[Deployment] = [
     Deployment(
         key="nifty-intraday-limited",
-        label="NIFTY Limited-Trade Strategy · Intraday + Overnight",
-        strategy=NiftyIntradayLimited,
+        label="NIFTY Limited-Trade Strategy · 500-point ITM Options",
+        strategy=NiftyIntradayLimitedOptions,
+        symbol="NSE:NIFTY50-INDEX",
         timeframe="5m",
-        params=NiftyIntradayLimited.Params(
+        params=NiftyIntradayLimitedOptions.Params(
             lookback=18,
             z_threshold=1.0,
             stop_points=50,
             target_points=300,
             max_entries_per_day=3,
+            itm_points=500,
         ),
         quantity=65,
         max_order_qty=65,
