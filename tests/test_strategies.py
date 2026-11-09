@@ -375,6 +375,28 @@ def test_unfilled_entry_is_repriced_to_the_new_ask(options, monkeypatch):
     assert instance(quiet, inst["id"])["position"] == 1
 
 
+def test_option_entry_reprices_immediately_before_first_interval(options, monkeypatch):
+    from app.brokers.base import Depth
+    from app.brokers.paper import PaperBroker
+
+    calls = 0
+
+    async def moving_depth(self, symbol):
+        nonlocal calls
+        calls += 1
+        return Depth(bid=190.0, ask=190.0 if calls == 1 else 199.0)
+
+    monkeypatch.setattr(PaperBroker, "get_depth", moving_depth)
+    monkeypatch.setattr(settings, "option_reprice_interval", 1.0)
+    quiet, inst = options()
+    SCRIPT.append(("buy", None, "entry", OPT))
+    tick(quiet)
+    wait(quiet, 0.05)  # much shorter than the configured one-second repeat interval
+
+    assert option_orders(quiet) == [("BUY", 200.0, "FILLED")]
+    assert instance(quiet, inst["id"])["position"] == 1
+
+
 def test_entry_is_cancelled_rather_than_chase_too_far(options):
     quiet, inst = options()
     BOOK["ask"] = 190.0

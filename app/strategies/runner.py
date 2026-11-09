@@ -11,8 +11,8 @@ paper account to try a strategy). Safety rules, applied to every buy/sell before
     that only shrink the position (exits are never blocked by limits)
   - live orders also pause while the trade ledger has updates it couldn't save
   - options use protected limit orders: ask-based entries and bid-based exits, with LTP only
-    when depth is unavailable. Protective exits refresh immediately and then every 0.5 seconds
-    until filled; they are never sent as market orders
+    when depth is unavailable. Both refresh immediately and then every 0.5 seconds; exits chase
+    until filled, while entries retain their time and maximum-price safeguards
 A strategy that raises an exception is stopped with status "error".
 
 Each running instance has its own tick queue and worker task, so a strategy that is slow
@@ -845,8 +845,8 @@ class StrategyRunner:
 
     async def _chase(self, inst: RunningInstance, order_id: str, symbol: str, side: Side,
                      first_limit: float, closing: bool) -> None:
-        """Keep an unfilled option order where it can fill. Protective exits check a fresh book
-        immediately and then frequently; entries wait the conservative option_reprice_interval.
+        """Keep an unfilled option order where it can fill. Entries and protective exits check
+        a fresh book immediately and then at their configured short intervals.
         If the best ask (buying) or bid (selling) + buffer has moved past the limit, move the
         limit there. An exit (`closing`) is chased until it fills. An entry is cancelled, and the trade
         skipped, after option_entry_max_reprices checks or rather than go more than
@@ -857,7 +857,7 @@ class StrategyRunner:
         cap = first_limit * (1 + sign * cfg.option_entry_max_chase_pct / 100)
         limit, checks, first_check = first_limit, 0, True
         while True:
-            if not (closing and first_check):
+            if not first_check:
                 await asyncio.sleep(
                     cfg.option_exit_reprice_interval if closing else cfg.option_reprice_interval)
             first_check = False

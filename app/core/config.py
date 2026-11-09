@@ -98,13 +98,14 @@ class Settings(BaseSettings):
     option_exit_limit_buffer_pct: float = Field(0.5, ge=0)
     # Used only when the relevant ask/bid depth is unavailable. The order remains a limit.
     option_ltp_buffer_pct: float = Field(3.0, ge=0)
-    # Seconds between checks of an unfilled option order: if the market has moved past it, it
-    # is repriced to the new best ask / bid + buffer. Exits are repriced until they fill.
-    option_reprice_interval: float = Field(5.0, gt=0)
+    # Seconds between checks of an unfilled option entry: if the market has moved past it, it
+    # is repriced to the new best ask + buffer. Entries and exits both refresh every 0.5s.
+    option_reprice_interval: float = Field(0.5, gt=0)
     option_exit_reprice_interval: float = Field(0.5, gt=0)
     # Entries give up instead: the order is cancelled and the trade skipped after this many
     # checks, or rather than reprice more than option_entry_max_chase_pct past its first price.
-    option_entry_max_reprices: int = Field(6, ge=0)
+    # 60 checks at 0.5s preserves the previous roughly 30-second entry chase window.
+    option_entry_max_reprices: int = Field(60, ge=0)
     option_entry_max_chase_pct: float = Field(5.0, ge=0)
 
 
