@@ -224,6 +224,8 @@ def test_history_warmup_retries_after_temporary_broker_failure():
         await strategy.on_start()
         assert not strategy._history_warmed and ctx.calls == []
         retry = strategy._warmup_retry_at + timedelta(seconds=1)
+        market_open = datetime.combine(retry.date(), time(9, 15), tzinfo=IST)
+        retry = max(retry, market_open)  # on_tick intentionally ignores pre-open timestamps
         await strategy.on_tick(Tick("NSE:NIFTY50-INDEX", 25_000, retry))
 
     asyncio.run(go())

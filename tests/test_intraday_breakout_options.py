@@ -80,7 +80,16 @@ def test_index_signals_become_option_buys_and_sells(monkeypatch):
                          ("BUY", 130, "NSE:NIFTY031125300PE"), ("SELL", 130, "NSE:NIFTY031125300PE")]
 
 
-def test_less_than_a_lot_is_skipped():
+def test_less_than_a_lot_is_skipped(monkeypatch):
+    import app.strategies.builtin.intraday_breakout_options as mod
+
+    class Now:
+        @staticmethod
+        def now(tz=None):
+            return datetime(2026, 10, 28, 11, 0, tzinfo=tz)
+
+    monkeypatch.setattr(mod, "datetime", Now)
+
     async def go():
         ctx = FakeCtx(quantity=50)
         legs = OptionLegs(ctx, 300)
