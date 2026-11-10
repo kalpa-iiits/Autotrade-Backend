@@ -156,7 +156,11 @@ def test_morning_run_logs_in_only_accounts_that_need_it(client, monkeypatch):
             raise AutoLoginError("verify TOTP: Invalid OTP")  # first try fails, retry works
         return "tok"
 
+    async def valid(creds, token, http=None):
+        return None
+
     monkeypatch.setattr(autologin, "fyers_login", flaky)
+    monkeypatch.setattr(autologin, "validate_fyers_token", valid)
     due = add_fyers(client).json()["id"]
     add_fyers(client, {"client_id": "XB9-100", "secret_key": "s"})  # no login details: skipped
     job: AutoLogin = client.app.state.auto_login
@@ -167,6 +171,29 @@ def test_morning_run_logs_in_only_accounts_that_need_it(client, monkeypatch):
 
     run(client, job.run_once)  # already logged in today: nothing to do
     assert len(attempts) == 2
+
+
+def test_morning_run_replaces_rejected_overnight_fyers_token(client, monkeypatch):
+    logins = []
+
+    async def rejected(creds, token, http=None):
+        assert token == "overnight-token"
+        raise AutoLoginError("validate access token: Could not authenticate the user")
+
+    async def fresh(creds, redirect_uri, http=None):
+        logins.append(creds["client_id"])
+        return "market-token"
+
+    monkeypatch.setattr(autologin, "validate_fyers_token", rejected)
+    monkeypatch.setattr(autologin, "fyers_login", fresh)
+    account_id = add_fyers(client).json()["id"]
+    run(client, store.save_token, account_id, "overnight-token")
+
+    run(client, client.app.state.auto_login.run_once, 1)
+
+    account = run(client, store.get_account, account_id)
+    assert run(client, store.token_of, account) == "market-token"
+    assert logins == ["XB12345-100"]
 
 
 def test_schedule_time(client):

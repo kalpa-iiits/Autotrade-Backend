@@ -104,6 +104,20 @@ def _exchange_auth_code(creds: dict, redirect_uri: str, auth_code: str) -> str:
     return resp["access_token"]
 
 
+async def validate_fyers_token(creds: dict, token: str, http: httpx.AsyncClient | None = None) -> None:
+    """Raise when Fyers' trading API does not accept a stored or newly issued token."""
+    own = http is None
+    http = http or httpx.AsyncClient(timeout=20)
+    try:
+        r = await http.get(PROFILE_URL, headers={"Authorization": f"{creds['client_id']}:{token}"})
+        data = _check(r, "validate access token")
+        if data.get("s") != "ok":
+            raise AutoLoginError(f"validate access token: {data.get('message') or data}")
+    finally:
+        if own:
+            await http.aclose()
+
+
 async def fyers_login(creds: dict, redirect_uri: str, http: httpx.AsyncClient | None = None) -> str:
     """Today's access token for a Fyers app, from the account holder's user id, PIN and TOTP."""
     own = http is None
@@ -134,10 +148,7 @@ async def fyers_login(creds: dict, redirect_uri: str, http: httpx.AsyncClient | 
         # save that token as today's login: validate it now so AutoLogin.login retries with a
         # fresh TOTP/token instead of discovering the failure when the market opens.
         token = await asyncio.to_thread(_exchange_auth_code, creds, redirect_uri, auth_code)
-        r = await http.get(PROFILE_URL, headers={"Authorization": f"{creds['client_id']}:{token}"})
-        data = _check(r, "validate access token")
-        if data.get("s") != "ok":
-            raise AutoLoginError(f"validate access token: {data.get('message') or data}")
+        await validate_fyers_token(creds, token, http)
         return token
     finally:
         if own:
@@ -252,14 +263,27 @@ class AutoLogin:
         log.info("%s auto-login for account %s succeeded", title, account.id)
 
     async def run_once(self, attempts: int = ATTEMPTS) -> None:
-        """Every Fyers / Zerodha account with login details and no token for today."""
+        """Log in accounts with no working token, including an expired early-morning token."""
         due = []
         for account in await store.list_accounts():
             if account.broker not in AUTO_LOGIN_FIELDS:
                 continue
             try:
-                if has_auto_login(account.broker, store.credentials_of(account)) and store.token_of(account) is None:
+                creds = store.credentials_of(account)
+                if not has_auto_login(account.broker, creds):
+                    continue
+                token = store.token_of(account)
+                if token is None:
                     due.append(account)
+                elif account.broker == "fyers":
+                    try:
+                        await validate_fyers_token(creds, token)
+                    except Exception as e:
+                        log.warning("Stored Fyers token for account %s was rejected; logging in again: %s",
+                                    account.id, e)
+                        await store.clear_token(account.id)
+                        await self.accounts.disconnect(account.id, "Stored Fyers token was rejected")
+                        due.append(account)
             except VaultError as e:
                 log.warning("Auto-login skipped for account %s: %s", account.id, e)
         results = await asyncio.gather(*(self.login(a, attempts=attempts) for a in due), return_exceptions=True)
