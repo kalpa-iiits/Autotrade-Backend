@@ -122,12 +122,14 @@ page), up to `AUTOTRADE_MAX_ACCOUNTS_PER_USER` (10). Each has a label unique to 
   `pin` and `totp_secret` (the key shown when you enable external 2FA / TOTP on Fyers) to its
   credentials, all three or none. Every day at `AUTOTRADE_FYERS_AUTO_LOGIN_TIME` (IST, default
   `08:45`; empty turns it off) the server logs those accounts in without a browser, retrying
-  twice, and again at startup if it comes up later with no token for today.
+  twice. At `AUTOTRADE_FYERS_AUTO_LOGIN_RETRY_TIME` (default `09:10`) it makes one final attempt
+  for accounts that still have no valid token. It also runs at startup if the server comes up
+  later with no token for today.
   `POST /api/accounts/{id}/auto-login` runs it now. It uses Fyers' web-login endpoints, which
   are not part of the documented API and may change; the browser login keeps working either way.
 - **Zerodha auto-login** (optional): add the account's Kite `user_id`, login `password` and
   `totp_secret` (the key shown when you enable external TOTP on Kite) to its credentials, all
-  three or none. It runs on the same schedule as Fyers (`AUTOTRADE_FYERS_AUTO_LOGIN_TIME`) and
+  three or none. It runs on the same schedule as Fyers (08:45 plus the 09:10 fallback) and
   through the same `POST /api/accounts/{id}/auto-login`. It logs in the way the Kite web login
   does, opens the Kite Connect login for the account's app and reads the request token off the
   redirect to `/auth/zerodha/callback` (it never calls the callback). Log in once through the

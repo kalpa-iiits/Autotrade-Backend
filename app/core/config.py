@@ -63,6 +63,8 @@ class Settings(BaseSettings):
     # secret stored (app/accounts/autologin.py). Despite the name, it is for both brokers.
     # Empty: no auto-login.
     fyers_auto_login_time: str = Field("08:45", pattern=r"^(([01]\d|2[0-3]):[0-5]\d)?$")
+    # One more morning pass for accounts that still have no valid token. Empty disables it.
+    fyers_auto_login_retry_time: str = Field("09:10", pattern=r"^(([01]\d|2[0-3]):[0-5]\d)?$")
 
     # ---------- reliability ----------
     # Only one server process may run strategies and place orders: it holds this lock file

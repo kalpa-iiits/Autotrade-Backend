@@ -49,7 +49,7 @@ def test_headless_flow(monkeypatch):
     seen = []
 
     def handler(request: httpx.Request) -> httpx.Response:
-        body = json.loads(request.content)
+        body = json.loads(request.content) if request.content else None
         seen.append((request.url.path, body))
         if request.url.path.endswith("send_login_otp_v2"):
             assert base64.b64decode(body["fy_id"]).decode() == "XA12345"
@@ -60,6 +60,9 @@ def test_headless_flow(monkeypatch):
         if request.url.path.endswith("verify_pin_v2"):
             assert base64.b64decode(body["identifier"]).decode() == "1234"
             return httpx.Response(200, json={"s": "ok", "data": {"access_token": "trade"}})
+        if request.url.path.endswith("profile"):
+            assert request.headers["Authorization"] == "XB12345-100:token-for-CODE"
+            return httpx.Response(200, json={"s": "ok", "data": {"name": "Test"}})
         assert request.headers["Authorization"] == "Bearer trade"
         assert body["app_id"] == "XB12345" and body["appType"] == "100"
         return httpx.Response(308, json={"s": "ok", "Url": "https://x/cb?auth_code=CODE&state=autologin"})
@@ -72,7 +75,30 @@ def test_headless_flow(monkeypatch):
 
     import asyncio
     assert asyncio.run(go()) == "token-for-CODE"
-    assert len(seen) == 4
+    assert len(seen) == 5
+
+
+def test_headless_flow_rejects_an_unusable_access_token(monkeypatch):
+    def handler(request: httpx.Request) -> httpx.Response:
+        if request.url.path.endswith("send_login_otp_v2"):
+            return httpx.Response(200, json={"s": "ok", "request_key": "k1"})
+        if request.url.path.endswith("verify_otp"):
+            return httpx.Response(200, json={"s": "ok", "request_key": "k2"})
+        if request.url.path.endswith("verify_pin_v2"):
+            return httpx.Response(200, json={"s": "ok", "data": {"access_token": "trade"}})
+        if request.url.path.endswith("token"):
+            return httpx.Response(308, json={"s": "ok", "Url": "https://x/cb?auth_code=CODE"})
+        return httpx.Response(401, json={"s": "error", "message": "Could not authenticate the user"})
+
+    monkeypatch.setattr(autologin, "_exchange_auth_code", lambda *_: "bad-token")
+
+    async def go():
+        async with httpx.AsyncClient(transport=httpx.MockTransport(handler)) as http:
+            await fyers_login(FYERS_AUTO, "https://x/cb", http)
+
+    import asyncio
+    with pytest.raises(AutoLoginError, match="validate access token: Could not authenticate the user"):
+        asyncio.run(go())
 
 
 def test_headless_flow_reports_the_failing_step():
@@ -147,6 +173,11 @@ def test_schedule_time(client):
     job: AutoLogin = client.app.state.auto_login
     now = datetime(2026, 11, 9, 7, 0, tzinfo=IST)
     assert job._today_at(now) == datetime(2026, 11, 9, 8, 45, tzinfo=IST)
+    assert job._next_run(now) == datetime(2026, 11, 9, 8, 45, tzinfo=IST)
+    assert job._next_run(datetime(2026, 11, 9, 8, 46, tzinfo=IST)) == datetime(2026, 11, 9, 9, 10, tzinfo=IST)
+    assert job._next_run(datetime(2026, 11, 9, 9, 10, tzinfo=IST)) == datetime(2026, 11, 10, 8, 45, tzinfo=IST)
+    assert job._attempts_at(datetime(2026, 11, 9, 8, 45, tzinfo=IST)) == 3
+    assert job._attempts_at(datetime(2026, 11, 9, 9, 10, tzinfo=IST)) == 1
 
 
 # ---------- Zerodha ----------

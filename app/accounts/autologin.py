@@ -14,9 +14,10 @@ once by a browser login, and the Kite account must use TOTP (external 2FA).
 None of these endpoints are part of the brokers' documented APIs and they may change; when
 they fail, the manual broker login (/api/accounts/<id>/broker-login) still works.
 
-Runs at AUTOTRADE_FYERS_AUTO_LOGIN_TIME (IST; despite the name, for every broker) every day, and
-once at startup if the server comes up after that time with an account that has no token for
-today.
+Runs at AUTOTRADE_FYERS_AUTO_LOGIN_TIME (IST; despite the name, for every broker), makes one
+more pass at AUTOTRADE_FYERS_AUTO_LOGIN_RETRY_TIME for accounts still not logged in, and runs
+once at startup if the server comes up after the first time with an account that has no token
+for today.
 """
 
 import asyncio
@@ -44,6 +45,7 @@ log = logging.getLogger(__name__)
 
 VAGATOR = "https://api-t2.fyers.in/vagator/v2"
 TOKEN_URL = "https://api-t1.fyers.in/api/v3/token"
+PROFILE_URL = "https://api-t1.fyers.in/api/v3/profile"
 KITE = "https://kite.zerodha.com"
 KITE_HOSTS = {"kite.zerodha.com", "kite.trade"}  # redirects we follow (with the Kite session)
 MAX_REDIRECTS = 10
@@ -127,10 +129,19 @@ async def fyers_login(creds: dict, redirect_uri: str, http: httpx.AsyncClient | 
         auth_code = (parse_qs(urlparse(url).query).get("auth_code") or [""])[0]
         if not auth_code:
             raise AutoLoginError(f"authorize app: no auth code ({data.get('message') or 'check the redirect URI'})")
+
+        # Fyers can complete the web flow yet issue a token its trading API rejects.  Do not
+        # save that token as today's login: validate it now so AutoLogin.login retries with a
+        # fresh TOTP/token instead of discovering the failure when the market opens.
+        token = await asyncio.to_thread(_exchange_auth_code, creds, redirect_uri, auth_code)
+        r = await http.get(PROFILE_URL, headers={"Authorization": f"{creds['client_id']}:{token}"})
+        data = _check(r, "validate access token")
+        if data.get("s") != "ok":
+            raise AutoLoginError(f"validate access token: {data.get('message') or data}")
+        return token
     finally:
         if own:
             await http.aclose()
-    return await asyncio.to_thread(_exchange_auth_code, creds, redirect_uri, auth_code)
 
 
 # ---------- Zerodha ----------
@@ -240,7 +251,7 @@ class AutoLogin:
         self.last[account.id] = {"at": datetime.now(IST).isoformat(), "ok": True, "error": None}
         log.info("%s auto-login for account %s succeeded", title, account.id)
 
-    async def run_once(self) -> None:
+    async def run_once(self, attempts: int = ATTEMPTS) -> None:
         """Every Fyers / Zerodha account with login details and no token for today."""
         due = []
         for account in await store.list_accounts():
@@ -251,7 +262,7 @@ class AutoLogin:
                     due.append(account)
             except VaultError as e:
                 log.warning("Auto-login skipped for account %s: %s", account.id, e)
-        results = await asyncio.gather(*(self.login(a) for a in due), return_exceptions=True)
+        results = await asyncio.gather(*(self.login(a, attempts=attempts) for a in due), return_exceptions=True)
         for account, result in zip(due, results):
             if isinstance(result, Exception):
                 log.error("Auto-login for account %s (%s) gave up: %s", account.id, account.broker, result)
@@ -259,6 +270,27 @@ class AutoLogin:
     def _today_at(self, now: datetime) -> datetime:
         hour, minute = map(int, self.settings.fyers_auto_login_time.split(":"))
         return now.replace(hour=hour, minute=minute, second=0, microsecond=0)
+
+    def _run_times(self, now: datetime) -> list[datetime]:
+        values = [self.settings.fyers_auto_login_time]
+        if self.settings.fyers_auto_login_retry_time:
+            values.append(self.settings.fyers_auto_login_retry_time)
+        times = []
+        for value in values:
+            hour, minute = map(int, value.split(":"))
+            times.append(now.replace(hour=hour, minute=minute, second=0, microsecond=0))
+        return sorted(set(times))
+
+    def _next_run(self, now: datetime) -> datetime:
+        for at in self._run_times(now):
+            if at > now:
+                return at
+        tomorrow = now + timedelta(days=1)
+        return self._run_times(tomorrow)[0]
+
+    def _attempts_at(self, at: datetime) -> int:
+        retry = self.settings.fyers_auto_login_retry_time
+        return 1 if retry and at.strftime("%H:%M") == retry else ATTEMPTS
 
     async def _loop(self) -> None:
         if datetime.now(IST) >= self._today_at(datetime.now(IST)):
@@ -268,12 +300,10 @@ class AutoLogin:
                 log.exception("Auto-login run failed")
         while True:
             now = datetime.now(IST)
-            at = self._today_at(now)
-            if at <= now:
-                at += timedelta(days=1)
+            at = self._next_run(now)
             await asyncio.sleep((at - now).total_seconds())
             try:
-                await self.run_once()
+                await self.run_once(attempts=self._attempts_at(at))
             except Exception:
                 log.exception("Auto-login run failed")
 
