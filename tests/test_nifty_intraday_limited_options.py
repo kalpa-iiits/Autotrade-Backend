@@ -2,6 +2,7 @@ import asyncio
 from datetime import date
 
 from app.brokers.base import OptionContract
+from app.orders.schemas import Product
 from app.strategies.builtin.nifty_intraday_limited_options import (
     LimitedTradeOptionLegs,
     NiftyIntradayLimitedOptions,
@@ -31,18 +32,21 @@ class FakeCtx:
         self.held_symbol = None
         self.order_pending = False
         self.calls = []
+        self.products = []
         self.logs = []
 
     async def option_contracts(self):
         return chain()
 
-    async def buy(self, quantity=None, reason=None, symbol=None):
+    async def buy(self, quantity=None, reason=None, symbol=None, product=None):
         self.calls.append(("BUY", quantity, symbol, reason))
+        self.products.append(product)
         self.position += quantity
         self.held_symbol = symbol
 
-    async def sell(self, quantity=None, reason=None, symbol=None):
+    async def sell(self, quantity=None, reason=None, symbol=None, product=None):
         self.calls.append(("SELL", quantity, symbol, reason))
+        self.products.append(product)
         self.position -= quantity
 
     def log(self, message):
@@ -95,6 +99,7 @@ def test_overnight_option_skips_same_day_expiry(monkeypatch):
     ctx = asyncio.run(go())
     assert ctx.calls[0][2] == "NSE:NIFTY031124500CE"
     assert "500 points ITM" in ctx.calls[0][3]
+    assert ctx.products == [Product.DELIVERY]
 
 
 def test_option_adapter_keeps_stops_in_nifty_points(monkeypatch):

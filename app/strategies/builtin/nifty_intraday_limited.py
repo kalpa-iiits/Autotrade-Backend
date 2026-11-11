@@ -15,6 +15,7 @@ from pydantic import BaseModel, ConfigDict, Field
 
 from app.brokers import OrderError
 from app.brokers.base import Candle
+from app.orders.schemas import Product
 from app.strategies.base import Bar, Strategy, Tick, before_market_open
 
 IST = ZoneInfo("Asia/Kolkata")
@@ -521,9 +522,13 @@ class NiftyIntradayLimited(Strategy):
                 self._entry_pending = signal
                 await self._save_checkpoint()
                 if signal > 0:
-                    await self.ctx.buy(reason="long z-score/EMA signal")
+                    await self.ctx.buy(
+                        reason="long z-score/EMA signal", product=Product.INTRADAY,
+                    )
                 else:
-                    await self.ctx.sell(reason="short z-score/EMA signal")
+                    await self.ctx.sell(
+                        reason="short z-score/EMA signal", product=Product.INTRADAY,
+                    )
                 await self._reconcile_entry(getattr(self.ctx, "last_price", None) or bar.close)
         await self._save_checkpoint()
 
@@ -565,9 +570,13 @@ class NiftyIntradayLimited(Strategy):
         self._overnight_sent_at = now
         await self._save_checkpoint()
         if direction > 0:
-            await self.ctx.buy(reason="overnight long at 15:15")
+            await self.ctx.buy(
+                reason="overnight long at 15:15", product=Product.DELIVERY,
+            )
         else:
-            await self.ctx.sell(reason="overnight short at 15:15")
+            await self.ctx.sell(
+                reason="overnight short at 15:15", product=Product.DELIVERY,
+            )
         await self._reconcile_overnight(getattr(self.ctx, "last_price", None) or 0)
 
     async def _reconcile_overnight(self, price: float) -> None:
@@ -616,7 +625,9 @@ class NiftyIntradayLimited(Strategy):
             return
         self._exit_sent_at = now
         await self._save_checkpoint()
-        await self.ctx.exit(reason=reason)
+        product = (Product.DELIVERY if self._trade_kind == "overnight"
+                   else Product.INTRADAY)
+        await self.ctx.exit(reason=reason, product=product)
 
     async def on_clock(self, now: datetime) -> None:
         local = now.astimezone(IST)

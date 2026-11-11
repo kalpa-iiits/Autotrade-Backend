@@ -5,6 +5,7 @@ from zoneinfo import ZoneInfo
 import pytest
 
 from app.brokers.base import Candle
+from app.orders.schemas import Product
 from app.strategies.base import Bar, Tick
 from app.strategies.builtin.nifty_intraday_limited import NiftyIntradayLimited
 from app.strategies.deployments import DEPLOYMENTS
@@ -56,21 +57,25 @@ class LiveCtx:
         self.order_pending = False
         self.strategy_state = {}
         self.calls = []
+        self.products = []
         self.history_candles = []
         self.logs = []
 
-    async def buy(self, quantity=None, reason=None):
+    async def buy(self, quantity=None, reason=None, product=None):
         self.calls.append(("buy", reason))
+        self.products.append(product)
         self.position += quantity or self.quantity
         self.last_fill_price = self.last_price
 
-    async def sell(self, quantity=None, reason=None):
+    async def sell(self, quantity=None, reason=None, product=None):
         self.calls.append(("sell", reason))
+        self.products.append(product)
         self.position -= quantity or self.quantity
         self.last_fill_price = self.last_price
 
-    async def exit(self, reason=None):
+    async def exit(self, reason=None, product=None):
         self.calls.append(("exit", reason))
+        self.products.append(product)
         self.position = 0
 
     async def save_strategy_state(self, state):
@@ -257,6 +262,7 @@ def test_live_sequence_exits_intraday_before_opening_overnight():
     asyncio.run(strategy._begin_overnight(24_085, at("15:15")))
 
     assert [call[0] for call in ctx.calls] == ["exit", "buy"]
+    assert ctx.products == [Product.INTRADAY, Product.DELIVERY]
     assert ctx.position == 65
     assert strategy._trade_kind == "overnight"
     assert strategy.stop is strategy.target is None
@@ -265,6 +271,7 @@ def test_live_sequence_exits_intraday_before_opening_overnight():
     ctx.last_price = 24_020
     asyncio.run(strategy.on_tick(Tick(ctx.symbol, 24_020, next_open)))
     assert ctx.calls[-1][0] == "exit"
+    assert ctx.products[-1] == Product.DELIVERY
     assert ctx.position == 0
 
 

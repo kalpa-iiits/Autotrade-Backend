@@ -43,7 +43,7 @@ from app.core.config import Settings
 from app.core.db import utcnow
 from app.core.market import in_market_hours, seconds_until_market_hours
 from app.orders.models import OrderRecord
-from app.orders.schemas import Order, OrderStatus, OrderType, PlaceOrder, Side
+from app.orders.schemas import Order, OrderStatus, OrderType, PlaceOrder, Product, Side
 from app.strategies.backtest import Backtester
 from app.strategies.base import TIMEFRAMES, Strategy, Tick
 from app.strategies.deployment import Deployment
@@ -190,12 +190,18 @@ class StrategyContext:
         """The other instrument (e.g. an option) this instance last bought, while it holds one."""
         return self._inst.held_symbol if self._inst.position else None
 
-    async def buy(self, quantity: int | None = None, reason: str | None = None, symbol: str | None = None) -> None:
+    async def buy(self, quantity: int | None = None, reason: str | None = None,
+                  symbol: str | None = None, product: Product | None = None) -> None:
         """Buy `symbol` (default: the instance's own symbol, whose ticks it receives)."""
-        await self._runner.request(self._inst, Side.BUY, quantity or self._sized(reason), reason, symbol)
+        await self._runner.request(
+            self._inst, Side.BUY, quantity or self._sized(reason), reason, symbol, product,
+        )
 
-    async def sell(self, quantity: int | None = None, reason: str | None = None, symbol: str | None = None) -> None:
-        await self._runner.request(self._inst, Side.SELL, quantity or self._sized(reason), reason, symbol)
+    async def sell(self, quantity: int | None = None, reason: str | None = None,
+                   symbol: str | None = None, product: Product | None = None) -> None:
+        await self._runner.request(
+            self._inst, Side.SELL, quantity or self._sized(reason), reason, symbol, product,
+        )
 
     async def option_contracts(self) -> list[OptionContract]:
         """Options listed on the instance's symbol, from its broker."""
@@ -212,12 +218,12 @@ class StrategyContext:
                      f"of {self.symbol} at {self._inst.last_price}")
         return quantity
 
-    async def exit(self, reason: str | None = None) -> None:
+    async def exit(self, reason: str | None = None, product: Product | None = None) -> None:
         """Flatten the position."""
         if self.position > 0:
-            await self.sell(self.position, reason)
+            await self.sell(self.position, reason, product=product)
         elif self.position < 0:
-            await self.buy(-self.position, reason)
+            await self.buy(-self.position, reason, product=product)
 
     async def history(self, resolution: str = "D", days: int = 30) -> list:
         """Candles for this symbol over the last `days` calendar days (oldest first), from the
@@ -732,7 +738,7 @@ class StrategyRunner:
         return None
 
     async def request(self, inst: RunningInstance, side: Side, quantity: int, reason: str | None,
-                      symbol: str | None = None) -> None:
+                      symbol: str | None = None, product: Product | None = None) -> None:
         """Place an order on `symbol` (default the instance's own) and record it as a signal.
         The instance keeps one net position whichever symbol it trades."""
         if quantity <= 0:
@@ -752,7 +758,7 @@ class StrategyRunner:
                 signal.outcome, signal.message = "blocked", blocked
             else:
                 inst.last_fill_price = None
-                await self._place(inst, side, quantity, signal)
+                await self._place(inst, side, quantity, signal, product)
             if symbol != inst.symbol and side == Side.BUY and signal.outcome == "placed":
                 inst.held_symbol = symbol
             await self._record(signal, inst.account_id)
@@ -794,7 +800,8 @@ class StrategyRunner:
             return option_limit_price(last, side, self.settings.option_ltp_buffer_pct), f"last {last:g}; no depth"
         return None
 
-    async def _place(self, inst: RunningInstance, side: Side, quantity: int, signal: StrategySignal) -> None:
+    async def _place(self, inst: RunningInstance, side: Side, quantity: int,
+                     signal: StrategySignal, product: Product | None = None) -> None:
         service = self.service(inst.account_id)
         signal.broker = service.name
         order_type, limit_price = OrderType.MARKET, None
@@ -816,7 +823,7 @@ class StrategyRunner:
         try:
             order = await service.place_order(PlaceOrder(
                 action="place_order", symbol=signal.symbol, side=side, quantity=quantity,
-                order_type=order_type, limit_price=limit_price,
+                order_type=order_type, limit_price=limit_price, product=product,
             ))
         except OrderError as e:
             signal.outcome, signal.message = "rejected", str(e)

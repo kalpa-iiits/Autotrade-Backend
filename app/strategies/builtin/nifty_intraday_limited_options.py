@@ -9,6 +9,7 @@ from datetime import datetime, timedelta
 
 from pydantic import Field
 
+from app.orders.schemas import Product
 from app.strategies.builtin.intraday_breakout_options import pick_contract
 from app.strategies.builtin.nifty_intraday_limited import IST, NiftyIntradayLimited
 
@@ -34,29 +35,36 @@ class LimitedTradeOptionLegs:
         """The strategy's stops and targets remain NIFTY-index point levels."""
         return None
 
-    async def buy(self, quantity: int | None = None, reason: str | None = None) -> None:
+    async def buy(self, quantity: int | None = None, reason: str | None = None,
+                  product: Product | None = None) -> None:
         if self.position < 0:
-            await self.exit(reason)
+            await self.exit(reason, product)
         elif self.position == 0:
-            await self._open("CE", reason)
+            await self._open("CE", reason, product)
 
-    async def sell(self, quantity: int | None = None, reason: str | None = None) -> None:
+    async def sell(self, quantity: int | None = None, reason: str | None = None,
+                   product: Product | None = None) -> None:
         if self.position > 0:
-            await self.exit(reason)
+            await self.exit(reason, product)
         elif self.position == 0:
-            await self._open("PE", reason)
+            await self._open("PE", reason, product)
 
-    async def exit(self, reason: str | None = None) -> None:
+    async def exit(self, reason: str | None = None,
+                   product: Product | None = None) -> None:
         if self._ctx.position and self.held:
-            await self._ctx.sell(self._ctx.position, reason, symbol=self.held)
+            await self._ctx.sell(
+                self._ctx.position, reason, symbol=self.held, product=product,
+            )
 
-    async def _open(self, kind: str, reason: str | None) -> None:
+    async def _open(self, kind: str, reason: str | None,
+                    product: Product | None = None) -> None:
         spot = self._ctx.last_price
         if not spot:
             self._ctx.log(f"skipped ({reason}): no NIFTY price available")
             return
         today = datetime.now(IST).date()
         overnight = bool(reason and "overnight" in reason.lower())
+        product = Product.DELIVERY if overnight else product or Product.INTRADAY
         first_expiry = today + timedelta(days=1) if overnight else today
         contract = pick_contract(
             await self._ctx.option_contracts(), kind, spot, self._itm, first_expiry,
@@ -80,6 +88,7 @@ class LimitedTradeOptionLegs:
             f"{reason}; {kind} {contract.strike:g} {contract.expiry:%d %b}; "
             f"{self._itm:g} points ITM",
             symbol=contract.symbol,
+            product=product,
         )
 
 

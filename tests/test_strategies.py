@@ -9,6 +9,7 @@ from sqlalchemy import select
 
 from app.core.config import settings
 from app.main import app
+from app.orders.schemas import Product
 from app.strategies import deployments
 from app.strategies.base import Bar, BarBuilder, Strategy, Tick
 from app.strategies.builtin.sma_crossover import SmaCrossover
@@ -794,6 +795,21 @@ def test_trading_another_symbol_is_remembered_across_restarts(deploy):
     start_strategy(c, "a")
     running = c.app.state.strategy_runner.running[inst["id"]]
     assert (running.position, running.held_symbol) == (2, "NSE:SBIN26NOV800CE")
+
+
+def test_strategy_product_override_reaches_entry_and_exit_orders(deploy):
+    c = deploy(dep("a"))
+    start_strategy(c, "a")
+    SCRIPT.extend([
+        ("buy", 1, "overnight entry", None, Product.DELIVERY),
+        ("exit", "overnight exit", Product.DELIVERY),
+    ])
+
+    tick(c)
+    tick(c)
+
+    orders = list(runtime(c).service.broker.orders.values())
+    assert [order.product for order in orders] == [Product.DELIVERY, Product.DELIVERY]
 
 
 def test_option_strategies_take_fixed_quantity_only(deploy):
