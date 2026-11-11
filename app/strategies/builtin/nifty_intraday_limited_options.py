@@ -9,6 +9,8 @@ from datetime import datetime, timedelta
 
 from pydantic import Field
 
+from app.brokers import OrderError
+from app.brokers.base import OptionContract, OptionGreeks
 from app.orders.schemas import Product
 from app.strategies.builtin.intraday_breakout_options import pick_contract
 from app.strategies.builtin.nifty_intraday_limited import IST, NiftyIntradayLimited
@@ -21,6 +23,8 @@ class LimitedTradeOptionLegs:
         self._ctx = ctx
         self._itm = itm_points
         self.held = ctx.held_symbol
+
+    target_abs_delta = 0.85
 
     def __getattr__(self, name):
         return getattr(self._ctx, name)
@@ -66,15 +70,25 @@ class LimitedTradeOptionLegs:
         overnight = bool(reason and "overnight" in reason.lower())
         product = Product.DELIVERY if overnight else product or Product.INTRADAY
         first_expiry = today + timedelta(days=1) if overnight else today
-        contract = pick_contract(
-            await self._ctx.option_contracts(), kind, spot, self._itm, first_expiry,
-        )
+        contracts = await self._ctx.option_contracts()
+        contract = pick_contract(contracts, kind, spot, self._itm, first_expiry)
         if contract is None:
             holding = "overnight " if overnight else ""
             self._ctx.log(
                 f"skipped ({reason}): no {holding}{kind} contract found near NIFTY {spot}"
             )
             return
+        greek: OptionGreeks | None = None
+        if hasattr(self._ctx, "option_greeks"):
+            try:
+                rows = await self._ctx.option_greeks(contract.expiry)
+                greek, selected = pick_contract_by_delta(
+                    contracts, rows, kind, contract.expiry, self.target_abs_delta,
+                )
+                if selected is not None:
+                    contract = selected
+            except OrderError as error:
+                self._ctx.log(f"delta selection unavailable ({error}); using {self._itm:g}-point ITM fallback")
         quantity = self._ctx.quantity // contract.lot * contract.lot
         if quantity == 0:
             self._ctx.log(
@@ -83,22 +97,52 @@ class LimitedTradeOptionLegs:
             )
             return
         self.held = contract.symbol
+        if greek is not None:
+            values = [f"delta {greek.delta:+.3f}"]
+            if greek.iv is not None:
+                values.append(f"IV {greek.iv:.2f}%")
+            if greek.theta is not None:
+                values.append(f"theta {greek.theta:.2f}/day")
+            selection = f"{', '.join(values)}; target |delta| {self.target_abs_delta:.2f}"
+        else:
+            selection = f"{self._itm:g} points ITM fallback"
         await self._ctx.buy(
             quantity,
-            f"{reason}; {kind} {contract.strike:g} {contract.expiry:%d %b}; "
-            f"{self._itm:g} points ITM",
+            f"{reason}; {kind} {contract.strike:g} {contract.expiry:%d %b}; {selection}",
             symbol=contract.symbol,
             product=product,
         )
 
 
+def pick_contract_by_delta(
+    contracts: list[OptionContract], rows: list[OptionGreeks], kind: str, expiry,
+    target_abs_delta: float,
+) -> tuple[OptionGreeks | None, OptionContract | None]:
+    """Pick the liquid listed contract whose absolute live delta is closest to the target."""
+    by_symbol = {contract.symbol: contract for contract in contracts
+                 if contract.kind == kind and contract.expiry == expiry}
+    candidates = [row for row in rows
+                  if row.kind == kind and row.expiry == expiry and row.symbol in by_symbol
+                  and 0 < abs(row.delta) <= 1 and (row.ask is None or row.ask > 0)]
+    if not candidates:
+        return None, None
+
+    def key(row: OptionGreeks):
+        spread = ((row.ask - row.bid) / row.ask
+                  if row.ask and row.bid is not None and row.bid > 0 else float("inf"))
+        return abs(abs(row.delta) - target_abs_delta), spread
+
+    greek = min(candidates, key=key)
+    return greek, by_symbol[greek.symbol]
+
+
 class NiftyIntradayLimitedOptions(NiftyIntradayLimited):
     name = "nifty_intraday_limited_options"
     description = (
-        "NIFTY limited-trade intraday and overnight signals executed by buying 500-point "
-        "ITM calls for long signals and puts for short signals."
+        "NIFTY limited-trade intraday and overnight signals executed with calls and puts "
+        "selected near 0.85 absolute delta, with a 500-point ITM fallback."
     )
-    tags = ("Intraday + overnight", "NIFTY", "Options", "500-point ITM", "Long CE/PE")
+    tags = ("Intraday + overnight", "NIFTY", "Options", "0.85 delta", "Long CE/PE")
     capital_sizing = False
     backtest_note = (
         "Backtests replay the NIFTY index signals and report index points x quantity, not "
@@ -116,11 +160,17 @@ class NiftyIntradayLimitedOptions(NiftyIntradayLimited):
             if rule["kind"] == "entry_long":
                 rule["title"] = ("Buy overnight call (CE)" if "overnight" in title
                                  else "Buy intraday call (CE)")
-                rule["conditions"].append(f"Buys a CE approximately {p.itm_points:g} points ITM")
+                rule["conditions"].append(
+                    f"Targets +{LimitedTradeOptionLegs.target_abs_delta:.2f} delta; "
+                    f"falls back to approximately {p.itm_points:g} points ITM"
+                )
             elif rule["kind"] == "entry_short":
                 rule["title"] = ("Buy overnight put (PE)" if "overnight" in title
                                  else "Buy intraday put (PE)")
-                rule["conditions"].append(f"Buys a PE approximately {p.itm_points:g} points ITM")
+                rule["conditions"].append(
+                    f"Targets -{LimitedTradeOptionLegs.target_abs_delta:.2f} delta; "
+                    f"falls back to approximately {p.itm_points:g} points ITM"
+                )
             elif rule["kind"] == "exit":
                 rule["conditions"].append("Sells the option held for that NIFTY signal")
         return rules

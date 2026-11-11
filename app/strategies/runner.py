@@ -210,6 +210,13 @@ class StrategyContext:
             raise OrderError("Broker account not available")
         return await service.require().get_option_contracts(self.symbol)
 
+    async def option_greeks(self, expiry: date):
+        """Live option Greeks for the instance's underlying and selected expiry."""
+        service = self._runner.service(self._inst.account_id)
+        if service is None:
+            raise OrderError("Broker account not available")
+        return await service.require().get_option_greeks(self.symbol, expiry)
+
     def _sized(self, reason: str | None) -> int:
         quantity = self.quantity
         cfg = self._inst.config

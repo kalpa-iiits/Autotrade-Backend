@@ -59,6 +59,24 @@ class OptionContract:
     lot: int
 
 
+@dataclass(frozen=True)
+class OptionGreeks:
+    """Live option-chain values used to choose a contract before an entry."""
+
+    symbol: str
+    kind: Literal["CE", "PE"]
+    strike: float
+    expiry: date
+    delta: float
+    gamma: float | None = None
+    theta: float | None = None
+    vega: float | None = None
+    iv: float | None = None
+    ltp: float | None = None
+    bid: float | None = None
+    ask: float | None = None
+
+
 class OrderError(Exception):
     """An order request the broker refused (unknown symbol, cannot cancel, ...)."""
 
@@ -201,6 +219,12 @@ class Broker(ABC):
     async def get_option_contracts(self, underlying: str) -> list[OptionContract]:
         """Every unexpired CE/PE listed on `underlying` (e.g. the NIFTY 50 index); empty if the
         broker lists none or can't say."""
+        return []
+
+    async def get_option_greeks(
+        self, underlying: str, expiry: date, strike_count: int = 50,
+    ) -> list[OptionGreeks]:
+        """Live Greeks for one expiry. Brokers without a Greeks API return an empty list."""
         return []
 
     async def get_history(

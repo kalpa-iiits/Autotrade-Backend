@@ -8,7 +8,7 @@ from datetime import date, timedelta
 import pytest
 
 from app.brokers import MissingCredentials, OrderError
-from app.brokers.fyers import FyersBroker
+from app.brokers.fyers import FyersBroker, parse_option_greeks
 from tests.conftest import AUTH, TOKEN
 from app.orders.schemas import OrderStatus, OrderType, PlaceOrder, Side
 
@@ -19,6 +19,7 @@ class FakeModel:
         self.cancel_ok = True
         self.modified = []
         self.history_requests = []
+        self.optionchain_requests = []
 
     def place_order(self, data):
         self.placed.append(data)
@@ -67,6 +68,19 @@ class FakeModel:
         self.history_requests.append(data)
         return {"s": "ok", "candles": []}
 
+    def optionchain(self, data):
+        self.optionchain_requests.append(data)
+        if not data.get("timestamp"):
+            return {"s": "ok", "data": {"expiryData": [
+                {"date": "17-11-2026", "expiry": "1794918600", "expiry_flag": "W"},
+            ], "optionsChain": []}}
+        return {"s": "ok", "data": {"optionsChain": [{
+            "symbol": "NSE:NIFTY26N1724900CE", "option_type": "CE", "strike_price": 24900,
+            "ltp": 569.75, "bid": 569.5, "ask": 570.0,
+            "greeks": {"delta": 0.847, "gamma": 0.0004, "theta": -15.9,
+                       "vega": 5.2, "iv": 18.17},
+        }]}}
+
 
 class FakeSocket:
     """Stands in for FyersDataSocket and FyersOrderSocket; records calls, fires callbacks."""
@@ -112,6 +126,32 @@ def make_broker():
 def test_requires_credentials():
     with pytest.raises(MissingCredentials):
         FyersBroker(client_id="", access_token="", model=FakeModel())
+
+
+def test_option_chain_returns_live_greeks_for_requested_expiry():
+    async def run():
+        broker, model = make_broker()
+        rows = await broker.get_option_greeks("NSE:NIFTY50-INDEX", date(2026, 11, 17))
+        # The expiry lookup is cached, so a second selection only spends one data request.
+        again = await broker.get_option_greeks("NSE:NIFTY50-INDEX", date(2026, 11, 17))
+        return rows, again, model.optionchain_requests
+
+    rows, again, requests = asyncio.run(run())
+    assert rows == again and len(rows) == 1
+    assert (rows[0].symbol, rows[0].delta, rows[0].theta, rows[0].iv) == (
+        "NSE:NIFTY26N1724900CE", 0.847, -15.9, 18.17,
+    )
+    assert [request["greeks"] for request in requests] == ["1", "1", "1"]
+    assert requests[1]["strikecount"] == 50
+
+
+def test_option_greeks_parser_ignores_underlying_and_invalid_rows():
+    rows = parse_option_greeks({"s": "ok", "data": {"optionsChain": [
+        {"symbol": "NSE:NIFTY50-INDEX", "option_type": "", "strike_price": -1},
+        {"symbol": "NSE:NIFTY26N1725800PE", "option_type": "PE", "strike_price": 25800,
+         "delta": -0.86, "theta": -12.5, "iv": 17.2},
+    ]}}, date(2026, 11, 17))
+    assert len(rows) == 1 and rows[0].kind == "PE" and rows[0].delta == -0.86
 
 
 def test_place_order_maps_payload_and_tracks_socket_updates():

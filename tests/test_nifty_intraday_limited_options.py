@@ -1,7 +1,7 @@
 import asyncio
 from datetime import date
 
-from app.brokers.base import OptionContract
+from app.brokers.base import OptionContract, OptionGreeks
 from app.orders.schemas import Product
 from app.strategies.builtin.nifty_intraday_limited_options import (
     LimitedTradeOptionLegs,
@@ -85,6 +85,31 @@ def test_intraday_long_and_short_buy_500_point_itm_options(monkeypatch):
         ("SELL", "NSE:NIFTY271025500PE"),
     ]
     assert all(quantity == 65 for _, quantity, _, _ in ctx.calls)
+
+
+def test_live_fyers_delta_selects_closest_contract_and_logs_greeks(monkeypatch):
+    fixed_now(monkeypatch)
+
+    class GreeksCtx(FakeCtx):
+        async def option_greeks(self, expiry):
+            return [
+                OptionGreeks("NSE:NIFTY271024500CE", "CE", 24500, expiry, 0.78,
+                             theta=-18.0, iv=19.0, bid=568.0, ask=569.0),
+                OptionGreeks("NSE:NIFTY271024000CE", "CE", 24000, expiry, 0.86,
+                             theta=-12.0, iv=18.0, bid=1030.0, ask=1031.0),
+                OptionGreeks("NSE:NIFTY271023500CE", "CE", 23500, expiry, 0.94,
+                             theta=-7.0, iv=17.0, bid=1510.0, ask=1512.0),
+            ]
+
+    async def go():
+        ctx = GreeksCtx()
+        await LimitedTradeOptionLegs(ctx, 500).buy(reason="long z-score/EMA signal")
+        return ctx
+
+    ctx = asyncio.run(go())
+    assert ctx.calls[0][2] == "NSE:NIFTY271024000CE"
+    assert "delta +0.860" in ctx.calls[0][3]
+    assert "IV 18.00%" in ctx.calls[0][3]
 
 
 def test_overnight_option_skips_same_day_expiry(monkeypatch):

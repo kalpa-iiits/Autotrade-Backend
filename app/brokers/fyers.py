@@ -24,7 +24,17 @@ install_pkg_resources_bridge()
 from fyers_apiv3 import fyersModel
 from fyers_apiv3.FyersWebsocket import data_ws, order_ws
 
-from app.brokers.base import Broker, Candle, Depth, Instrument, MissingCredentials, OptionContract, OrderError, Resolution
+from app.brokers.base import (
+    Broker,
+    Candle,
+    Depth,
+    Instrument,
+    MissingCredentials,
+    OptionContract,
+    OptionGreeks,
+    OrderError,
+    Resolution,
+)
 from app.core.market import in_market_hours
 from app.orders.schemas import (
     Order,
@@ -136,6 +146,40 @@ def parse_option_contracts(text: str) -> dict[str, list[OptionContract]]:
         except ValueError:
             continue
         out.setdefault(row[13].strip(), []).append(contract)
+    return out
+
+
+def parse_option_greeks(response: dict, expiry: date) -> list[OptionGreeks]:
+    """Parse FYERS' options-chain-v3 response, ignoring the underlying/VIX rows."""
+    data = response.get("data") if isinstance(response.get("data"), dict) else response
+    rows = data.get("optionsChain") or []
+    out: list[OptionGreeks] = []
+    for row in rows:
+        kind = row.get("option_type")
+        greek = row.get("greeks") or {}
+        try:
+            delta = float(greek.get("delta", row.get("delta")))
+            strike = float(row["strike_price"])
+        except (KeyError, TypeError, ValueError):
+            continue
+        if kind not in ("CE", "PE") or not 0 < abs(delta) <= 1:
+            continue
+
+        def optional(name: str) -> float | None:
+            value = greek.get(name, row.get(name))
+            try:
+                return float(value) if value is not None else None
+            except (TypeError, ValueError):
+                return None
+
+        symbol = str(row.get("symbol") or row.get("ex_symbol") or "").strip()
+        if not symbol:
+            continue
+        out.append(OptionGreeks(
+            symbol=symbol, kind=kind, strike=strike, expiry=expiry, delta=delta,
+            gamma=optional("gamma"), theta=optional("theta"), vega=optional("vega"),
+            iv=optional("iv"), ltp=optional("ltp"), bid=optional("bid"), ask=optional("ask"),
+        ))
     return out
 
 
@@ -273,6 +317,7 @@ class FyersBroker(Broker):
         self._order_resync_due = False  # order socket was down; check the order book once it is back
         self._watchdog_interval = watchdog_interval
         self._watchdog: asyncio.Task | None = None
+        self._option_expiries: dict[tuple[str, date], str] = {}
 
     # ---------- lifecycle ----------
 
@@ -496,6 +541,35 @@ class FyersBroker(Broker):
             if _options is None or _options[0] != today:
                 _options = today, parse_option_contracts(await _download_master(FYERS_NSE_FO_MASTER))
         return [c for c in _options[1].get(name, []) if c.expiry >= today]
+
+    async def get_option_greeks(
+        self, underlying: str, expiry: date, strike_count: int = 50,
+    ) -> list[OptionGreeks]:
+        """Fetch FYERS live delta/gamma/theta/vega/IV for a selected expiry."""
+        key = (underlying, expiry)
+        timestamp = self._option_expiries.get(key)
+        if timestamp is None:
+            first = await asyncio.to_thread(self._model.optionchain, {
+                "symbol": underlying, "strikecount": 1, "timestamp": "", "greeks": "1",
+            })
+            if first.get("s") != "ok":
+                raise OrderError(first.get("message", f"Could not fetch option expiries for {underlying}"))
+            data = first.get("data") if isinstance(first.get("data"), dict) else first
+            wanted = expiry.strftime("%d-%m-%Y")
+            match = next((row for row in data.get("expiryData") or [] if row.get("date") == wanted), None)
+            if match is None or match.get("expiry") is None:
+                raise OrderError(f"FYERS option chain has no expiry {wanted} for {underlying}")
+            timestamp = str(match["expiry"])
+            self._option_expiries[key] = timestamp
+        response = await asyncio.to_thread(self._model.optionchain, {
+            "symbol": underlying,
+            "strikecount": min(max(int(strike_count), 1), 50),
+            "timestamp": timestamp,
+            "greeks": "1",
+        })
+        if response.get("s") != "ok":
+            raise OrderError(response.get("message", f"Could not fetch option Greeks for {underlying}"))
+        return parse_option_greeks(response, expiry)
 
     # ---------- orders ----------
 
