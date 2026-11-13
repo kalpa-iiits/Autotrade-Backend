@@ -187,7 +187,7 @@ class StrategyContext:
 
     @property
     def held_symbol(self) -> str | None:
-        """The other instrument (e.g. an option) this instance last bought, while it holds one."""
+        """The other instrument (e.g. an option) this instance currently trades."""
         return self._inst.held_symbol if self._inst.position else None
 
     async def buy(self, quantity: int | None = None, reason: str | None = None,
@@ -766,7 +766,7 @@ class StrategyRunner:
             else:
                 inst.last_fill_price = None
                 await self._place(inst, side, quantity, signal, product)
-            if symbol != inst.symbol and side == Side.BUY and signal.outcome == "placed":
+            if symbol != inst.symbol and signal.outcome == "placed":
                 inst.held_symbol = symbol
             await self._record(signal, inst.account_id)
 
@@ -1058,11 +1058,11 @@ class StrategyRunner:
                                                  "status": status, "error": error})
 
     async def _held_symbol(self, config: StrategyInstance) -> str | None:
-        """After a restart: the other instrument its latest accepted buy was for, if any."""
+        """After a restart, recover the instrument used by the latest accepted trade."""
         async with db.session() as s:
             symbol = await s.scalar(
                 select(StrategySignal.symbol)
-                .where(StrategySignal.instance_id == config.id, StrategySignal.side == Side.BUY.value,
+                .where(StrategySignal.instance_id == config.id,
                        StrategySignal.outcome == "placed")
                 .order_by(StrategySignal.id.desc()).limit(1)
             )
