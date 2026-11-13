@@ -3,9 +3,11 @@
 The NIFTY index supplies historical candles and live ticks.  Scheduled trailing updates use
 broker-published completed one-minute OHLC aggregated to five minutes, while stop hits remain
 tick-by-tick. A long signal holds an in-the-money call; a short signal holds an in-the-money
-put. A reversal first sells the held option, then buys the opposite leg after that exit is
-terminal. The runner therefore applies the same depth-priced limit orders and repricing policy
-used by the intraday NIFTY options strategy.
+put. Entries use the current weekly expiry. A reversal first sells the held option, then buys
+the opposite leg after that exit is terminal; if expiry arrives first, the same signal is rolled
+to the following weekly contract. Every physical option order explicitly uses the broker's
+overnight carry-forward product. The runner applies the same depth-priced limit orders and
+repricing policy used by the intraday NIFTY options strategy.
 """
 
 from datetime import datetime, timedelta
@@ -14,6 +16,7 @@ from pydantic import Field
 
 from app.brokers import OrderError
 from app.brokers.base import Candle
+from app.orders.schemas import Product
 from app.strategies.builtin.intraday_breakout_options import pick_contract
 from app.strategies.builtin.nifty_trailing_reversal import IST, NiftyTrailingReversal
 from app.strategies.base import before_market_open
@@ -119,7 +122,9 @@ class ReversalOptionLegs:
                       if expires_today else self.reason or "reverse: exit current option")
             if expires_today:
                 self.reason = f"maintain {'LONG' if self.target > 0 else 'SHORT'} signal after expiry roll"
-            await self._ctx.sell(actual, reason, symbol=self.held)
+            await self._ctx.sell(
+                actual, reason, symbol=self.held, product=Product.DELIVERY,
+            )
             if self._ctx.position == 0 and not self._ctx.order_pending:
                 self.held, self.held_expiry = None, None
             return
@@ -130,7 +135,9 @@ class ReversalOptionLegs:
         if not spot:
             return  # startup warm-up can finish before the first live index tick
         contracts = await self._ctx.option_contracts()
-        # This is positional: unlike the intraday strategy, never open an option expiring today.
+        # Use the current weekly contract until its expiry date arrives. On expiry day, enter
+        # the following weekly contract directly instead of opening one that must be rolled on
+        # the next tick.
         contract = pick_contract(contracts, wanted_kind, spot, self._itm, today + timedelta(days=1))
         if contract is None:
             self._ctx.log(f"cannot enter: no {wanted_kind} contract found near {spot}")
@@ -141,7 +148,9 @@ class ReversalOptionLegs:
             return
         self.held = contract.symbol
         self.held_expiry = contract.expiry
-        await self._ctx.buy(quantity, self.reason, symbol=contract.symbol)
+        await self._ctx.buy(
+            quantity, self.reason, symbol=contract.symbol, product=Product.DELIVERY,
+        )
 
 
 class NiftyTrailingReversalOptions(NiftyTrailingReversal):
@@ -159,21 +168,32 @@ class NiftyTrailingReversalOptions(NiftyTrailingReversal):
     )
 
     class Params(NiftyTrailingReversal.Params):
-        itm_points: float = Field(300, ge=0, description="Option distance in the money, index points")
+        itm_points: float = Field(1000, ge=0, description="Option distance in the money, index points")
         history_days: int = Field(7, ge=1, le=60, description="One-minute history used at live startup")
 
     @classmethod
     def rules(cls, p: "NiftyTrailingReversalOptions.Params") -> list[dict]:
         rules = super().rules(p)
         for rule in rules:
-            if rule["kind"] == "entry_long":
+            if rule["kind"] == "filter":
+                rule["conditions"].append(
+                    "Every option entry, exit, reversal and roll uses the overnight carry-forward product"
+                )
+            elif rule["kind"] == "entry_long":
                 rule["title"] = "Buy an ITM call (CE)"
-                rule["conditions"].append(f"Uses the next non-expiring CE about {p.itm_points:g} points ITM")
+                rule["conditions"].append(
+                    f"Uses the current-week CE about {p.itm_points:g} points ITM"
+                )
             elif rule["kind"] == "entry_short":
                 rule["title"] = "Buy an ITM put (PE)"
-                rule["conditions"].append(f"Uses the next non-expiring PE about {p.itm_points:g} points ITM")
+                rule["conditions"].append(
+                    f"Uses the current-week PE about {p.itm_points:g} points ITM"
+                )
             elif rule["kind"] == "exit":
                 rule["conditions"].append("A reversal sells the held option before buying the opposite leg")
+                rule["conditions"].append(
+                    "If expiry arrives before a reversal, rolls the same signal to the next weekly contract"
+                )
         return rules
 
     async def on_start(self) -> None:

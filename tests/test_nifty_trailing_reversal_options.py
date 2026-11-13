@@ -4,6 +4,7 @@ from datetime import datetime, time, timedelta
 import pytest
 
 from app.brokers.base import Candle, OptionContract
+from app.orders.schemas import Product
 from app.strategies.base import Tick
 from app.strategies.builtin.nifty_trailing_reversal import IST
 from app.strategies.builtin.nifty_trailing_reversal_options import (
@@ -22,6 +23,7 @@ class FakeCtx:
         self.tick_size = 0.05
         self.order_pending = False
         self.calls = []
+        self.products = []
         self.logs = []
         self._history = history or []
         today = datetime.now(IST).date()
@@ -38,13 +40,15 @@ class FakeCtx:
         assert resolution == "1" and days in (1, 7)
         return self._history
 
-    async def buy(self, quantity=None, reason=None, symbol=None):
+    async def buy(self, quantity=None, reason=None, symbol=None, product=None):
         self.calls.append(("BUY", quantity, symbol))
+        self.products.append(product)
         self.position += quantity
         self.held_symbol = symbol
 
-    async def sell(self, quantity=None, reason=None, symbol=None):
+    async def sell(self, quantity=None, reason=None, symbol=None, product=None):
         self.calls.append(("SELL", quantity, symbol))
+        self.products.append(product)
         self.position -= quantity
 
     def log(self, message):
@@ -69,6 +73,66 @@ def test_reversal_sells_current_option_before_buying_opposite_leg():
     assert ctx.calls[0][2].endswith("CE")
     assert ctx.calls[1][2] == ctx.calls[0][2]
     assert ctx.calls[2][2].endswith("PE")
+    assert ctx.products == [Product.DELIVERY, Product.DELIVERY, Product.DELIVERY]
+
+
+def test_async_reversal_never_buys_opposite_leg_before_exit_is_terminal():
+    class AsyncCtx(FakeCtx):
+        async def buy(self, quantity=None, reason=None, symbol=None, product=None):
+            self.calls.append(("BUY", quantity, symbol))
+            self.products.append(product)
+            self.order_pending = True
+
+        async def sell(self, quantity=None, reason=None, symbol=None, product=None):
+            self.calls.append(("SELL", quantity, symbol))
+            self.products.append(product)
+            self.order_pending = True
+
+    async def go():
+        ctx = AsyncCtx(quantity=130)
+        current = next(c for c in ctx._contracts if c.kind == "CE" and c.strike == 24_700)
+        ctx.position, ctx.held_symbol = 130, current.symbol
+        legs = ReversalOptionLegs(ctx, 300)
+
+        await legs.sell(reason="reverse short")
+        await legs.advance()
+        assert [side for side, _, _ in ctx.calls] == ["SELL"]
+
+        # The broker reports the CE exit terminal. Only now may the PE entry be sent.
+        ctx.position, ctx.order_pending = 0, False
+        await legs.advance()
+        return ctx
+
+    ctx = asyncio.run(go())
+    assert [side for side, _, _ in ctx.calls] == ["SELL", "BUY"]
+    assert ctx.calls[0][2].endswith("CE") and ctx.calls[1][2].endswith("PE")
+    assert ctx.products == [Product.DELIVERY, Product.DELIVERY]
+
+
+def test_new_signal_uses_nearest_non_expiring_weekly_and_1000_point_itm_default():
+    async def go():
+        today = datetime.now(IST).date()
+        current_week_expiry = today + timedelta(days=1)
+        current_week = [
+            OptionContract(f"NSE:NIFTYCURRENT{strike}{kind}", kind, float(strike),
+                           current_week_expiry, 65)
+            for strike in range(23_500, 26_551, 50) for kind in ("CE", "PE")
+        ]
+        contexts = []
+        for direction in ("CE", "PE"):
+            ctx = FakeCtx()
+            ctx._contracts = current_week + ctx._contracts
+            legs = ReversalOptionLegs(ctx, NiftyTrailingReversalOptions.Params().itm_points)
+            await (legs.buy(reason="long signal") if direction == "CE" else
+                   legs.sell(reason="short signal"))
+            contexts.append(ctx)
+        return contexts, current_week_expiry
+
+    (ce_ctx, pe_ctx), current_week_expiry = asyncio.run(go())
+    ce = next(c for c in ce_ctx._contracts if c.symbol == ce_ctx.calls[0][2])
+    pe = next(c for c in pe_ctx._contracts if c.symbol == pe_ctx.calls[0][2])
+    assert (ce.kind, ce.strike, ce.expiry) == ("CE", 24_000, current_week_expiry)
+    assert (pe.kind, pe.strike, pe.expiry) == ("PE", 26_000, current_week_expiry)
 
 
 def test_positional_leg_rolls_instead_of_holding_through_expiry():
@@ -87,6 +151,7 @@ def test_positional_leg_rolls_instead_of_holding_through_expiry():
     assert ctx.calls[0] == ("SELL", 65, "NSE:NIFTYTODAY24700CE")
     assert ctx.calls[1][0] == "BUY" and ctx.calls[1][2].endswith("CE")
     assert ctx.calls[1][2] != ctx.calls[0][2]
+    assert ctx.products == [Product.DELIVERY, Product.DELIVERY]
 
 
 def test_live_start_reconstructs_direction_and_stop_from_history():
@@ -265,5 +330,6 @@ def test_direct_and_options_versions_have_separate_catalog_entries():
     assert (direct.max_order_qty, direct.max_position) == (10_000, 5_000)
     assert options.strategy is NiftyTrailingReversalOptions
     assert not options.strategy.capital_sizing and options.backtest_fixed_quantity == 65
+    assert options.params.itm_points == 1000
     assert options.symbol == "NSE:NIFTY50-INDEX"
 

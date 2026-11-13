@@ -66,7 +66,7 @@ DEPLOYMENTS: list[Deployment] = [
         strategy=NiftyTrailingReversalOptions,
         symbol="NSE:NIFTY50-INDEX",
         timeframe="5m",
-        params=NiftyTrailingReversalOptions.Params(itm_points=300, history_days=7),
+        params=NiftyTrailingReversalOptions.Params(itm_points=1000, history_days=7),
         quantity=65,
         max_order_qty=650,
         max_position=650,
