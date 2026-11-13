@@ -65,12 +65,12 @@ def fixed_now(monkeypatch):
     monkeypatch.setattr(module, "datetime", Now)
 
 
-def test_intraday_long_and_short_buy_600_point_itm_options(monkeypatch):
+def test_intraday_long_and_short_buy_700_point_itm_options(monkeypatch):
     fixed_now(monkeypatch)
 
     async def go():
         ctx = FakeCtx()
-        legs = LimitedTradeOptionLegs(ctx, 600)
+        legs = LimitedTradeOptionLegs(ctx, 700)
         await legs.buy(reason="long z-score/EMA signal")
         await legs.exit("target")
         await legs.sell(reason="short z-score/EMA signal")
@@ -79,10 +79,10 @@ def test_intraday_long_and_short_buy_600_point_itm_options(monkeypatch):
 
     ctx = asyncio.run(go())
     assert [(side, symbol) for side, _, symbol, _ in ctx.calls] == [
-        ("BUY", "NSE:NIFTY271024400CE"),
-        ("SELL", "NSE:NIFTY271024400CE"),
-        ("BUY", "NSE:NIFTY271025600PE"),
-        ("SELL", "NSE:NIFTY271025600PE"),
+        ("BUY", "NSE:NIFTY271024300CE"),
+        ("SELL", "NSE:NIFTY271024300CE"),
+        ("BUY", "NSE:NIFTY271025700PE"),
+        ("SELL", "NSE:NIFTY271025700PE"),
     ]
     assert all(quantity == 65 for _, quantity, _, _ in ctx.calls)
 
@@ -97,20 +97,20 @@ def test_live_fyers_delta_selects_closest_contract_and_logs_greeks(monkeypatch):
                              theta=-18.0, iv=19.0, bid=568.0, ask=569.0),
                 OptionGreeks("NSE:NIFTY271024000CE", "CE", 24000, expiry, 0.86,
                              theta=-12.0, iv=18.0, bid=1030.0, ask=1031.0),
-                OptionGreeks("NSE:NIFTY271024050CE", "CE", 24050, expiry, 0.91,
+                OptionGreeks("NSE:NIFTY271024050CE", "CE", 24050, expiry, 0.96,
                              theta=-7.0, iv=17.0, bid=1510.0, ask=1512.0),
             ]
 
     async def go():
         ctx = GreeksCtx()
-        await LimitedTradeOptionLegs(ctx, 600).buy(reason="long z-score/EMA signal")
+        await LimitedTradeOptionLegs(ctx, 700).buy(reason="long z-score/EMA signal")
         return ctx
 
     ctx = asyncio.run(go())
     assert ctx.calls[0][2] == "NSE:NIFTY271024050CE"
-    assert "delta +0.910" in ctx.calls[0][3]
+    assert "delta +0.960" in ctx.calls[0][3]
     assert "IV 17.00%" in ctx.calls[0][3]
-    assert "target |delta| 0.90" in ctx.calls[0][3]
+    assert "target |delta| 0.95" in ctx.calls[0][3]
 
 
 def test_overnight_option_skips_same_day_expiry(monkeypatch):
@@ -118,38 +118,38 @@ def test_overnight_option_skips_same_day_expiry(monkeypatch):
 
     async def go():
         ctx = FakeCtx()
-        legs = LimitedTradeOptionLegs(ctx, 600)
+        legs = LimitedTradeOptionLegs(ctx, 700)
         await legs.buy(reason="overnight long at 15:15")
         return ctx
 
     ctx = asyncio.run(go())
-    assert ctx.calls[0][2] == "NSE:NIFTY031124400CE"
-    assert "600 points ITM" in ctx.calls[0][3]
+    assert ctx.calls[0][2] == "NSE:NIFTY031124300CE"
+    assert "700 points ITM" in ctx.calls[0][3]
     assert ctx.products == [Product.DELIVERY]
 
 
 def test_option_adapter_keeps_stops_in_nifty_points(monkeypatch):
     fixed_now(monkeypatch)
     ctx = FakeCtx()
-    legs = LimitedTradeOptionLegs(ctx, 600)
+    legs = LimitedTradeOptionLegs(ctx, 700)
     assert legs.last_fill_price is None
 
 
-def test_limited_trade_deployment_is_the_600_point_itm_option_version():
+def test_limited_trade_deployment_is_the_700_point_itm_option_version():
     deployment = next(d for d in DEPLOYMENTS if d.key == "nifty-intraday-limited")
     assert deployment.strategy is NiftyIntradayLimitedOptions
     assert deployment.symbol == "NSE:NIFTY50-INDEX"
-    assert deployment.params.itm_points == 600
+    assert deployment.params.itm_points == 700
     assert deployment.quantity == deployment.max_order_qty == deployment.max_position == 65
     assert deployment.backtest_fixed_quantity == 65
 
 
-def test_rules_describe_600_point_itm_ce_and_pe_execution():
+def test_rules_describe_700_point_itm_ce_and_pe_execution():
     rules = NiftyIntradayLimitedOptions.rules(NiftyIntradayLimitedOptions.Params())
     entries = [rule for rule in rules if rule["kind"] in ("entry_long", "entry_short")]
     assert any("intraday call" in rule["title"].lower() for rule in entries)
     assert any("overnight call" in rule["title"].lower() for rule in entries)
     assert any("intraday put" in rule["title"].lower() for rule in entries)
     assert any("overnight put" in rule["title"].lower() for rule in entries)
-    assert all(any("600" in condition for condition in rule["conditions"]) for rule in entries)
-    assert all(any("0.90 delta" in condition for condition in rule["conditions"]) for rule in entries)
+    assert all(any("700" in condition for condition in rule["conditions"]) for rule in entries)
+    assert all(any("0.95 delta" in condition for condition in rule["conditions"]) for rule in entries)

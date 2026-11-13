@@ -24,7 +24,7 @@ from app.strategies.deployment import Deployment
 DEPLOYMENTS: list[Deployment] = [
     Deployment(
         key="nifty-intraday-limited",
-        label="NIFTY Limited-Trade Strategy · 600-point ITM Options",
+        label="NIFTY Limited-Trade Strategy · 700-point ITM Options",
         strategy=NiftyIntradayLimitedOptions,
         symbol="NSE:NIFTY50-INDEX",
         timeframe="5m",
@@ -34,7 +34,7 @@ DEPLOYMENTS: list[Deployment] = [
             stop_points=50,
             target_points=300,
             max_entries_per_day=3,
-            itm_points=600,
+            itm_points=700,
         ),
         quantity=65,
         max_order_qty=65,
