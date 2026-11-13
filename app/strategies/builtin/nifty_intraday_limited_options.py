@@ -1,9 +1,8 @@
 """NIFTY limited-trade signals executed with 600-point ITM CE/PE options.
 
-The NIFTY index remains the signal and risk-price source. Intraday long/short signals buy a
-call/put. Overnight long/short signals instead sell a put/call and buy it back on exit.
-Intraday entries may use the current day's expiry; an overnight entry always selects an
-expiry after the entry day.
+The NIFTY index remains the signal and risk-price source. Long signals buy a call, short
+signals buy a put, and every index exit sells the held option. Intraday entries may use the
+current day's expiry; an overnight entry always selects an expiry after the entry day.
 """
 
 from datetime import datetime, timedelta
@@ -18,7 +17,7 @@ from app.strategies.builtin.nifty_intraday_limited import IST, NiftyIntradayLimi
 
 
 class LimitedTradeOptionLegs:
-    """Translate signed NIFTY trades into intraday long or overnight short options."""
+    """Translate signed NIFTY trades into long CE/PE option positions."""
 
     def __init__(self, ctx, itm_points: float) -> None:
         self._ctx = ctx
@@ -56,13 +55,9 @@ class LimitedTradeOptionLegs:
 
     async def exit(self, reason: str | None = None,
                    product: Product | None = None) -> None:
-        if self._ctx.position > 0 and self.held:
+        if self._ctx.position and self.held:
             await self._ctx.sell(
                 self._ctx.position, reason, symbol=self.held, product=product,
-            )
-        elif self._ctx.position < 0 and self.held:
-            await self._ctx.buy(
-                -self._ctx.position, reason, symbol=self.held, product=product,
             )
 
     async def _open(self, kind: str, reason: str | None,
@@ -73,8 +68,6 @@ class LimitedTradeOptionLegs:
             return
         today = datetime.now(IST).date()
         overnight = bool(reason and "overnight" in reason.lower())
-        if overnight:
-            kind = "PE" if kind == "CE" else "CE"
         product = Product.DELIVERY if overnight else product or Product.INTRADAY
         first_expiry = today + timedelta(days=1) if overnight else today
         contracts = await self._ctx.option_contracts()
@@ -113,8 +106,7 @@ class LimitedTradeOptionLegs:
             selection = f"{', '.join(values)}; target |delta| {self.target_abs_delta:.2f}"
         else:
             selection = f"{self._itm:g} points ITM fallback"
-        open_option = self._ctx.sell if overnight else self._ctx.buy
-        await open_option(
+        await self._ctx.buy(
             quantity,
             f"{reason}; {kind} {contract.strike:g} {contract.expiry:%d %b}; {selection}",
             symbol=contract.symbol,
@@ -147,15 +139,14 @@ def pick_contract_by_delta(
 class NiftyIntradayLimitedOptions(NiftyIntradayLimited):
     name = "nifty_intraday_limited_options"
     description = (
-        "NIFTY limited-trade signals that buy calls/puts intraday and sell puts/calls "
-        "overnight, selected near 0.90 absolute delta with a 600-point ITM fallback."
+        "NIFTY limited-trade intraday and overnight signals executed with calls and puts "
+        "selected near 0.90 absolute delta, with a 600-point ITM fallback."
     )
-    tags = ("Intraday + overnight", "NIFTY", "Options", "0.90 delta", "Long/short options")
+    tags = ("Intraday + overnight", "NIFTY", "Options", "0.90 delta", "Long CE/PE")
     capital_sizing = False
     backtest_note = (
         "Backtests replay the NIFTY index signals and report index points x quantity, not "
-        "historical option-premium P&L. Live intraday entries buy options; overnight entries "
-        "sell options and buy them back on exit."
+        "historical option-premium P&L. Live entries buy ITM options and live exits sell them."
     )
 
     class Params(NiftyIntradayLimited.Params):
@@ -167,27 +158,21 @@ class NiftyIntradayLimitedOptions(NiftyIntradayLimited):
         for rule in rules:
             title = rule["title"].lower()
             if rule["kind"] == "entry_long":
-                overnight = "overnight" in title
-                rule["title"] = ("Sell overnight put (PE)" if overnight
+                rule["title"] = ("Buy overnight call (CE)" if "overnight" in title
                                  else "Buy intraday call (CE)")
                 rule["conditions"].append(
-                    f"Targets {'-' if overnight else '+'}"
-                    f"{LimitedTradeOptionLegs.target_abs_delta:.2f} option delta; "
+                    f"Targets +{LimitedTradeOptionLegs.target_abs_delta:.2f} delta; "
                     f"falls back to approximately {p.itm_points:g} points ITM"
                 )
             elif rule["kind"] == "entry_short":
-                overnight = "overnight" in title
-                rule["title"] = ("Sell overnight call (CE)" if overnight
+                rule["title"] = ("Buy overnight put (PE)" if "overnight" in title
                                  else "Buy intraday put (PE)")
                 rule["conditions"].append(
-                    f"Targets {'+' if overnight else '-'}"
-                    f"{LimitedTradeOptionLegs.target_abs_delta:.2f} option delta; "
+                    f"Targets -{LimitedTradeOptionLegs.target_abs_delta:.2f} delta; "
                     f"falls back to approximately {p.itm_points:g} points ITM"
                 )
             elif rule["kind"] == "exit":
-                rule["conditions"].append(
-                    "Closes the option for that NIFTY signal (sells long or buys back short)"
-                )
+                rule["conditions"].append("Sells the option held for that NIFTY signal")
         return rules
 
     async def on_start(self) -> None:

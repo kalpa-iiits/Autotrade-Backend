@@ -113,29 +113,19 @@ def test_live_fyers_delta_selects_closest_contract_and_logs_greeks(monkeypatch):
     assert "target |delta| 0.90" in ctx.calls[0][3]
 
 
-def test_overnight_long_sells_put_and_short_sells_call_then_buys_them_back(monkeypatch):
+def test_overnight_option_skips_same_day_expiry(monkeypatch):
     fixed_now(monkeypatch)
 
     async def go():
         ctx = FakeCtx()
         legs = LimitedTradeOptionLegs(ctx, 600)
         await legs.buy(reason="overnight long at 15:15")
-        assert legs.position == 65
-        await legs.exit("overnight long exit", Product.DELIVERY)
-        await legs.sell(reason="overnight short at 15:15")
-        assert legs.position == -65
-        await legs.exit("overnight short exit", Product.DELIVERY)
         return ctx
 
     ctx = asyncio.run(go())
-    assert [(side, symbol) for side, _, symbol, _ in ctx.calls] == [
-        ("SELL", "NSE:NIFTY031125600PE"),
-        ("BUY", "NSE:NIFTY031125600PE"),
-        ("SELL", "NSE:NIFTY031124400CE"),
-        ("BUY", "NSE:NIFTY031124400CE"),
-    ]
-    assert all("600 points ITM" in reason for _, _, _, reason in (ctx.calls[0], ctx.calls[2]))
-    assert ctx.products == [Product.DELIVERY] * 4
+    assert ctx.calls[0][2] == "NSE:NIFTY031124400CE"
+    assert "600 points ITM" in ctx.calls[0][3]
+    assert ctx.products == [Product.DELIVERY]
 
 
 def test_option_adapter_keeps_stops_in_nifty_points(monkeypatch):
@@ -158,9 +148,8 @@ def test_rules_describe_600_point_itm_ce_and_pe_execution():
     rules = NiftyIntradayLimitedOptions.rules(NiftyIntradayLimitedOptions.Params())
     entries = [rule for rule in rules if rule["kind"] in ("entry_long", "entry_short")]
     assert any("intraday call" in rule["title"].lower() for rule in entries)
-    assert any("sell overnight call" in rule["title"].lower() for rule in entries)
+    assert any("overnight call" in rule["title"].lower() for rule in entries)
     assert any("intraday put" in rule["title"].lower() for rule in entries)
-    assert any("sell overnight put" in rule["title"].lower() for rule in entries)
+    assert any("overnight put" in rule["title"].lower() for rule in entries)
     assert all(any("600" in condition for condition in rule["conditions"]) for rule in entries)
-    assert all(any("0.90 option delta" in condition for condition in rule["conditions"])
-               for rule in entries)
+    assert all(any("0.90 delta" in condition for condition in rule["conditions"]) for rule in entries)

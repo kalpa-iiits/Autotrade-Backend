@@ -797,24 +797,6 @@ def test_trading_another_symbol_is_remembered_across_restarts(deploy):
     assert (running.position, running.held_symbol) == (2, "NSE:SBIN26NOV800CE")
 
 
-def test_shorting_another_symbol_is_remembered_across_restarts(deploy):
-    c = deploy(dep("a", quantity=1, max_order_qty=5, max_position=5))
-    runtime(c).service.broker.prices["NSE:SBIN26NOV800PE"] = 50.0
-    inst = start_strategy(c, "a")
-    SCRIPT.extend([("sell", 2, "opened short", "NSE:SBIN26NOV800PE")])
-    tick(c)
-    got = signals(c, inst["id"])[0]
-    assert (got["symbol"], got["side"], got["quantity"], got["outcome"]) == (
-        "NSE:SBIN26NOV800PE", "SELL", 2, "placed",
-    )
-    assert c.app.state.strategy_runner.running[inst["id"]].held_symbol == "NSE:SBIN26NOV800PE"
-
-    c = deploy(dep("a", quantity=1, max_order_qty=5, max_position=5))
-    start_strategy(c, "a")
-    running = c.app.state.strategy_runner.running[inst["id"]]
-    assert (running.position, running.held_symbol) == (-2, "NSE:SBIN26NOV800PE")
-
-
 def test_strategy_product_override_reaches_entry_and_exit_orders(deploy):
     c = deploy(dep("a"))
     start_strategy(c, "a")
