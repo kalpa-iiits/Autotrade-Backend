@@ -1,4 +1,4 @@
-"""NIFTY limited-trade signals executed with 500-point ITM CE/PE options.
+"""NIFTY limited-trade signals executed with 600-point ITM CE/PE options.
 
 The NIFTY index remains the signal and risk-price source. Long signals buy a call, short
 signals buy a put, and every index exit sells the held option. Intraday entries may use the
@@ -140,7 +140,7 @@ class NiftyIntradayLimitedOptions(NiftyIntradayLimited):
     name = "nifty_intraday_limited_options"
     description = (
         "NIFTY limited-trade intraday and overnight signals executed with calls and puts "
-        "selected near 0.90 absolute delta, with a 500-point ITM fallback."
+        "selected near 0.90 absolute delta, with a 600-point ITM fallback."
     )
     tags = ("Intraday + overnight", "NIFTY", "Options", "0.90 delta", "Long CE/PE")
     capital_sizing = False
@@ -150,7 +150,7 @@ class NiftyIntradayLimitedOptions(NiftyIntradayLimited):
     )
 
     class Params(NiftyIntradayLimited.Params):
-        itm_points: float = Field(500, ge=0, description="Option distance in the money, index points")
+        itm_points: float = Field(600, ge=0, description="Option distance in the money, index points")
 
     @classmethod
     def rules(cls, p: "NiftyIntradayLimitedOptions.Params") -> list[dict]:
