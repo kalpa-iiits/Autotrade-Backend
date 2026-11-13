@@ -24,7 +24,7 @@ class LimitedTradeOptionLegs:
         self._itm = itm_points
         self.held = ctx.held_symbol
 
-    target_abs_delta = 0.85
+    target_abs_delta = 0.90
 
     def __getattr__(self, name):
         return getattr(self._ctx, name)
@@ -140,9 +140,9 @@ class NiftyIntradayLimitedOptions(NiftyIntradayLimited):
     name = "nifty_intraday_limited_options"
     description = (
         "NIFTY limited-trade intraday and overnight signals executed with calls and puts "
-        "selected near 0.85 absolute delta, with a 500-point ITM fallback."
+        "selected near 0.90 absolute delta, with a 500-point ITM fallback."
     )
-    tags = ("Intraday + overnight", "NIFTY", "Options", "0.85 delta", "Long CE/PE")
+    tags = ("Intraday + overnight", "NIFTY", "Options", "0.90 delta", "Long CE/PE")
     capital_sizing = False
     backtest_note = (
         "Backtests replay the NIFTY index signals and report index points x quantity, not "

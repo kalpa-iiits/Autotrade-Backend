@@ -97,7 +97,7 @@ def test_live_fyers_delta_selects_closest_contract_and_logs_greeks(monkeypatch):
                              theta=-18.0, iv=19.0, bid=568.0, ask=569.0),
                 OptionGreeks("NSE:NIFTY271024000CE", "CE", 24000, expiry, 0.86,
                              theta=-12.0, iv=18.0, bid=1030.0, ask=1031.0),
-                OptionGreeks("NSE:NIFTY271023500CE", "CE", 23500, expiry, 0.94,
+                OptionGreeks("NSE:NIFTY271024050CE", "CE", 24050, expiry, 0.91,
                              theta=-7.0, iv=17.0, bid=1510.0, ask=1512.0),
             ]
 
@@ -107,9 +107,10 @@ def test_live_fyers_delta_selects_closest_contract_and_logs_greeks(monkeypatch):
         return ctx
 
     ctx = asyncio.run(go())
-    assert ctx.calls[0][2] == "NSE:NIFTY271024000CE"
-    assert "delta +0.860" in ctx.calls[0][3]
-    assert "IV 18.00%" in ctx.calls[0][3]
+    assert ctx.calls[0][2] == "NSE:NIFTY271024050CE"
+    assert "delta +0.910" in ctx.calls[0][3]
+    assert "IV 17.00%" in ctx.calls[0][3]
+    assert "target |delta| 0.90" in ctx.calls[0][3]
 
 
 def test_overnight_option_skips_same_day_expiry(monkeypatch):
@@ -151,3 +152,4 @@ def test_rules_describe_500_point_itm_ce_and_pe_execution():
     assert any("intraday put" in rule["title"].lower() for rule in entries)
     assert any("overnight put" in rule["title"].lower() for rule in entries)
     assert all(any("500" in condition for condition in rule["conditions"]) for rule in entries)
+    assert all(any("0.90 delta" in condition for condition in rule["conditions"]) for rule in entries)
