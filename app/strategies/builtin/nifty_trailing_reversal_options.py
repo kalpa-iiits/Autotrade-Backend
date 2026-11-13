@@ -10,7 +10,7 @@ overnight carry-forward product. The runner applies the same depth-priced limit 
 repricing policy used by the intraday NIFTY options strategy.
 """
 
-from datetime import datetime, time, timedelta
+from datetime import date, datetime, time, timedelta
 
 from pydantic import Field
 
@@ -19,10 +19,15 @@ from app.brokers.base import Candle
 from app.orders.schemas import Product
 from app.strategies.builtin.intraday_breakout_options import pick_contract
 from app.strategies.builtin.nifty_trailing_reversal import IST, NiftyTrailingReversal
-from app.strategies.base import before_market_open
 
 EXPIRY_ROLLOVER_TIME = time(15, 0)
+MARKET_CLOSE = time(15, 30)
 OPTION_CHAIN_RETRY = timedelta(seconds=5)
+
+
+def _market_open(at: datetime) -> bool:
+    local = at.astimezone(IST).time()
+    return time(9, 15) <= local < MARKET_CLOSE
 
 
 class _ReplayContext:
@@ -57,8 +62,12 @@ def _complete_bars(candles: list[Candle], now: datetime, seconds: int) -> list[C
         rows.sort(key=lambda c: c.start)
         if len(rows) != seconds // 60:
             continue
+        start = datetime.fromtimestamp(bucket * seconds, tz=rows[0].start.tzinfo)
+        expected = [start + timedelta(minutes=index) for index in range(seconds // 60)]
+        if [row.start for row in rows] != expected:
+            continue
         out.append(Candle(
-            datetime.fromtimestamp(bucket * seconds, tz=rows[0].start.tzinfo),
+            start,
             rows[0].open,
             max(c.high for c in rows),
             min(c.low for c in rows),
@@ -76,11 +85,32 @@ class ReversalOptionLegs:
         self._itm = itm_points
         self.held = ctx.held_symbol
         self.held_expiry = None
+        self.held_lot: int | None = None
         self.target = (-1 if self.held and self.held.endswith("PE") else
                        1 if self.held and self.held.endswith("CE") else 0)
         self.reason: str | None = None
         self._market_now: datetime | None = None
         self._contracts_retry_at: datetime | None = None
+        self.checkpoint_dirty = False
+
+    def checkpoint_state(self) -> dict:
+        return {
+            "held_symbol": self.held,
+            "held_expiry": self.held_expiry.isoformat() if self.held_expiry else None,
+            "held_lot": self.held_lot,
+        }
+
+    def restore_checkpoint_state(self, state) -> None:
+        """Restore metadata only when it describes the broker position loaded by the runner."""
+        if not self.held or not isinstance(state, dict) or state.get("held_symbol") != self.held:
+            return
+        expiry, lot = state.get("held_expiry"), state.get("held_lot")
+        try:
+            restored_expiry = date.fromisoformat(expiry) if expiry else None
+        except (TypeError, ValueError):
+            restored_expiry = None
+        self.held_expiry = restored_expiry
+        self.held_lot = lot if isinstance(lot, int) and lot > 0 else None
 
     def __getattr__(self, name):
         return getattr(self._ctx, name)
@@ -143,7 +173,7 @@ class ReversalOptionLegs:
             if held_kind == wanted_kind:
                 # The chain is only needed to decide a same-direction expiry roll. A genuine
                 # signal reversal must still exit immediately if chain retrieval is down.
-                if self.held_expiry is None and self.held:
+                if (self.held_expiry is None or self.held_lot is None) and self.held:
                     contracts = await self._option_contracts(local_now)
                     if contracts is None:
                         return
@@ -154,11 +184,22 @@ class ReversalOptionLegs:
                         )
                         return
                     self.held_expiry = held_contract.expiry
+                    self.held_lot = held_contract.lot
+                    self.checkpoint_dirty = True
                 roll_due = self.held_expiry is not None and (
                     self.held_expiry < today
                     or self.held_expiry == today and local_now.time() >= EXPIRY_ROLLOVER_TIME
                 )
             if held_kind == wanted_kind and not roll_due:
+                if self.held_lot:
+                    desired = self._ctx.quantity // self.held_lot * self.held_lot
+                    if actual < desired:
+                        await self._ctx.buy(
+                            desired - actual,
+                            "complete partially filled option entry",
+                            symbol=self.held,
+                            product=Product.DELIVERY,
+                        )
                 return
             if not self.held:
                 self._ctx.log("cannot reverse option: held contract is unknown")
@@ -171,7 +212,8 @@ class ReversalOptionLegs:
                 actual, reason, symbol=self.held, product=Product.DELIVERY,
             )
             if self._ctx.position == 0 and not self._ctx.order_pending:
-                self.held, self.held_expiry = None, None
+                self.held, self.held_expiry, self.held_lot = None, None, None
+                self.checkpoint_dirty = True
             return
 
         if wanted_kind is None:
@@ -198,6 +240,8 @@ class ReversalOptionLegs:
             return
         self.held = contract.symbol
         self.held_expiry = contract.expiry
+        self.held_lot = contract.lot
+        self.checkpoint_dirty = True
         await self._ctx.buy(
             quantity, self.reason, symbol=contract.symbol, product=Product.DELIVERY,
         )
@@ -246,6 +290,20 @@ class NiftyTrailingReversalOptions(NiftyTrailingReversal):
                 )
         return rules
 
+    def _checkpoint(self) -> dict:
+        state = super()._checkpoint()
+        if isinstance(self.ctx, ReversalOptionLegs):
+            state["option_leg"] = self.ctx.checkpoint_state()
+        return state
+
+    async def _advance_option_legs(self, now: datetime) -> None:
+        if not isinstance(self.ctx, ReversalOptionLegs):
+            return
+        await self.ctx.advance(now)
+        if self.ctx.checkpoint_dirty:
+            await self._save_checkpoint()
+            self.ctx.checkpoint_dirty = False
+
     async def on_start(self) -> None:
         real_ctx = self.ctx
         if not hasattr(real_ctx, "option_contracts"):  # backtest: retain index-point simulation
@@ -257,6 +315,7 @@ class NiftyTrailingReversalOptions(NiftyTrailingReversal):
         self._warmup_retry_at: datetime | None = None
         if self._checkpoint_restored:
             self._history_warmed = True
+            self.ctx.restore_checkpoint_state(real_ctx.strategy_state.get("option_leg"))
             self.ctx.target = self._direction
             self.ctx.reason = "resume durable NIFTY reversal state"
             self._real_ctx.log(
@@ -264,7 +323,8 @@ class NiftyTrailingReversalOptions(NiftyTrailingReversal):
                 f"stop {self.stop:.2f}" if self.stop is not None else
                 "restored NIFTY reversal state without an armed stop"
             )
-            await self.ctx.advance()
+            if _market_open(datetime.now(IST)):
+                await self._advance_option_legs(datetime.now(IST))
             return
         self._history_warmed = False
         await self._warm_from_history(datetime.now(IST))
@@ -310,17 +370,26 @@ class NiftyTrailingReversalOptions(NiftyTrailingReversal):
             f"reconstructed {'LONG' if direction > 0 else 'SHORT'} signal from "
             f"{len(bars)} candles; stop {self.stop:.2f}")
         await self._save_checkpoint()
-        await self.ctx.advance(now)
+        if _market_open(now):
+            await self._advance_option_legs(now)
         return True
 
     async def on_tick(self, tick) -> None:
-        if before_market_open(tick.at):
-            return  # nothing to buy or sell before 09:15: don't move the option legs either
+        if not _market_open(tick.at):
+            return  # never place positional option orders outside the continuous NSE session
         if isinstance(self.ctx, ReversalOptionLegs):
             if not await self._warm_from_history(tick.at.astimezone(IST)):
                 return
-            await self.ctx.advance(tick.at)
+            await self._advance_option_legs(tick.at)
         await super().on_tick(tick)
         if isinstance(self.ctx, ReversalOptionLegs):
-            await self.ctx.advance(tick.at)
+            await self._advance_option_legs(tick.at)
+
+    async def on_clock(self, now: datetime) -> None:
+        await super().on_clock(now)
+        if not isinstance(self.ctx, ReversalOptionLegs) or not _market_open(now):
+            return
+        if not await self._warm_from_history(now.astimezone(IST)):
+            return
+        await self._advance_option_legs(now)
 

@@ -109,6 +109,20 @@ def test_async_reversal_never_buys_opposite_leg_before_exit_is_terminal():
     assert ctx.products == [Product.DELIVERY, Product.DELIVERY]
 
 
+def test_partial_option_entry_is_topped_up_to_the_configured_quantity():
+    async def go():
+        ctx = FakeCtx(quantity=130)
+        held = next(c for c in ctx._contracts if c.kind == "CE" and c.strike == 24_700)
+        ctx.position, ctx.held_symbol = 65, held.symbol
+        legs = ReversalOptionLegs(ctx, 300)
+        await legs.advance(datetime.combine(datetime.now(IST).date(), time(10, 0), tzinfo=IST))
+        return ctx
+
+    ctx = asyncio.run(go())
+    assert ctx.calls == [("BUY", 65, ctx.held_symbol)]
+    assert ctx.position == 130 and ctx.products == [Product.DELIVERY]
+
+
 def test_new_signal_uses_nearest_non_expiring_weekly_and_1000_point_itm_default():
     async def go():
         today = datetime.now(IST).date()
@@ -214,6 +228,60 @@ def test_expiry_roll_retries_transient_option_chain_failure_without_stopping():
     assert any("retrying option chain in 5 seconds" in message for message in ctx.logs)
 
 
+def test_clock_drives_1500_rollover_without_a_market_tick_and_stops_at_close():
+    async def strategy_at(at):
+        ctx = FakeCtx()
+        expiring = OptionContract("NSE:NIFTYTODAY24700CE", "CE", 24_700, at.date(), 65)
+        ctx._contracts.insert(0, expiring)
+        ctx.position, ctx.held_symbol = 65, expiring.symbol
+        strategy = NiftyTrailingReversalOptions(NiftyTrailingReversalOptions.Params(), ctx, 300)
+        strategy._real_ctx = ctx
+        strategy.ctx = ReversalOptionLegs(ctx, 300)
+        await super(NiftyTrailingReversalOptions, strategy).on_start()
+        strategy.seeded = strategy._history_warmed = True
+        strategy._direction = strategy.ctx.target = 1
+        strategy.stop = 24_000
+        await strategy.on_clock(at)
+        return ctx
+
+    today = datetime.now(IST).date()
+    at_roll = asyncio.run(strategy_at(datetime.combine(today, time(15, 0), tzinfo=IST)))
+    after_close = asyncio.run(strategy_at(datetime.combine(today, time(15, 30), tzinfo=IST)))
+    assert [side for side, _, _ in at_roll.calls] == ["SELL"]
+    assert after_close.calls == []
+
+
+def test_option_leg_expiry_metadata_is_saved_and_restored():
+    class PersistentCtx(FakeCtx):
+        def __init__(self):
+            super().__init__()
+            self.saved = []
+
+        async def save_strategy_state(self, state):
+            self.saved.append(dict(state))
+
+    async def go():
+        ctx = PersistentCtx()
+        held = next(c for c in ctx._contracts if c.kind == "CE" and c.strike == 24_700)
+        ctx.position, ctx.held_symbol = 65, held.symbol
+        strategy = NiftyTrailingReversalOptions(NiftyTrailingReversalOptions.Params(), ctx, 300)
+        strategy._real_ctx = ctx
+        strategy.ctx = ReversalOptionLegs(ctx, 300)
+        await super(NiftyTrailingReversalOptions, strategy).on_start()
+        strategy.seeded = strategy._history_warmed = True
+        strategy._direction = strategy.ctx.target = 1
+        strategy.stop = 24_000
+        await strategy._advance_option_legs(
+            datetime.combine(datetime.now(IST).date(), time(10, 0), tzinfo=IST)
+        )
+        restored = ReversalOptionLegs(ctx, 300)
+        restored.restore_checkpoint_state(ctx.saved[-1]["option_leg"])
+        return held, restored
+
+    held, restored = asyncio.run(go())
+    assert restored.held_expiry == held.expiry and restored.held_lot == held.lot
+
+
 def test_live_start_reconstructs_direction_and_stop_from_history():
     day = datetime.combine(datetime.now(IST).date() - timedelta(days=1), time(9, 15), tzinfo=IST)
     rows = []
@@ -227,7 +295,13 @@ def test_live_start_reconstructs_direction_and_stop_from_history():
     ctx = FakeCtx(rows)
     strategy = NiftyTrailingReversalOptions(NiftyTrailingReversalOptions.Params(), ctx, 300)
 
-    asyncio.run(strategy.on_start())
+    async def go():
+        await strategy.on_start()
+        if not ctx.calls:  # startup outside market hours defers the order to the first live tick
+            opened = datetime.combine(datetime.now(IST).date(), time(9, 15), tzinfo=IST)
+            await strategy.on_tick(Tick("NSE:NIFTY50-INDEX", 25_000, opened))
+
+    asyncio.run(go())
 
     assert strategy.seeded and strategy._direction == 1
     assert strategy.stop == pytest.approx(25_050 * 0.996)
@@ -325,6 +399,15 @@ def test_history_aggregation_ignores_partial_five_minute_bars():
     rows = [Candle(start + timedelta(minutes=i), 100, 101, 99, 100) for i in range(7)]
     bars = _complete_bars(rows, start + timedelta(minutes=7), 300)
     assert len(bars) == 1 and bars[0].start == start
+
+
+def test_history_aggregation_rejects_duplicate_and_missing_minutes():
+    start = datetime.now(IST).replace(second=0, microsecond=0)
+    start -= timedelta(minutes=start.minute % 5 + 10)
+    starts = [start, start + timedelta(minutes=1), start + timedelta(minutes=1),
+              start + timedelta(minutes=3), start + timedelta(minutes=4)]
+    rows = [Candle(at, 100, 101, 99, 100) for at in starts]
+    assert _complete_bars(rows, start + timedelta(minutes=5), 300) == []
 
 
 def test_history_warmup_retries_after_temporary_broker_failure():
