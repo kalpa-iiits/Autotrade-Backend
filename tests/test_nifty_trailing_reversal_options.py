@@ -143,8 +143,11 @@ def test_positional_leg_rolls_instead_of_holding_through_expiry():
         ctx._contracts.insert(0, expiring)
         ctx.position, ctx.held_symbol = 65, expiring.symbol
         legs = ReversalOptionLegs(ctx, 300)
-        await legs.advance()  # exit today's CE
-        await legs.advance()  # enter the next available CE
+        await legs.advance(datetime.combine(today, time(14, 59), tzinfo=IST))
+        assert ctx.calls == []  # keep the current-week contract until the requested time
+        rollover = datetime.combine(today, time(15, 0), tzinfo=IST)
+        await legs.advance(rollover)  # exit today's CE
+        await legs.advance(rollover)  # enter the next available CE
         return ctx
 
     ctx = asyncio.run(go())
@@ -152,6 +155,63 @@ def test_positional_leg_rolls_instead_of_holding_through_expiry():
     assert ctx.calls[1][0] == "BUY" and ctx.calls[1][2].endswith("CE")
     assert ctx.calls[1][2] != ctx.calls[0][2]
     assert ctx.products == [Product.DELIVERY, Product.DELIVERY]
+
+
+def test_expiry_day_entries_switch_to_next_week_at_1500_ist():
+    async def open_at(at):
+        ctx = FakeCtx()
+        today = at.date()
+        ctx._contracts = [
+            OptionContract(f"NSE:NIFTYTODAY{strike}{kind}", kind, float(strike), today, 65)
+            for strike in range(24_500, 25_551, 50) for kind in ("CE", "PE")
+        ] + ctx._contracts
+        legs = ReversalOptionLegs(ctx, 300)
+        await legs.advance(at)  # set the live market time before the signal arrives
+        await legs.sell(reason="short signal")
+        return ctx
+
+    today = datetime.now(IST).date()
+    before = asyncio.run(open_at(datetime.combine(today, time(14, 59), tzinfo=IST)))
+    after = asyncio.run(open_at(datetime.combine(today, time(15, 0), tzinfo=IST)))
+
+    before_contract = next(c for c in before._contracts if c.symbol == before.calls[0][2])
+    after_contract = next(c for c in after._contracts if c.symbol == after.calls[0][2])
+    assert before_contract.expiry == today
+    assert after_contract.expiry == today + timedelta(days=1)
+
+
+def test_expiry_roll_retries_transient_option_chain_failure_without_stopping():
+    class FlakyChainCtx(FakeCtx):
+        attempts = 0
+
+        async def option_contracts(self):
+            self.attempts += 1
+            if self.attempts == 1:
+                raise RuntimeError("temporary symbol-master failure")
+            return self._contracts
+
+    async def go():
+        ctx = FlakyChainCtx()
+        today = datetime.now(IST).date()
+        expiring = OptionContract("NSE:NIFTYTODAY24700CE", "CE", 24_700, today, 65)
+        ctx._contracts.insert(0, expiring)
+        ctx.position, ctx.held_symbol = 65, expiring.symbol
+        legs = ReversalOptionLegs(ctx, 300)
+        rollover = datetime.combine(today, time(15, 0), tzinfo=IST)
+
+        await legs.advance(rollover)
+        assert ctx.calls == [] and ctx.attempts == 1
+        await legs.advance(rollover + timedelta(seconds=4))
+        assert ctx.calls == [] and ctx.attempts == 1  # throttled
+        await legs.advance(rollover + timedelta(seconds=5))
+        assert ctx.calls[0] == ("SELL", 65, expiring.symbol)
+        await legs.advance(rollover + timedelta(seconds=5))
+        return ctx
+
+    ctx = asyncio.run(go())
+    assert [side for side, _, _ in ctx.calls] == ["SELL", "BUY"]
+    assert ctx.calls[1][2].endswith("CE") and ctx.calls[1][2] != ctx.calls[0][2]
+    assert any("retrying option chain in 5 seconds" in message for message in ctx.logs)
 
 
 def test_live_start_reconstructs_direction_and_stop_from_history():

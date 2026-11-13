@@ -4,13 +4,13 @@ The NIFTY index supplies historical candles and live ticks.  Scheduled trailing 
 broker-published completed one-minute OHLC aggregated to five minutes, while stop hits remain
 tick-by-tick. A long signal holds an in-the-money call; a short signal holds an in-the-money
 put. Entries use the current weekly expiry. A reversal first sells the held option, then buys
-the opposite leg after that exit is terminal; if expiry arrives first, the same signal is rolled
-to the following weekly contract. Every physical option order explicitly uses the broker's
+the opposite leg after that exit is terminal; at 15:00 IST on expiry day, the same signal is
+rolled to the following weekly contract. Every physical option order explicitly uses the broker's
 overnight carry-forward product. The runner applies the same depth-priced limit orders and
 repricing policy used by the intraday NIFTY options strategy.
 """
 
-from datetime import datetime, timedelta
+from datetime import datetime, time, timedelta
 
 from pydantic import Field
 
@@ -20,6 +20,9 @@ from app.orders.schemas import Product
 from app.strategies.builtin.intraday_breakout_options import pick_contract
 from app.strategies.builtin.nifty_trailing_reversal import IST, NiftyTrailingReversal
 from app.strategies.base import before_market_open
+
+EXPIRY_ROLLOVER_TIME = time(15, 0)
+OPTION_CHAIN_RETRY = timedelta(seconds=5)
 
 
 class _ReplayContext:
@@ -76,6 +79,8 @@ class ReversalOptionLegs:
         self.target = (-1 if self.held and self.held.endswith("PE") else
                        1 if self.held and self.held.endswith("CE") else 0)
         self.reason: str | None = None
+        self._market_now: datetime | None = None
+        self._contracts_retry_at: datetime | None = None
 
     def __getattr__(self, name):
         return getattr(self._ctx, name)
@@ -97,30 +102,70 @@ class ReversalOptionLegs:
         self.target, self.reason = -1, reason
         await self.advance()
 
-    async def advance(self) -> None:
+    def _defer_contracts(self, local_now: datetime, message: str) -> None:
+        self._contracts_retry_at = local_now + OPTION_CHAIN_RETRY
+        self._ctx.log(f"{message}; retrying option chain in {OPTION_CHAIN_RETRY.seconds} seconds")
+
+    async def _option_contracts(self, local_now: datetime):
+        """Fetch the chain without allowing a temporary broker/master failure to stop the strategy."""
+        if self._contracts_retry_at is not None and local_now < self._contracts_retry_at:
+            return None
+        try:
+            contracts = await self._ctx.option_contracts()
+        except Exception as exc:
+            self._defer_contracts(local_now, f"option chain unavailable ({exc})")
+            return None
+        if not contracts:
+            self._defer_contracts(local_now, "option chain is empty")
+            return None
+        self._contracts_retry_at = None
+        return contracts
+
+    async def advance(self, now: datetime | None = None) -> None:
         """Move one safe step toward the requested leg: exit first, then enter."""
+        if now is not None:
+            self._market_now = now.astimezone(IST)
+        local_now = self._market_now or datetime.now(IST)
         if self._ctx.order_pending:
             return
 
         actual = self._ctx.position
-        today = datetime.now(IST).date()
+        today = local_now.date()
         held_kind = ("PE" if self.held and self.held.endswith("PE") else
                      "CE" if self.held and self.held.endswith("CE") else None)
         wanted_kind = "CE" if self.target > 0 else "PE" if self.target < 0 else None
         if actual:
-            if self.held_expiry is None and self.held:
-                contracts = await self._ctx.option_contracts()
-                held_contract = next((c for c in contracts if c.symbol == self.held), None)
-                self.held_expiry = held_contract.expiry if held_contract else None
-            expires_today = self.held_expiry is not None and self.held_expiry <= today
-            if held_kind == wanted_kind and not expires_today:
+            roll_due = False
+            if held_kind != wanted_kind:
+                # A fresh strategy reversal gets one immediate chain attempt for its opposite
+                # leg even if an earlier same-direction expiry lookup was deferred.
+                self._contracts_retry_at = None
+            if held_kind == wanted_kind:
+                # The chain is only needed to decide a same-direction expiry roll. A genuine
+                # signal reversal must still exit immediately if chain retrieval is down.
+                if self.held_expiry is None and self.held:
+                    contracts = await self._option_contracts(local_now)
+                    if contracts is None:
+                        return
+                    held_contract = next((c for c in contracts if c.symbol == self.held), None)
+                    if held_contract is None:
+                        self._defer_contracts(
+                            local_now, f"held contract {self.held} is absent from the option chain",
+                        )
+                        return
+                    self.held_expiry = held_contract.expiry
+                roll_due = self.held_expiry is not None and (
+                    self.held_expiry < today
+                    or self.held_expiry == today and local_now.time() >= EXPIRY_ROLLOVER_TIME
+                )
+            if held_kind == wanted_kind and not roll_due:
                 return
             if not self.held:
                 self._ctx.log("cannot reverse option: held contract is unknown")
                 return
-            reason = (f"roll {held_kind} expiring {self.held_expiry:%d %b}"
-                      if expires_today else self.reason or "reverse: exit current option")
-            if expires_today:
+            reason = (f"roll {held_kind} expiring {self.held_expiry:%d %b} at 15:00 IST"
+                      if roll_due else self.reason or "reverse: exit current option")
+            if roll_due:
                 self.reason = f"maintain {'LONG' if self.target > 0 else 'SHORT'} signal after expiry roll"
             await self._ctx.sell(
                 actual, reason, symbol=self.held, product=Product.DELIVERY,
@@ -134,13 +179,18 @@ class ReversalOptionLegs:
         spot = self._ctx.last_price
         if not spot:
             return  # startup warm-up can finish before the first live index tick
-        contracts = await self._ctx.option_contracts()
-        # Use the current weekly contract until its expiry date arrives. On expiry day, enter
-        # the following weekly contract directly instead of opening one that must be rolled on
-        # the next tick.
-        contract = pick_contract(contracts, wanted_kind, spot, self._itm, today + timedelta(days=1))
+        contracts = await self._option_contracts(local_now)
+        if contracts is None:
+            return
+        # Keep using the expiring weekly contract until 15:00 IST. From the rollover time
+        # onward, skip today's expiry and select the following weekly contract.
+        first_expiry = (today + timedelta(days=1)
+                        if local_now.time() >= EXPIRY_ROLLOVER_TIME else today)
+        contract = pick_contract(contracts, wanted_kind, spot, self._itm, first_expiry)
         if contract is None:
-            self._ctx.log(f"cannot enter: no {wanted_kind} contract found near {spot}")
+            self._defer_contracts(
+                local_now, f"no eligible {wanted_kind} contract found near {spot}",
+            )
             return
         quantity = self._ctx.quantity // contract.lot * contract.lot
         if quantity == 0:
@@ -192,7 +242,7 @@ class NiftyTrailingReversalOptions(NiftyTrailingReversal):
             elif rule["kind"] == "exit":
                 rule["conditions"].append("A reversal sells the held option before buying the opposite leg")
                 rule["conditions"].append(
-                    "If expiry arrives before a reversal, rolls the same signal to the next weekly contract"
+                    "At 15:00 IST on expiry day, rolls the same signal to the next weekly contract"
                 )
         return rules
 
@@ -260,7 +310,7 @@ class NiftyTrailingReversalOptions(NiftyTrailingReversal):
             f"reconstructed {'LONG' if direction > 0 else 'SHORT'} signal from "
             f"{len(bars)} candles; stop {self.stop:.2f}")
         await self._save_checkpoint()
-        await self.ctx.advance()
+        await self.ctx.advance(now)
         return True
 
     async def on_tick(self, tick) -> None:
@@ -269,8 +319,8 @@ class NiftyTrailingReversalOptions(NiftyTrailingReversal):
         if isinstance(self.ctx, ReversalOptionLegs):
             if not await self._warm_from_history(tick.at.astimezone(IST)):
                 return
-            await self.ctx.advance()
+            await self.ctx.advance(tick.at)
         await super().on_tick(tick)
         if isinstance(self.ctx, ReversalOptionLegs):
-            await self.ctx.advance()
+            await self.ctx.advance(tick.at)
 
