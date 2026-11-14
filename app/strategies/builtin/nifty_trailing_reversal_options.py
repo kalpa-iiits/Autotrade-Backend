@@ -249,6 +249,7 @@ class ReversalOptionLegs:
 
 class NiftyTrailingReversalOptions(NiftyTrailingReversal):
     name = "nifty_trailing_reversal_options"
+    timeframes = ("5m", "15m", "30m", "60m")
     description = (
         "Persistent NIFTY percentage-reversal signals, executed by holding an ITM call while "
         "long and an ITM put while short."

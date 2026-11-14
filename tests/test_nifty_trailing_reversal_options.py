@@ -472,6 +472,10 @@ def test_direct_and_options_versions_have_separate_catalog_entries():
     assert direct.strategy.capital_sizing and direct.backtest_fixed_quantity is None
     assert (direct.max_order_qty, direct.max_position) == (10_000, 5_000)
     assert options.strategy is NiftyTrailingReversalOptions
+    assert direct.strategy.timeframes == ("5m",)
+    assert options.strategy.timeframes == ("5m", "15m", "30m", "60m")
+    for timeframe in options.strategy.timeframes:
+        options.check_timeframe(timeframe)
     assert not options.strategy.capital_sizing and options.backtest_fixed_quantity == 65
     assert options.params.itm_points == 1000
     assert options.symbol == "NSE:NIFTY50-INDEX"
