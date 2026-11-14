@@ -415,6 +415,9 @@ def test_entry_is_cancelled_rather_than_chase_too_far(options):
 
 def test_entry_is_cancelled_after_max_reprices(options, monkeypatch):
     monkeypatch.setattr(settings, "option_entry_max_reprices", 2)
+    # Leave a deterministic margin between the first assertion and the third check that
+    # cancels the order; the fixture's 20 ms interval is too close under scheduler jitter.
+    monkeypatch.setattr(settings, "option_reprice_interval", 0.05)
     quiet, inst = options()
     BOOK["ask"] = 190.0  # stays stale: nothing to move to, it just sits
     SCRIPT.append(("buy", None, "entry", OPT))
