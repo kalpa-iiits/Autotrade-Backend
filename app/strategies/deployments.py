@@ -18,6 +18,9 @@ from app.strategies.builtin.intraday_breakout_options import IntradayBreakoutOpt
 from app.strategies.builtin.nifty_intraday_limited_options import NiftyIntradayLimitedOptions
 from app.strategies.builtin.nifty_trailing_reversal import NiftyTrailingReversal
 from app.strategies.builtin.nifty_trailing_reversal_options import NiftyTrailingReversalOptions
+from app.strategies.builtin.nifty_trailing_reversal_options_optimized import (
+    NiftyTrailingReversalOptionsOptimized,
+)
 from app.strategies.builtin.sma_crossover import SmaCrossover
 from app.strategies.deployment import Deployment
 
@@ -67,6 +70,22 @@ DEPLOYMENTS: list[Deployment] = [
         symbol="NSE:NIFTY50-INDEX",
         timeframe="5m",
         params=NiftyTrailingReversalOptions.Params(itm_points=1000, history_days=7),
+        quantity=65,
+        max_order_qty=650,
+        max_position=650,
+        max_orders_per_day=100,
+        backtest_initial_capital=1_000_000,
+        backtest_fixed_quantity=65,
+    ),
+    # Independent copy of the complete options execution path. Only the signal condition differs:
+    # its initial protective stop is the grid-search recommendation of 0.4% instead of 0.8%.
+    Deployment(
+        key="nifty-percentage-reversal-options-optimized",
+        label="NIFTY Percentage Trailing Reversal · Options · Optimized",
+        strategy=NiftyTrailingReversalOptionsOptimized,
+        symbol="NSE:NIFTY50-INDEX",
+        timeframe="5m",
+        params=NiftyTrailingReversalOptionsOptimized.Params(itm_points=1000, history_days=7),
         quantity=65,
         max_order_qty=650,
         max_position=650,
