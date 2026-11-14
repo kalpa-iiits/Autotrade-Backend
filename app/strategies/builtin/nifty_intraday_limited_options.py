@@ -62,6 +62,11 @@ class LimitedTradeOptionLegs:
 
     async def _open(self, kind: str, reason: str | None,
                     product: Product | None = None) -> None:
+        # Contract discovery and delta selection both make broker requests. Do not perform
+        # either after the runner has exhausted this instance's daily entry-order budget.
+        # Exits use exit() above and remain available regardless of the cap.
+        if not getattr(self._ctx, "entry_orders_available", True):
+            return
         spot = self._ctx.last_price
         if not spot:
             self._ctx.log(f"skipped ({reason}): no NIFTY price available")

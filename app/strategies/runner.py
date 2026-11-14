@@ -177,6 +177,17 @@ class StrategyContext:
         return self._inst.pending_order_id is not None
 
     @property
+    def entry_orders_available(self) -> bool:
+        """Whether another risk-increasing order may be opened today.
+
+        Option adapters use this before fetching contracts, Greeks, depth or quotes. The
+        runner remains the final authority in ``_check``; this early signal prevents a
+        strategy retry from spending broker quota after its daily order cap is exhausted.
+        Position-reducing exits deliberately do not consult this property.
+        """
+        return self._inst.orders_today < self._inst.config.max_orders_per_day
+
+    @property
     def strategy_state(self) -> dict:
         """Last durable strategy checkpoint loaded when this instance started."""
         return dict(self._inst.strategy_state)

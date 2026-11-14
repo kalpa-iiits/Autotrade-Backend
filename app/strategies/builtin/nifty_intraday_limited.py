@@ -408,9 +408,9 @@ class NiftyIntradayLimited(Strategy):
     # ---------- live execution ----------
 
     async def on_tick(self, tick: Tick) -> None:
-        if before_market_open(tick.at):
-            return
         now = tick.at.astimezone(IST)
+        if now.weekday() >= 5 or before_market_open(tick.at):
+            return
         if now.date() != self.day:
             self._new_session(now.date())
             self.session_open = tick.price
@@ -565,6 +565,15 @@ class NiftyIntradayLimited(Strategy):
         direction = self._overnight_pending
         if not direction or self.ctx.position or self.ctx.order_pending or self._morning_exit_pending:
             return
+        if not getattr(self.ctx, "entry_orders_available", True):
+            # The cap cannot become available again until the next IST day. Abandon this
+            # day's entry instead of retrying it on every five-second clock event. This also
+            # prevents option adapters from repeatedly fetching contracts and Greeks.
+            self._overnight_pending = 0
+            self._overnight_sent_at = None
+            await self._save_checkpoint()
+            self.ctx.log("overnight entry skipped: daily order limit reached")
+            return
         if self._overnight_sent_at is not None and now - self._overnight_sent_at < EXIT_RETRY:
             return
         self._overnight_sent_at = now
@@ -631,6 +640,8 @@ class NiftyIntradayLimited(Strategy):
 
     async def on_clock(self, now: datetime) -> None:
         local = now.astimezone(IST)
+        if local.weekday() >= 5:
+            return
         if local.date() != self.day and local.time() >= SESSION_OPEN:
             self._new_session(local.date())
             if self.ctx.position:

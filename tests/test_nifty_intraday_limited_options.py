@@ -34,6 +34,7 @@ class FakeCtx:
         self.calls = []
         self.products = []
         self.logs = []
+        self.entry_orders_available = True
 
     async def option_contracts(self):
         return chain()
@@ -126,6 +127,28 @@ def test_overnight_option_skips_same_day_expiry(monkeypatch):
     assert ctx.calls[0][2] == "NSE:NIFTY031124300CE"
     assert "700 points ITM" in ctx.calls[0][3]
     assert ctx.products == [Product.DELIVERY]
+
+
+def test_exhausted_daily_order_budget_skips_option_api_calls(monkeypatch):
+    fixed_now(monkeypatch)
+
+    async def go():
+        ctx = FakeCtx()
+        ctx.entry_orders_available = False
+        calls = 0
+
+        async def contracts():
+            nonlocal calls
+            calls += 1
+            return chain()
+
+        ctx.option_contracts = contracts
+        await LimitedTradeOptionLegs(ctx, 700).sell(reason="overnight short at 15:15")
+        return ctx, calls
+
+    ctx, calls = asyncio.run(go())
+    assert calls == 0
+    assert ctx.calls == []
 
 
 def test_option_adapter_keeps_stops_in_nifty_points(monkeypatch):

@@ -60,6 +60,7 @@ class LiveCtx:
         self.products = []
         self.history_candles = []
         self.logs = []
+        self.entry_orders_available = True
 
     async def buy(self, quantity=None, reason=None, product=None):
         self.calls.append(("buy", reason))
@@ -247,6 +248,45 @@ def test_zero_selected_overnight_value_stays_flat():
     replay(strategy, candle("15:15", 24_000, open=24_000))
     assert ctx.entries == []
     assert ctx.position == 0
+
+
+def test_weekend_clock_does_not_start_an_overnight_trade():
+    ctx = LiveCtx()
+    ctx.last_price = 24_000
+    strategy = NiftyIntradayLimited(
+        NiftyIntradayLimited.Params(lookback=2, stop_points=10, target_points=20),
+        ctx,
+        300,
+    )
+    asyncio.run(strategy.on_start())
+
+    saturday = datetime(2026, 11, 14, 15, 15, tzinfo=IST)
+    asyncio.run(strategy.on_clock(saturday))
+
+    assert ctx.calls == []
+    assert strategy._overnight_pending == 0
+
+
+def test_exhausted_order_budget_abandons_pending_overnight_entry():
+    ctx = LiveCtx()
+    ctx.entry_orders_available = False
+    ctx.last_price = 24_000
+    strategy = NiftyIntradayLimited(
+        NiftyIntradayLimited.Params(lookback=2, stop_points=10, target_points=20),
+        ctx,
+        300,
+    )
+    asyncio.run(strategy.on_start())
+    strategy.day = DAY
+    strategy.session_open = 23_000
+    strategy._overnight_pending = 1
+
+    asyncio.run(strategy._maybe_open_overnight(at("15:15")))
+    asyncio.run(strategy._maybe_open_overnight(at("15:16")))
+
+    assert ctx.calls == []
+    assert strategy._overnight_pending == 0
+    assert ctx.logs == ["overnight entry skipped: daily order limit reached"]
 
 
 def test_live_sequence_exits_intraday_before_opening_overnight():
