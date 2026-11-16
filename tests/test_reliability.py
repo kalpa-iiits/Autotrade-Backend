@@ -30,7 +30,17 @@ from app.strategies.runner import StrategyError
 from app.trades.models import Fill
 from tests.conftest import TOKEN, run
 from tests.test_fyers import FakeSocket, make_broker
-from tests.test_strategies import SCRIPT, SYM, by_key, deploy, dep, signals, start_strategy, tick  # noqa: F401
+from tests.test_strategies import (  # noqa: F401
+    CLOCK_SCRIPT,
+    SCRIPT,
+    SYM,
+    by_key,
+    deploy,
+    dep,
+    signals,
+    start_strategy,
+    tick,
+)
 from tests.test_zerodha import FakeKite, FakeWS
 
 AUTH = {"Authorization": f"Bearer {TOKEN}"}
@@ -258,18 +268,25 @@ def test_resync_unblocks_a_strategy_waiting_on_a_lost_fill(deploy, monkeypatch):
     c = deploy(dep("a"))
     inst = start_strategy(c, "a")
     runner, brokers = c.app.state.strategy_runner, c.app.state.accounts.get(1).service
-    order = place_limit(c, qty=1)
-    # As if the strategy had placed it: it owns the order and waits for it to finish.
-    running = runner.running[inst["id"]]
-    running.pending_order_id, runner._order_owner[(1, order["id"])] = order["id"], inst["id"]
     SCRIPT.append(("buy",))
     tick(c)
-    assert signals(c, inst["id"])[0]["outcome"] == "blocked"  # "order ... is still open"
+    order = c.post(
+        "/api/accounts/1/orders",
+        json={"symbol": SYM, "side": "SELL", "quantity": 1,
+              "order_type": "LIMIT", "limit_price": 1_000},
+        headers=AUTH,
+    ).json()
+    # As if the strategy had placed this closing order: it owns it and awaits the fill.
+    running = runner.running[inst["id"]]
+    running.pending_order_id, runner._order_owner[(1, order["id"])] = order["id"], inst["id"]
 
     paper_order = brokers.broker.orders[order["id"]]
     paper_order.status, paper_order.filled_quantity, paper_order.filled_price = OrderStatus.FILLED, 1, 1.0
+    CLOCK_SCRIPT.append(("buy",))
     run(c, brokers.resync)
+    run(c, runner.drain)
     assert (running.pending_order_id, running.position) == (None, 1)
+    assert not CLOCK_SCRIPT  # the terminal order update woke the strategy immediately
 
 
 def test_zerodha_reconnect_triggers_resync(monkeypatch):

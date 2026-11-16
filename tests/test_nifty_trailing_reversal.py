@@ -179,6 +179,26 @@ def test_live_reversal_resets_stop_from_actual_fill():
     assert strategy.stop == 98.9 * 1.008
 
 
+def test_option_like_intrabar_reversal_keeps_the_backtest_stop_reference():
+    """An option leg has no NIFTY fill, so an intrabar crossing uses the touched stop—not
+    a later streamed tick—to match the historical replay."""
+    ctx = LiveContext()
+    ctx.position = -65
+    strategy = NiftyTrailingReversal(NiftyTrailingReversal.Params(), ctx, 300)
+    first = datetime(2026, 11, 2, 10, 25, tzinfo=IST)
+
+    async def replay():
+        await strategy.on_start()
+        strategy.seeded = True
+        strategy.stop = 100
+        await strategy.on_tick(Tick(SYM, 99, first))
+        await strategy.on_tick(Tick(SYM, 101, first + timedelta(minutes=4, seconds=14)))
+
+    asyncio.run(replay())
+    assert strategy.stop == pytest.approx(100 * 0.992)
+    assert strategy._reversal_reference is None  # synchronous completion consumed it
+
+
 def test_async_live_reversal_waits_for_broker_fill_price():
     class AsyncContext(LiveContext):
         async def sell(self, quantity=None, reason=None):

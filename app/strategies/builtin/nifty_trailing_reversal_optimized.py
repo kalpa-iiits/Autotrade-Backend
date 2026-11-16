@@ -75,6 +75,7 @@ class NiftyTrailingReversalOptimized(Strategy):
         self._seed_pending = False
         self._reversal_pending = False
         self._pre_reversal_stop: float | None = None
+        self._reversal_reference: float | None = None
         self._fill_bucket: int | None = None
         self._pending_trails: list[tuple[datetime, int]] = []
         self._trail_retry_at: datetime | None = None
@@ -99,6 +100,7 @@ class NiftyTrailingReversalOptimized(Strategy):
         stop = state.get("stop")
         fill_bucket = state.get("fill_bucket")
         pre_reversal_stop = state.get("pre_reversal_stop")
+        reversal_reference = state.get("reversal_reference")
         pending_trails = state.get("pending_trails", [])
         if direction not in (-1, 0, 1):
             return False
@@ -107,6 +109,8 @@ class NiftyTrailingReversalOptimized(Strategy):
         if fill_bucket is not None and not isinstance(fill_bucket, int):
             return False
         if pre_reversal_stop is not None and not isinstance(pre_reversal_stop, (int, float)):
+            return False
+        if reversal_reference is not None and not isinstance(reversal_reference, (int, float)):
             return False
         if not isinstance(pending_trails, list):
             return False
@@ -130,6 +134,8 @@ class NiftyTrailingReversalOptimized(Strategy):
         self._reversal_pending = bool(state.get("reversal_pending")) or bool(self.ctx.order_pending)
         self._pre_reversal_stop = (float(pre_reversal_stop)
                                    if pre_reversal_stop is not None else None)
+        self._reversal_reference = (float(reversal_reference)
+                                    if reversal_reference is not None else None)
         self._fill_bucket = fill_bucket
         self._pending_trails = restored_trails
         return True
@@ -166,6 +172,7 @@ class NiftyTrailingReversalOptimized(Strategy):
             "seed_pending": self._seed_pending,
             "reversal_pending": self._reversal_pending,
             "pre_reversal_stop": self._pre_reversal_stop,
+            "reversal_reference": self._reversal_reference,
             "fill_bucket": self._fill_bucket,
             "pending_trails": [
                 {"closed_at": value.isoformat(), "direction": direction}
@@ -273,6 +280,7 @@ class NiftyTrailingReversalOptimized(Strategy):
         """Live mode: bar-close ratchets, but protective stops remain active each tick."""
         if before_market_open(tick.at):
             return  # pre-open values: a stop "hit" now could only send orders the exchange refuses
+        previous_bucket = self._bars._bucket
         if bar := self._bars.add(tick):
             await self.on_bar(bar)
         # A broker may publish its completed minute candles a few seconds after the boundary.
@@ -282,9 +290,11 @@ class NiftyTrailingReversalOptimized(Strategy):
         position = self.ctx.position
         direction = 1 if position > 0 else -1 if position < 0 else 0
         bucket = int(tick.at.timestamp()) // self.bar_seconds
+        opened_bucket = previous_bucket != bucket
         if direction and direction != self._direction and not self._reversal_pending:
             seed_fill = self._seed_pending
             self._direction, self._reversal_pending = direction, False
+            self._reversal_reference = None
             if self._seed_pending:
                 self.seeded, self._seed_pending = True, False
             # Direct-instrument live orders use the broker's reported fill. Option legs expose
@@ -300,7 +310,8 @@ class NiftyTrailingReversalOptimized(Strategy):
             # the order is terminal, either install its actual-fill stop or restore the old side
             # after a rejection/cancellation.
             if direction == self._direction:
-                fill = getattr(self.ctx, "last_fill_price", None) or tick.price
+                fill = (getattr(self.ctx, "last_fill_price", None)
+                        or self._reversal_reference or tick.price)
                 self.stop = self._initial_stop(fill, long=direction > 0)
                 self._fill_bucket = bucket
             else:
@@ -310,6 +321,7 @@ class NiftyTrailingReversalOptimized(Strategy):
                 self._fill_bucket = None
             self._reversal_pending = False
             self._pre_reversal_stop = None
+            self._reversal_reference = None
             await self._save_checkpoint()
 
         if not self.seeded and position == 0:
@@ -327,9 +339,11 @@ class NiftyTrailingReversalOptimized(Strategy):
             old_stop = self.stop
             old_fill_bucket = self._fill_bucket
             desired_direction = -1
+            reference = tick.price if opened_bucket else old_stop
             self._pre_reversal_stop = old_stop
+            self._reversal_reference = reference
             self._direction = desired_direction
-            self.stop = self._initial_stop(tick.price, long=False)
+            self.stop = self._initial_stop(reference, long=False)
             self._fill_bucket = bucket
             self._reversal_pending = True
             # Durable intent comes first. If the process dies after the broker accepts the
@@ -341,9 +355,11 @@ class NiftyTrailingReversalOptimized(Strategy):
             old_stop = self.stop
             old_fill_bucket = self._fill_bucket
             desired_direction = 1
+            reference = tick.price if opened_bucket else old_stop
             self._pre_reversal_stop = old_stop
+            self._reversal_reference = reference
             self._direction = desired_direction
-            self.stop = self._initial_stop(tick.price, long=True)
+            self.stop = self._initial_stop(reference, long=True)
             self._fill_bucket = bucket
             self._reversal_pending = True
             await self._save_checkpoint()
@@ -356,10 +372,12 @@ class NiftyTrailingReversalOptimized(Strategy):
         if new_direction == desired_direction:  # filled synchronously, or option target changed
             self._reversal_pending = self.ctx.order_pending
             if not self._reversal_pending:
-                fill = getattr(self.ctx, "last_fill_price", None) or tick.price
+                fill = (getattr(self.ctx, "last_fill_price", None)
+                        or self._reversal_reference or tick.price)
                 self.stop = self._initial_stop(fill, long=desired_direction > 0)
                 self._fill_bucket = bucket
                 self._pre_reversal_stop = None
+                self._reversal_reference = None
         elif self.ctx.order_pending:
             # Direct-instrument broker order accepted but has not filled yet.
             self._reversal_pending = True
@@ -370,6 +388,7 @@ class NiftyTrailingReversalOptimized(Strategy):
             self._fill_bucket = old_fill_bucket
             self._reversal_pending = False
             self._pre_reversal_stop = None
+            self._reversal_reference = None
         await self._save_checkpoint()
 
     async def on_bar(self, bar: Bar) -> None:

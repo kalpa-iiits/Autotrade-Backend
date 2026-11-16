@@ -111,6 +111,38 @@ def test_async_reversal_never_buys_opposite_leg_before_exit_is_terminal():
     assert ctx.products == [Product.DELIVERY, Product.DELIVERY]
 
 
+def test_reversal_preselects_opposite_contract_while_exit_is_pending():
+    class AsyncCtx(FakeCtx):
+        chain_calls = 0
+
+        async def option_contracts(self):
+            self.chain_calls += 1
+            return self._contracts
+
+        async def sell(self, quantity=None, reason=None, symbol=None, product=None):
+            self.calls.append(("SELL", quantity, symbol))
+            self.products.append(product)
+            self.order_pending = True
+
+    async def go():
+        ctx = AsyncCtx(quantity=130)
+        current = next(c for c in ctx._contracts if c.kind == "CE" and c.strike == 24_700)
+        ctx.position, ctx.held_symbol = 130, current.symbol
+        legs = ReversalOptionLegs(ctx, 300)
+        await legs.sell(reason="reverse short")
+        await asyncio.sleep(0)  # let the concurrent contract lookup complete
+        assert ctx.chain_calls == 1 and [call[0] for call in ctx.calls] == ["SELL"]
+
+        ctx.position, ctx.order_pending = 0, False
+        await legs.advance()
+        return ctx
+
+    ctx = asyncio.run(go())
+    assert ctx.chain_calls == 1  # the entry reused the result prepared during the exit
+    assert [call[0] for call in ctx.calls] == ["SELL", "BUY"]
+    assert ctx.calls[1][2].endswith("PE")
+
+
 def test_partial_option_entry_is_topped_up_to_the_configured_quantity():
     async def go():
         ctx = FakeCtx(quantity=130)

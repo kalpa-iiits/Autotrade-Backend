@@ -18,7 +18,8 @@ A strategy that raises an exception is stopped with status "error".
 Each running instance has its own tick queue and worker task, so a strategy that is slow
 (placing an order, loading history) only delays itself: the broker feed, other strategies and
 clients keep going. If an instance falls `strategy_queue_size` ticks behind, its oldest ticks
-are dropped (counted in /health). Order updates are applied straight away, never queued.
+are dropped (counted in /health). Order updates are applied straight away. A terminal update
+for the pending order also wakes the worker, so multi-leg strategies can advance immediately.
 Every `strategy_clock_interval` seconds an idle instance also gets a clock event (on_clock)
 through the same queue, so timed rules run even when no ticks arrive.
 """
@@ -719,6 +720,9 @@ class StrategyRunner:
             self._apply_order(self.running[owner], order)
 
     def _apply_order(self, inst: RunningInstance, order: Order) -> None:
+        pending_finished = order.status in TERMINAL and inst.pending_order_id == order.id
+        was_closing = ((order.side == Side.SELL and inst.position > 0)
+                       or (order.side == Side.BUY and inst.position < 0))
         filled = order.filled_quantity or (order.quantity if order.status == OrderStatus.FILLED else 0)
         new = filled - inst.filled.get(order.id, 0)
         if new > 0:
@@ -726,8 +730,12 @@ class StrategyRunner:
             inst.position += new if order.side == Side.BUY else -new
             if order.filled_price is not None:
                 inst.last_fill_price = float(order.filled_price)
-        if order.status in TERMINAL and inst.pending_order_id == order.id:
+        if pending_finished:
             inst.pending_order_id = None
+            # Keep strategy callbacks single-threaded: enqueue the wake-up instead of calling
+            # the strategy concurrently from the broker's order-update callback.
+            if was_closing and inst.worker is not None and not inst.worker.done():
+                inst.enqueue(Clock(utcnow()))
 
     # ---------- trade requests ----------
 

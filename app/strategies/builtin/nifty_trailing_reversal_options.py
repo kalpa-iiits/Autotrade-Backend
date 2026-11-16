@@ -10,6 +10,7 @@ overnight carry-forward product. The runner applies the same depth-priced limit 
 repricing policy used by the intraday NIFTY options strategy.
 """
 
+import asyncio
 from datetime import date, datetime, time, timedelta
 
 from pydantic import Field
@@ -154,6 +155,8 @@ class ReversalOptionLegs:
         self.reason: str | None = None
         self._market_now: datetime | None = None
         self._contracts_retry_at: datetime | None = None
+        self._selection_task: asyncio.Task | None = None
+        self._selection_target = 0
         self.checkpoint_dirty = False
 
     def checkpoint_state(self) -> dict:
@@ -214,6 +217,88 @@ class ReversalOptionLegs:
         self._contracts_retry_at = None
         return contracts
 
+    async def _select_entry_contract(
+        self, local_now: datetime, wanted_kind: str, spot: float,
+    ) -> tuple[OptionContract, OptionGreeks | None, str] | None:
+        """Resolve the contract once; reversal exits can run concurrently with this lookup."""
+        try:
+            contracts = await self._option_contracts(local_now)
+            if contracts is None:
+                return None
+            first_expiry = (
+                local_now.date() + timedelta(days=1)
+                if local_now.time() >= EXPIRY_ROLLOVER_TIME
+                else local_now.date()
+            )
+            max_itm_points = min(self._itm, MAX_ITM_POINTS)
+            contract = pick_capped_itm_contract(
+                contracts, wanted_kind, spot, max_itm_points, first_expiry
+            )
+            if contract is None:
+                self._defer_contracts(
+                    local_now, f"no eligible {wanted_kind} contract found near {spot}",
+                )
+                return None
+            greek: OptionGreeks | None = None
+            if hasattr(self._ctx, "option_greeks"):
+                try:
+                    rows = await self._ctx.option_greeks(contract.expiry)
+                    greek, selected = pick_delta_contract(
+                        contracts,
+                        rows,
+                        wanted_kind,
+                        contract.expiry,
+                        spot,
+                        max_itm_points=max_itm_points,
+                    )
+                    if selected is not None:
+                        contract = selected
+                    else:
+                        self._ctx.log(
+                            f"no {wanted_kind} on a 100-point strike meets |delta| >= "
+                            f"{MIN_ABS_DELTA:.2f} within {max_itm_points:g} ITM points; "
+                            f"using capped ITM fallback"
+                        )
+                except OrderError as error:
+                    self._ctx.log(
+                        f"delta selection unavailable ({error}); using capped ITM fallback"
+                    )
+            selection = (
+                f"|delta| {abs(greek.delta):.3f}"
+                if greek is not None
+                else f"up to {max_itm_points:g} points ITM fallback"
+            )
+            return contract, greek, selection
+        except Exception as error:
+            self._ctx.log(f"opposite option preselection failed ({error}); retrying")
+            return None
+
+    def _preselect(self, local_now: datetime, wanted_kind: str) -> None:
+        """Start the opposite-leg lookup without delaying the protective exit order."""
+        if self._selection_task is not None and self._selection_target == self.target:
+            return
+        if self._selection_task is not None:
+            self._selection_task.cancel()
+        spot = self._ctx.last_price
+        if not spot:
+            self._selection_task, self._selection_target = None, 0
+            return
+        self._selection_target = self.target
+        self._selection_task = asyncio.create_task(
+            self._select_entry_contract(local_now, wanted_kind, spot)
+        )
+
+    async def _prepared_contract(
+        self, local_now: datetime, wanted_kind: str, spot: float,
+    ) -> tuple[OptionContract, OptionGreeks | None, str] | None:
+        task = self._selection_task if self._selection_target == self.target else None
+        self._selection_task, self._selection_target = None, 0
+        if task is not None:
+            prepared = await task
+            if prepared is not None:
+                return prepared
+        return await self._select_entry_contract(local_now, wanted_kind, spot)
+
     async def advance(self, now: datetime | None = None) -> None:
         """Move one safe step toward the requested leg: exit first, then enter."""
         if now is not None:
@@ -233,6 +318,7 @@ class ReversalOptionLegs:
                 # A fresh strategy reversal gets one immediate chain attempt for its opposite
                 # leg even if an earlier same-direction expiry lookup was deferred.
                 self._contracts_retry_at = None
+                self._preselect(local_now, wanted_kind)
             if held_kind == wanted_kind:
                 # The chain is only needed to decide a same-direction expiry roll. A genuine
                 # signal reversal must still exit immediately if chain retrieval is down.
@@ -284,50 +370,10 @@ class ReversalOptionLegs:
         spot = self._ctx.last_price
         if not spot:
             return  # startup warm-up can finish before the first live index tick
-        contracts = await self._option_contracts(local_now)
-        if contracts is None:
+        prepared = await self._prepared_contract(local_now, wanted_kind, spot)
+        if prepared is None:
             return
-        # Keep using the expiring weekly contract until 15:00 IST. From the rollover time
-        # onward, skip today's expiry and select the following weekly contract.
-        first_expiry = (
-            today + timedelta(days=1)
-            if local_now.time() >= EXPIRY_ROLLOVER_TIME
-            else today
-        )
-        max_itm_points = min(self._itm, MAX_ITM_POINTS)
-        contract = pick_capped_itm_contract(
-            contracts, wanted_kind, spot, max_itm_points, first_expiry
-        )
-        if contract is None:
-            self._defer_contracts(
-                local_now,
-                f"no eligible {wanted_kind} contract found near {spot}",
-            )
-            return
-        greek: OptionGreeks | None = None
-        if hasattr(self._ctx, "option_greeks"):
-            try:
-                rows = await self._ctx.option_greeks(contract.expiry)
-                greek, selected = pick_delta_contract(
-                    contracts,
-                    rows,
-                    wanted_kind,
-                    contract.expiry,
-                    spot,
-                    max_itm_points=max_itm_points,
-                )
-                if selected is not None:
-                    contract = selected
-                else:
-                    self._ctx.log(
-                        f"no {wanted_kind} on a 100-point strike meets |delta| >= "
-                        f"{MIN_ABS_DELTA:.2f} within {max_itm_points:g} ITM points; "
-                        f"using capped ITM fallback"
-                    )
-            except OrderError as error:
-                self._ctx.log(
-                    f"delta selection unavailable ({error}); using capped ITM fallback"
-                )
+        contract, greek, selection = prepared
         quantity = self._ctx.quantity // contract.lot * contract.lot
         if quantity == 0:
             self._ctx.log(
@@ -338,11 +384,6 @@ class ReversalOptionLegs:
         self.held_expiry = contract.expiry
         self.held_lot = contract.lot
         self.checkpoint_dirty = True
-        selection = (
-            f"|delta| {abs(greek.delta):.3f}"
-            if greek is not None
-            else f"up to {max_itm_points:g} points ITM fallback"
-        )
         await self._ctx.buy(
             quantity,
             f"{self.reason}; {wanted_kind} {contract.strike:g} "
