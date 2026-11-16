@@ -3,7 +3,7 @@ from datetime import datetime, time, timedelta
 
 import pytest
 
-from app.brokers.base import Candle, OptionContract
+from app.brokers.base import Candle, OptionContract, OptionGreeks
 from app.orders.schemas import Product
 from app.strategies.base import Tick
 from app.strategies.builtin.nifty_trailing_reversal import IST
@@ -11,6 +11,8 @@ from app.strategies.builtin.nifty_trailing_reversal_options import (
     NiftyTrailingReversalOptions,
     ReversalOptionLegs,
     _complete_bars,
+    pick_capped_itm_contract,
+    pick_delta_contract,
 )
 
 
@@ -147,6 +149,114 @@ def test_new_signal_uses_nearest_non_expiring_weekly_and_1000_point_itm_default(
     pe = next(c for c in pe_ctx._contracts if c.symbol == pe_ctx.calls[0][2])
     assert (ce.kind, ce.strike, ce.expiry) == ("CE", 24_000, current_week_expiry)
     assert (pe.kind, pe.strike, pe.expiry) == ("PE", 26_000, current_week_expiry)
+
+
+@pytest.mark.parametrize(
+    ("kind", "deltas", "expected_strike"),
+    [
+        ("CE", {23_900: 0.99, 24_000: 0.969, 24_100: 0.972, 24_150: 0.971}, 24_100),
+        ("PE", {26_100: -0.99, 26_000: -0.969, 25_900: -0.972, 25_850: -0.971}, 25_900),
+    ],
+)
+def test_delta_selection_uses_shallowest_100_point_strike_at_or_above_097(
+    kind, deltas, expected_strike
+):
+    expiry = datetime.now(IST).date() + timedelta(days=1)
+    contracts = [
+        OptionContract(f"NSE:NIFTY{int(strike)}{kind}", kind, float(strike), expiry, 65)
+        for strike in deltas
+    ]
+    rows = [
+        OptionGreeks(contract.symbol, kind, contract.strike, expiry, deltas[contract.strike],
+                     bid=100, ask=101)
+        for contract in contracts
+    ]
+
+    greek, contract = pick_delta_contract(
+        contracts, rows, kind, expiry, 25_000, max_itm_points=1000
+    )
+
+    assert greek is not None and abs(greek.delta) >= 0.97
+    assert contract is not None and contract.strike == expected_strike
+    assert contract.strike % 100 == 0
+
+
+@pytest.mark.parametrize(("kind", "expected_strike"), [("CE", 24_000), ("PE", 26_000)])
+def test_delta_selection_caps_depth_at_1000_points(kind, expected_strike):
+    expiry = datetime.now(IST).date() + timedelta(days=1)
+    strikes = [23_900, 24_000, 24_100] if kind == "CE" else [25_900, 26_000, 26_100]
+    contracts = [
+        OptionContract(f"NSE:NIFTY{strike}{kind}", kind, float(strike), expiry, 65)
+        for strike in strikes
+    ]
+    beyond_cap = 23_900 if kind == "CE" else 26_100
+    rows = [
+        OptionGreeks(
+            contract.symbol,
+            kind,
+            contract.strike,
+            expiry,
+            (0.99 if contract.strike == beyond_cap else 0.96) * (1 if kind == "CE" else -1),
+            bid=100,
+            ask=101,
+        )
+        for contract in contracts
+    ]
+
+    _, selected = pick_delta_contract(
+        contracts, rows, kind, expiry, 25_000, max_itm_points=1000
+    )
+    fallback = pick_capped_itm_contract(contracts, kind, 25_000, 1000, expiry)
+
+    assert selected is None
+    assert fallback is not None and fallback.strike == expected_strike
+
+
+@pytest.mark.parametrize(("kind", "expected_strike"), [("CE", 24_000), ("PE", 26_000)])
+def test_1000_point_cap_rounds_to_nearest_liquid_strike(kind, expected_strike):
+    expiry = datetime.now(IST).date() + timedelta(days=1)
+    contracts = [
+        OptionContract(f"NSE:NIFTY{strike}{kind}", kind, float(strike), expiry, 65)
+        for strike in range(23_900, 26_201, 100)
+    ]
+
+    selected = pick_capped_itm_contract(contracts, kind, 25_001, 1000, expiry)
+
+    assert selected is not None and selected.strike == expected_strike
+    assert selected.strike % 100 == 0
+
+
+def test_live_entry_uses_delta_selection_instead_of_fixed_1000_itm():
+    class GreeksCtx(FakeCtx):
+        async def option_greeks(self, expiry):
+            return [
+                OptionGreeks(contract.symbol, contract.kind, contract.strike, expiry, delta,
+                             bid=100, ask=101)
+                for contract, delta in (
+                    (next(c for c in self._contracts
+                          if c.kind == "CE" and c.strike == 24_000), 0.99),
+                    (next(c for c in self._contracts
+                          if c.kind == "CE" and c.strike == 24_200), 0.971),
+                    (next(c for c in self._contracts
+                          if c.kind == "CE" and c.strike == 24_300), 0.969),
+                )
+            ]
+
+    async def go():
+        ctx = GreeksCtx()
+        expiry = ctx._contracts[0].expiry
+        ctx._contracts.extend(
+            OptionContract(f"NSE:NIFTY{strike}CE", "CE", float(strike), expiry, 65)
+            for strike in (24_000, 24_100, 24_200, 24_300, 24_400)
+        )
+        legs = ReversalOptionLegs(ctx, 1000)
+        await legs.buy(reason="long signal")
+        return ctx
+
+    ctx = asyncio.run(go())
+    selected = next(c for c in ctx._contracts if c.symbol == ctx.calls[0][2])
+    assert selected.strike == 24_200
+    assert selected.strike % 100 == 0
 
 
 def test_positional_leg_rolls_instead_of_holding_through_expiry():

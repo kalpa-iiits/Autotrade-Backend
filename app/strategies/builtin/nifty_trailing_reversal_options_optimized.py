@@ -15,7 +15,7 @@ from datetime import date, datetime, time, timedelta
 from pydantic import Field
 
 from app.brokers import OrderError
-from app.brokers.base import Candle
+from app.brokers.base import Candle, OptionContract, OptionGreeks
 from app.orders.schemas import Product
 from app.strategies.builtin.intraday_breakout_options import pick_contract
 from app.strategies.builtin.nifty_trailing_reversal_optimized import (
@@ -26,6 +26,9 @@ from app.strategies.builtin.nifty_trailing_reversal_optimized import (
 EXPIRY_ROLLOVER_TIME = time(15, 0)
 MARKET_CLOSE = time(15, 30)
 OPTION_CHAIN_RETRY = timedelta(seconds=5)
+MIN_ABS_DELTA = 0.97
+STRIKE_INTERVAL = 100
+MAX_ITM_POINTS = 1000
 
 
 def _market_open(at: datetime) -> bool:
@@ -78,6 +81,66 @@ def _complete_bars(candles: list[Candle], now: datetime, seconds: int) -> list[C
             sum(c.volume for c in rows),
         ))
     return out
+
+
+def pick_delta_contract(
+    contracts: list[OptionContract],
+    rows: list[OptionGreeks],
+    kind: str,
+    expiry: date,
+    spot: float,
+    min_abs_delta: float = MIN_ABS_DELTA,
+    max_itm_points: float = 1000,
+) -> tuple[OptionGreeks | None, OptionContract | None]:
+    """Pick the shallowest liquid 100-point strike meeting delta, capped at max ITM depth."""
+    by_symbol = {
+        contract.symbol: contract
+        for contract in contracts
+        if contract.kind == kind
+        and contract.expiry == expiry
+        and contract.strike % STRIKE_INTERVAL == 0
+        and 0 <= (spot - contract.strike if kind == "CE" else contract.strike - spot)
+        <= max_itm_points + STRIKE_INTERVAL / 2
+    }
+    candidates = [
+        row
+        for row in rows
+        if row.kind == kind
+        and row.expiry == expiry
+        and row.symbol in by_symbol
+        and min_abs_delta <= abs(row.delta) <= 1
+        and (row.ask is None or row.ask > 0)
+    ]
+    if not candidates:
+        return None, None
+
+    def key(row: OptionGreeks):
+        spread = (
+            (row.ask - row.bid) / row.ask
+            if row.ask and row.bid is not None and row.bid > 0
+            else float("inf")
+        )
+        contract = by_symbol[row.symbol]
+        depth = spot - contract.strike if kind == "CE" else contract.strike - spot
+        return abs(row.delta), spread, depth
+
+    greek = min(candidates, key=key)
+    return greek, by_symbol[greek.symbol]
+
+
+def pick_capped_itm_contract(
+    contracts: list[OptionContract], kind: str, spot: float, max_itm_points: float, today: date
+) -> OptionContract | None:
+    """Fallback to the listed 100-point strike nearest the maximum allowed ITM depth."""
+    eligible = [
+        contract
+        for contract in contracts
+        if contract.kind == kind
+        and contract.strike % STRIKE_INTERVAL == 0
+        and 0 <= (spot - contract.strike if kind == "CE" else contract.strike - spot)
+        <= max_itm_points + STRIKE_INTERVAL / 2
+    ]
+    return pick_contract(eligible, kind, spot, max_itm_points, today)
 
 
 class ReversalOptionLegs:
@@ -229,24 +292,66 @@ class ReversalOptionLegs:
             return
         # Keep using the expiring weekly contract until 15:00 IST. From the rollover time
         # onward, skip today's expiry and select the following weekly contract.
-        first_expiry = (today + timedelta(days=1)
-                        if local_now.time() >= EXPIRY_ROLLOVER_TIME else today)
-        contract = pick_contract(contracts, wanted_kind, spot, self._itm, first_expiry)
+        first_expiry = (
+            today + timedelta(days=1)
+            if local_now.time() >= EXPIRY_ROLLOVER_TIME
+            else today
+        )
+        max_itm_points = min(self._itm, MAX_ITM_POINTS)
+        contract = pick_capped_itm_contract(
+            contracts, wanted_kind, spot, max_itm_points, first_expiry
+        )
         if contract is None:
             self._defer_contracts(
-                local_now, f"no eligible {wanted_kind} contract found near {spot}",
+                local_now,
+                f"no eligible {wanted_kind} contract found near {spot}",
             )
             return
+        greek: OptionGreeks | None = None
+        if hasattr(self._ctx, "option_greeks"):
+            try:
+                rows = await self._ctx.option_greeks(contract.expiry)
+                greek, selected = pick_delta_contract(
+                    contracts,
+                    rows,
+                    wanted_kind,
+                    contract.expiry,
+                    spot,
+                    max_itm_points=max_itm_points,
+                )
+                if selected is not None:
+                    contract = selected
+                else:
+                    self._ctx.log(
+                        f"no {wanted_kind} on a 100-point strike meets |delta| >= "
+                        f"{MIN_ABS_DELTA:.2f} within {max_itm_points:g} ITM points; "
+                        f"using capped ITM fallback"
+                    )
+            except OrderError as error:
+                self._ctx.log(
+                    f"delta selection unavailable ({error}); using capped ITM fallback"
+                )
         quantity = self._ctx.quantity // contract.lot * contract.lot
         if quantity == 0:
-            self._ctx.log(f"cannot enter: {self._ctx.quantity} units is less than one lot of {contract.lot}")
+            self._ctx.log(
+                f"cannot enter: {self._ctx.quantity} units is less than one lot of {contract.lot}"
+            )
             return
         self.held = contract.symbol
         self.held_expiry = contract.expiry
         self.held_lot = contract.lot
         self.checkpoint_dirty = True
+        selection = (
+            f"|delta| {abs(greek.delta):.3f}"
+            if greek is not None
+            else f"up to {max_itm_points:g} points ITM fallback"
+        )
         await self._ctx.buy(
-            quantity, self.reason, symbol=contract.symbol, product=Product.DELIVERY,
+            quantity,
+            f"{self.reason}; {wanted_kind} {contract.strike:g} "
+            f"{contract.expiry:%d %b}; {selection}",
+            symbol=contract.symbol,
+            product=Product.DELIVERY,
         )
 
 
@@ -254,8 +359,8 @@ class NiftyTrailingReversalOptionsOptimized(NiftyTrailingReversalOptimized):
     name = "nifty_trailing_reversal_options_optimized"
     timeframes = ("5m", "15m", "30m", "60m")
     description = (
-        "Optimized persistent NIFTY percentage-reversal signals, executed by holding an ITM "
-        "call while long and an ITM put while short."
+        "Optimized persistent NIFTY percentage-reversal signals, executed with calls and puts "
+        "selected at or above 0.97 absolute delta, capped at 1000 points ITM."
     )
     tags = ("Positional", "NIFTY", "Options", "Long CE/PE", "Trailing stop")
     capital_sizing = False
@@ -266,7 +371,9 @@ class NiftyTrailingReversalOptionsOptimized(NiftyTrailingReversalOptimized):
     )
 
     class Params(NiftyTrailingReversalOptimized.Params):
-        itm_points: float = Field(1000, ge=0, description="Option distance in the money, index points")
+        itm_points: float = Field(
+            1000, ge=0, description="Requested option depth; live selection is capped at 1000 points"
+        )
         history_days: int = Field(7, ge=1, le=60, description="One-minute history used at live startup")
 
     @classmethod
@@ -280,12 +387,14 @@ class NiftyTrailingReversalOptionsOptimized(NiftyTrailingReversalOptimized):
             elif rule["kind"] == "entry_long":
                 rule["title"] = "Buy an ITM call (CE)"
                 rule["conditions"].append(
-                    f"Uses the current-week CE about {p.itm_points:g} points ITM"
+                    f"Uses a current-week CE with delta >= +{MIN_ABS_DELTA:.2f}; caps depth at "
+                    f"{min(p.itm_points, MAX_ITM_POINTS):g} ITM points and only uses 100-point strikes"
                 )
             elif rule["kind"] == "entry_short":
                 rule["title"] = "Buy an ITM put (PE)"
                 rule["conditions"].append(
-                    f"Uses the current-week PE about {p.itm_points:g} points ITM"
+                    f"Uses a current-week PE with delta <= -{MIN_ABS_DELTA:.2f}; caps depth at "
+                    f"{min(p.itm_points, MAX_ITM_POINTS):g} ITM points and only uses 100-point strikes"
                 )
             elif rule["kind"] == "exit":
                 rule["conditions"].append("A reversal sells the held option before buying the opposite leg")
