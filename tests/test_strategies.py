@@ -767,6 +767,47 @@ def test_sizing_fixed_quantity_or_capital_per_trade(deploy):
     assert instance(c, inst["id"])["sized_quantity"] == 10
 
 
+def test_quantity_can_change_while_running_and_only_affects_future_orders(deploy):
+    c = deploy(dep("a", quantity=1, max_order_qty=5, max_position=5, max_orders_per_day=20))
+    inst = start_strategy(c, "a")
+
+    SCRIPT.append(("buy",))
+    tick(c, price=100.0)
+    before = signals(c, inst["id"])[0]
+
+    r = c.patch(f"/api/strategies/{inst['id']}", json={"size_mode": "fixed", "fixed_quantity": 3},
+                headers=AUTH)
+    assert r.status_code == 200, r.text
+    assert (r.json()["lots"], r.json()["total_quantity"], r.json()["position"]) == (3, 3, 1)
+
+    SCRIPT.extend([("exit", "old position"), ("buy",)])
+    tick(c, price=100.0)
+    tick(c, price=100.0)
+    got = list(reversed(signals(c, inst["id"])))
+    assert [(s["side"], s["quantity"]) for s in got] == [("BUY", 1), ("SELL", 1), ("BUY", 3)]
+    assert got[0]["id"] == before["id"]  # prior history was not rewritten
+
+
+def test_quantity_edit_validates_lots_limits_and_available_capital(deploy):
+    class LotScripted(Scripted):
+        capital_sizing = False
+
+    c = deploy(dep("a", strategy=LotScripted, quantity=65, max_order_qty=650, max_position=650))
+    inst = by_key(c, "a")
+    # This derivative-style deployment exposes 65 units as one lot.
+    r = c.patch(f"/api/strategies/{inst['id']}", json={"fixed_quantity": 100}, headers=AUTH)
+    assert r.status_code == 422 and "65-unit lots" in r.json()["detail"]
+    r = c.patch(f"/api/strategies/{inst['id']}", json={"fixed_quantity": 195}, headers=AUTH)
+    assert r.status_code == 200 and (r.json()["lot_size"], r.json()["lots"]) == (65, 3)
+
+    # A direct instrument can be checked against the latest quote before saving.
+    c = deploy(dep("cash", quantity=1, max_order_qty=5, max_position=5))
+    inst = start_strategy(c, "cash")
+    tick(c, price=400_000.0)
+    r = c.patch(f"/api/strategies/{inst['id']}", json={"fixed_quantity": 3}, headers=AUTH)
+    assert r.status_code == 422 and "available" in r.json()["detail"]
+
+
 def test_sized_quantity_rounds_to_lots_and_caps():
     from decimal import Decimal
 

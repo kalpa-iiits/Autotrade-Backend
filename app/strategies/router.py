@@ -89,9 +89,55 @@ def _runner(request: Request) -> StrategyRunner:
     return request.app.state.strategy_runner
 
 
+async def _check_available_capital(row: StrategyInstance, sizing: dict, runner: StrategyRunner,
+                                   dep: Deployment | None) -> None:
+    """Reject a size that is known not to fit the account's available cash.
+
+    For cash instruments the current quote gives a useful notional estimate. Option strategies
+    choose their contract at signal time, so its premium is not known here; their broker still
+    performs the authoritative margin check when each future order is submitted.
+    """
+    service = runner.service(row.account_id)
+    if service is None or not service.connected or service.broker is None:
+        return
+    try:
+        funds = await service.broker.get_funds()
+        cash = funds.get("cash")
+        if cash is None:
+            return
+        available = Decimal(str(cash))
+        required: Decimal | None = None
+        if sizing["size_mode"] == "capital":
+            required = sizing["capital_per_trade"]
+        elif dep is None or dep.strategy.capital_sizing:
+            live = runner.running.get(row.id)
+            price = live.last_price if live else None
+            if not price:
+                price = (await service.broker.get_quotes([row.symbol])).get(row.symbol)
+            if price:
+                total = sizing["fixed_quantity"] or row.quantity
+                required = Decimal(total) * Decimal(str(price))
+        if required is not None and required > available:
+            raise HTTPException(
+                status.HTTP_422_UNPROCESSABLE_CONTENT,
+                f"Estimated capital required is ₹{required:,.2f}; only ₹{available:,.2f} is available",
+            )
+    except HTTPException:
+        raise
+    except OrderError:
+        # An unavailable quote/funds snapshot must not make configuration impossible. The broker
+        # repeats the capital/margin check before accepting the actual future order.
+        return
+
+
 def _instance_dict(row: StrategyInstance, runner: StrategyRunner) -> dict:
     live = runner.running.get(row.id)
     dep = runner.deployments.get(row.deployment_key)
+    # Strategies that trade derivative contracts expose their deployment quantity as one lot
+    # (for example NIFTY: 65). Cash instruments use the broker's exchange lot, normally 1.
+    lot_size = (live.lot_size if live and live.lot_size > 1 else
+                row.quantity if dep and not dep.strategy.capital_sizing else 1)
+    total = sized_quantity(row, live.last_price if live else None, lot_size)
     return {
         "id": row.id, "account_id": row.account_id, "deployment_key": row.deployment_key,
         "strategy": row.strategy, "description": dep.strategy.description if dep else None,
@@ -102,8 +148,11 @@ def _instance_dict(row: StrategyInstance, runner: StrategyRunner) -> dict:
         "quantity": row.quantity, "max_order_qty": row.max_order_qty,
         "size_mode": row.size_mode, "fixed_quantity": row.fixed_quantity,
         "capital_per_trade": float(row.capital_per_trade) if row.capital_per_trade is not None else None,
+        "lot_size": lot_size,
+        "lots": total // lot_size if total and total % lot_size == 0 else None,
+        "total_quantity": total,
         # Units the next entry would trade at the last price (None while it has no price).
-        "sized_quantity": (sized_quantity(row, live.last_price if live else None, live.lot_size if live else 1)
+        "sized_quantity": (total
                            if row.size_mode != "capital" or (live and live.last_price) else None),
         "max_position": row.max_position, "max_orders_per_day": row.max_orders_per_day,
         "last_error": row.last_error,
@@ -373,11 +422,20 @@ async def get_instance(request: Request, instance_id: int, user: User = Depends(
 @router.patch("/{instance_id}")
 async def update_instance(request: Request, instance_id: int, body: InstanceUpdate,
                           user: User = Depends(require_user)):
-    """Change an instance's symbol, timeframe and/or position sizing. It must be stopped."""
+    """Change an instance's symbol, timeframe and/or position sizing.
+
+    Symbol/timeframe changes still require a stopped strategy. Sizing changes are applied to a
+    running strategy under its order lock, so only orders submitted after this request use the
+    new size; existing positions, orders and signal history are never rewritten.
+    """
     runner = _runner(request)
     row = await _get(instance_id, user)
-    if instance_id in runner.running:
-        raise HTTPException(status.HTTP_409_CONFLICT, "Stop the strategy before changing it")
+    live = runner.running.get(instance_id)
+    target_changed = (("symbol" in body.model_fields_set and body.symbol and body.symbol.strip() != row.symbol)
+                      or ("timeframe" in body.model_fields_set and body.timeframe != row.timeframe))
+    if live is not None and target_changed:
+        raise HTTPException(status.HTTP_409_CONFLICT,
+                            "Stop the strategy before changing its symbol or timeframe")
     if row.status in HIDDEN:
         raise HTTPException(status.HTTP_409_CONFLICT, f"This instance is {row.status}")
     symbol = (body.symbol or row.symbol).strip()
@@ -390,14 +448,35 @@ async def update_instance(request: Request, instance_id: int, body: InstanceUpda
                             f"Instance #{other.id} ({other.status}) already uses {symbol} {timeframe}")
     sizing = _sizing(body, row, {"max_order_qty": row.max_order_qty, "max_position": row.max_position},
                      runner.deployments.get(row.deployment_key))
-    async with db.session() as s, s.begin():
-        row = await s.get(StrategyInstance, instance_id)
-        for k, v in sizing.items():
-            setattr(row, k, v)
-        if (row.symbol, row.timeframe) != (symbol, timeframe):
-            # Its position history belongs to the old symbol: a different instrument now.
-            row.symbol, row.timeframe, row.last_error = symbol, timeframe, None
-            row.strategy_state = {}
+    dep = runner.deployments.get(row.deployment_key)
+    lot_size = (live.lot_size if live and live.lot_size > 1 else
+                row.quantity if dep and not dep.strategy.capital_sizing else 1)
+    if sizing["size_mode"] == "fixed":
+        total = sizing["fixed_quantity"] or row.quantity
+        if total % lot_size:
+            raise HTTPException(status.HTTP_422_UNPROCESSABLE_CONTENT,
+                                f"Quantity must be a whole number of {lot_size}-unit lots")
+    await _check_available_capital(row, sizing, runner, dep)
+
+    # Serialize a live edit with order submission. Once the database commit completes, the
+    # same values are copied into the runner's execution config before its lock is released.
+    if live is not None:
+        await live.lock.acquire()
+    try:
+        async with db.session() as s, s.begin():
+            row = await s.get(StrategyInstance, instance_id)
+            for k, v in sizing.items():
+                setattr(row, k, v)
+            if (row.symbol, row.timeframe) != (symbol, timeframe):
+                # Its position history belongs to the old symbol: a different instrument now.
+                row.symbol, row.timeframe, row.last_error = symbol, timeframe, None
+                row.strategy_state = {}
+        if live is not None:
+            for k, v in sizing.items():
+                setattr(live.config, k, v)
+    finally:
+        if live is not None:
+            live.lock.release()
     return _instance_dict(row, runner) | {"warning": warning}
 
 
