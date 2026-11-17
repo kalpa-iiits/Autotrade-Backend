@@ -177,6 +177,12 @@ def test_invalid_deployments_fail_fast():
         Deployment(key="x", strategy=object, symbol=SYM, quantity=1)
 
 
+def test_all_production_deployments_allow_the_shared_position_ceiling():
+    assert deployments.DEPLOYMENTS
+    assert all(d.max_position == 1_800 for d in deployments.DEPLOYMENTS)
+    assert all((d.max_order_qty or d.quantity) >= 1_800 for d in deployments.DEPLOYMENTS)
+
+
 def test_changed_settings_come_back_stopped(deploy):
     c = deploy(dep("a"), dep("b", symbol="NSE:TCS-EQ"))
     start_strategy(c, "a")

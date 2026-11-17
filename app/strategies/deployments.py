@@ -40,8 +40,8 @@ DEPLOYMENTS: list[Deployment] = [
             itm_points=700,
         ),
         quantity=65,
-        max_order_qty=65,
-        max_position=65,
+        max_order_qty=1_800,
+        max_position=1_800,
         max_orders_per_day=10,
         backtest_initial_capital=500_000,
         backtest_fixed_quantity=65,
@@ -54,10 +54,10 @@ DEPLOYMENTS: list[Deployment] = [
         strategy=NiftyTrailingReversal,
         timeframe="5m",
         quantity=65,
-        # Capital sizing may target up to 5,000 units. A net reversal order can be twice the
+        # Capital sizing may target up to 1,800 units. A net reversal order can be twice the
         # position size because it closes the old side and opens the new side in one order.
         max_order_qty=10_000,
-        max_position=5_000,
+        max_position=1_800,
         max_orders_per_day=100,
         backtest_initial_capital=1_000_000,
     ),
@@ -71,8 +71,8 @@ DEPLOYMENTS: list[Deployment] = [
         timeframe="5m",
         params=NiftyTrailingReversalOptions.Params(itm_points=1000, history_days=7),
         quantity=65,
-        max_order_qty=650,
-        max_position=650,
+        max_order_qty=1_800,
+        max_position=1_800,
         max_orders_per_day=100,
         backtest_initial_capital=1_000_000,
         backtest_fixed_quantity=65,
@@ -87,15 +87,16 @@ DEPLOYMENTS: list[Deployment] = [
         timeframe="5m",
         params=NiftyTrailingReversalOptionsOptimized.Params(itm_points=1000, history_days=7),
         quantity=65,
-        max_order_qty=650,
-        max_position=650,
+        max_order_qty=1_800,
+        max_position=1_800,
         max_orders_per_day=100,
         backtest_initial_capital=1_000_000,
         backtest_fixed_quantity=65,
     ),
     # Intraday breakout (ported from the TradingView script). By default an instance trades one
     # futures lot (65); users can pick another fixed quantity or capital per trade in the app,
-    # up to 5,000 units per order and position (room for capital sizing on stocks, e.g. ₹5L of
+    # up to 5,000 units per order and 1,800 units per position (room for capital sizing on stocks,
+    # e.g. ₹5L of
     # a ₹100 share). Strategy Tester sizes entries from its own capital / order-size settings.
     # The user chooses the instrument and timeframe for each instance in the app.
     # 8 trades/day = up to 16 orders plus square-off, so the order cap is 20.
@@ -111,7 +112,7 @@ DEPLOYMENTS: list[Deployment] = [
         ),
         quantity=65,
         max_order_qty=5_000,
-        max_position=5_000,
+        max_position=1_800,
         max_orders_per_day=20,
         # The reference TradingView report has commission overridden to zero: its trade-level
         # "Net P&L" equals raw price P&L (for example, 78.15 points × 65 = ₹5,079.75).
@@ -119,7 +120,7 @@ DEPLOYMENTS: list[Deployment] = [
     ),
     # The same breakout signals on the NIFTY 50 index, traded with options 300 points in the
     # money: a CE on a long signal, a PE on a short one, sold when the index trade exits. Sized in
-    # option lots (65 units = 1 NIFTY lot), up to 10 lots.
+    # option lots (65 units = 1 NIFTY lot), up to the shared 1,800-unit position ceiling.
     Deployment(
         key="nifty-options-breakout",
         label="Intraday Breakout · NIFTY options",
@@ -133,8 +134,8 @@ DEPLOYMENTS: list[Deployment] = [
             itm_points=300,
         ),
         quantity=65,
-        max_order_qty=650,
-        max_position=650,
+        max_order_qty=1_800,
+        max_position=1_800,
         max_orders_per_day=20,
         backtest_fixed_quantity=65,  # one lot, like live (the tester trades index points)
     ),
@@ -145,7 +146,8 @@ DEPLOYMENTS: list[Deployment] = [
         timeframe="5m",
         params=SmaCrossover.Params(fast=9, slow=21),
         quantity=1,
-        max_position=1,
+        max_order_qty=1_800,
+        max_position=1_800,
         max_orders_per_day=10,
     ),
 ]

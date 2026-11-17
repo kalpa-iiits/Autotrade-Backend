@@ -163,7 +163,8 @@ def test_limited_trade_deployment_is_the_700_point_itm_option_version():
     assert deployment.strategy is NiftyIntradayLimitedOptions
     assert deployment.symbol == "NSE:NIFTY50-INDEX"
     assert deployment.params.itm_points == 700
-    assert deployment.quantity == deployment.max_order_qty == deployment.max_position == 65
+    assert deployment.quantity == 65
+    assert deployment.max_order_qty == deployment.max_position == 1_800
     assert deployment.backtest_fixed_quantity == 65
 
 

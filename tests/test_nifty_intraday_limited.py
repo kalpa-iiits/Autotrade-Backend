@@ -363,7 +363,7 @@ def test_new_deployment_matches_supplied_pine_inputs():
     params = deployment.params
     assert deployment.timeframe == "5m"
     assert deployment.quantity == deployment.backtest_fixed_quantity == 65
-    assert deployment.max_order_qty == deployment.max_position == 65
+    assert deployment.max_order_qty == deployment.max_position == 1_800
     assert deployment.strategy.capital_sizing is False
     assert deployment.backtest_initial_capital == 500_000
     assert (

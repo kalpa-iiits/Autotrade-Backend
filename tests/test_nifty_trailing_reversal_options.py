@@ -617,7 +617,7 @@ def test_direct_and_options_versions_have_separate_catalog_entries():
     options = next(d for d in DEPLOYMENTS if d.key == "nifty-percentage-reversal-options")
     assert direct.strategy.__name__ == "NiftyTrailingReversal"
     assert direct.strategy.capital_sizing and direct.backtest_fixed_quantity is None
-    assert (direct.max_order_qty, direct.max_position) == (10_000, 5_000)
+    assert (direct.max_order_qty, direct.max_position) == (10_000, 1_800)
     assert options.strategy is NiftyTrailingReversalOptions
     assert direct.strategy.timeframes == ("5m",)
     assert options.strategy.timeframes == ("5m", "15m", "30m", "60m")

@@ -137,8 +137,8 @@ def test_optimized_options_strategy_is_a_separate_five_minute_deployment():
     assert optimized.symbol == original.symbol == SYM
     assert optimized.timeframe == original.timeframe == "5m"
     assert optimized.quantity == original.quantity == 65
-    assert optimized.max_order_qty == original.max_order_qty == 650
-    assert optimized.max_position == original.max_position == 650
+    assert optimized.max_order_qty == original.max_order_qty == 1_800
+    assert optimized.max_position == original.max_position == 1_800
     assert optimized.max_orders_per_day == original.max_orders_per_day == 100
     assert optimized.backtest_initial_capital == original.backtest_initial_capital == 1_000_000
     assert optimized.backtest_fixed_quantity == original.backtest_fixed_quantity == 65
