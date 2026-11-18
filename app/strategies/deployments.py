@@ -22,6 +22,10 @@ from app.strategies.builtin.nifty_trailing_reversal_options_optimized import (
     NiftyTrailingReversalOptionsOptimized,
 )
 from app.strategies.builtin.sma_crossover import SmaCrossover
+from app.strategies.builtin.smart_money_concepts_options import (
+    InternalChoch3RCalls,
+    InternalChoch3RPuts,
+)
 from app.strategies.deployment import Deployment
 
 DEPLOYMENTS: list[Deployment] = [
@@ -138,6 +142,36 @@ DEPLOYMENTS: list[Deployment] = [
         max_position=1_800,
         max_orders_per_day=20,
         backtest_fixed_quantity=65,  # one lot, like live (the tester trades index points)
+    ),
+    Deployment(
+        key="smart-money-concepts",
+        label="Internal CHoCH 25% 3R · 500 ITM Calls",
+        strategy=InternalChoch3RCalls,
+        symbol="NSE:NIFTY50-INDEX",
+        timeframe="5m",
+        params=InternalChoch3RCalls.Params(itm_points=500),
+        quantity=65,
+        max_order_qty=1_800,
+        max_position=1_800,
+        max_orders_per_day=100,
+        backtest_initial_capital=200_000,
+        backtest_fixed_quantity=65,
+        backtest_commission_per_unit=0,
+    ),
+    Deployment(
+        key="smart-money-concepts-puts",
+        label="Internal CHoCH 25% 3R · 500 ITM Puts",
+        strategy=InternalChoch3RPuts,
+        symbol="NSE:NIFTY50-INDEX",
+        timeframe="5m",
+        params=InternalChoch3RPuts.Params(itm_points=500),
+        quantity=65,
+        max_order_qty=1_800,
+        max_position=1_800,
+        max_orders_per_day=100,
+        backtest_initial_capital=200_000,
+        backtest_fixed_quantity=65,
+        backtest_commission_per_unit=0,
     ),
     Deployment(
         key="sbin-sma-1m",
