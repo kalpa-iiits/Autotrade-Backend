@@ -276,6 +276,7 @@ def test_expiry_reopen_processes_opening_gap_signal_before_choosing_option_type(
     ctx = OptionSellerContext()
     ctx.strategy_state = {
         "version": 1,
+        # Checkpoints written before the display-name change must remain restorable.
         "strategy": "nifty_trailing_reversal_optimized_itm_option_seller",
         "bar_seconds": 300,
         "params": {"itm_points": 900.0},

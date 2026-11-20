@@ -89,7 +89,7 @@ DEPLOYMENTS: list[Deployment] = [
     # silently converted to a materially different instrument.
     Deployment(
         key="nifty-percentage-reversal-optimized-option-seller",
-        label="NIFTY Percentage Trailing Reversal · 900-ITM Weekly Option Seller · Optimized",
+        label="NIFTY Adaptive Premium Reset Seller",
         strategy=NiftyTrailingReversalOptimizedITMOptionSeller,
         symbol="NSE:NIFTY50-INDEX",
         timeframe="5m",

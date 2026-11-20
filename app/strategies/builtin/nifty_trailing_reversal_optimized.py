@@ -88,10 +88,12 @@ class NiftyTrailingReversalOptimized(Strategy):
             return False
         expected = {
             "version": self.checkpoint_version,
-            "strategy": self.name,
             "bar_seconds": self.bar_seconds,
             "params": self.params.model_dump(mode="json"),
         }
+        accepted_names = {self.name, *getattr(self, "legacy_checkpoint_names", ())}
+        if state.get("strategy") not in accepted_names:
+            return False
         if any(state.get(key) != value for key, value in expected.items() if key != "params"):
             return False
         if not self._checkpoint_params_match(state.get("params")):

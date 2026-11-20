@@ -445,9 +445,11 @@ class ShortWeeklyOptionLegs:
 
 
 class NiftyTrailingReversalOptimizedITMOptionSeller(NiftyTrailingReversalOptimized):
-    name = "nifty_trailing_reversal_optimized_itm_option_seller"
-    description = ("Unchanged optimized NIFTY signals executed by selling exactly 65 units "
-                   "of a current-week 900-ITM option with frozen DTE/IV premium resets.")
+    name = "nifty_adaptive_premium_reset_seller"
+    legacy_checkpoint_names = ("nifty_trailing_reversal_optimized_itm_option_seller",)
+    description = ("NIFTY Adaptive Premium Reset Seller: unchanged optimized NIFTY signals "
+                   "executed by selling exactly 65 units of a current-week 900-ITM option "
+                   "with frozen DTE/IV premium resets.")
     tags = ("Positional", "NIFTY", "Weekly options", "900 ITM", "65 units")
     capital_sizing = False
     primary_symbol_only = True
