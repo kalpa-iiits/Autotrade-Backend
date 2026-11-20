@@ -112,6 +112,9 @@ class Strategy(ABC):
     backtest_note: ClassVar[str | None] = None
     # False when it can't be sized from capital per trade (e.g. it trades option lots).
     capital_sizing: ClassVar[bool] = True
+    # Multi-leg strategies may trade auxiliary symbols without letting those quantities alter
+    # the configured instrument's directional position, sizing, or protective stops.
+    primary_symbol_only: ClassVar[bool] = False
 
     # Timeframes this strategy may run on, and the one new deployments get by default.
     timeframes: ClassVar[tuple[str, ...]] = tuple(TIMEFRAMES)

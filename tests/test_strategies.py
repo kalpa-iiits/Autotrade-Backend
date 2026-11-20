@@ -847,6 +847,39 @@ def test_trading_another_symbol_is_remembered_across_restarts(deploy):
     assert (running.position, running.held_symbol) == (2, "NSE:SBIN26NOV800CE")
 
 
+def test_auxiliary_hedge_does_not_change_primary_position_and_restores_separately(deploy):
+    class MultiLegScripted(Scripted):
+        primary_symbol_only = True
+
+    future = "NSE:NIFTY26NOVFUT"
+    hedge = "NSE:NIFTY26NOV24500PE"
+    deployment = dep(
+        "hedged", strategy=MultiLegScripted, symbol=future, quantity=65,
+        max_order_qty=130, max_position=65, max_orders_per_day=10,
+    )
+    c = deploy(deployment)
+    runtime(c).service.broker.prices[future] = 100.0
+    runtime(c).service.broker.prices[hedge] = 100.0
+    inst = start_strategy(c, "hedged")
+
+    SCRIPT.append(("buy", 65, "margin hedge", hedge))
+    tick(c, price=100, symbol=future)
+    running = c.app.state.strategy_runner.running[inst["id"]]
+    assert running.position == 0
+    assert running.positions == {hedge: 65}
+
+    SCRIPT.append(("buy", 65, "long future"))
+    tick(c, price=100, symbol=future)
+    assert running.position == 65
+    assert running.positions == {hedge: 65, future: 65}
+
+    c = deploy(deployment)
+    start_strategy(c, "hedged")
+    restored = c.app.state.strategy_runner.running[inst["id"]]
+    assert restored.position == 65
+    assert restored.positions == {hedge: 65, future: 65}
+
+
 def test_strategy_product_override_reaches_entry_and_exit_orders(deploy):
     c = deploy(dep("a"))
     start_strategy(c, "a")

@@ -16,10 +16,9 @@ try a strategy without real money, run it on a paper account.
 from app.strategies.builtin.intraday_breakout import IntradayBreakout
 from app.strategies.builtin.intraday_breakout_options import IntradayBreakoutOptions
 from app.strategies.builtin.nifty_intraday_limited_options import NiftyIntradayLimitedOptions
-from app.strategies.builtin.nifty_trailing_reversal import NiftyTrailingReversal
-from app.strategies.builtin.nifty_trailing_reversal_options import NiftyTrailingReversalOptions
-from app.strategies.builtin.nifty_trailing_reversal_options_optimized import (
-    NiftyTrailingReversalOptionsOptimized,
+from app.strategies.builtin.nifty_trailing_reversal_hedged_futures import (
+    NiftyTrailingReversalHedgedFutures,
+    NiftyTrailingReversalOptimizedHedgedFutures,
 )
 from app.strategies.builtin.sma_crossover import SmaCrossover
 from app.strategies.builtin.smart_money_concepts_options import (
@@ -51,12 +50,15 @@ DEPLOYMENTS: list[Deployment] = [
         backtest_fixed_quantity=65,
         backtest_commission_per_unit=0,
     ),
-    # Direct-instrument version: one 130-unit order reverses a 65-unit future/index position.
+    # Hedged current-month futures: buy the 500-point OTM option before opening/reversing the
+    # future, so the broker can apply the lower hedged margin. Update the future at monthly roll.
     Deployment(
         key="nifty-percentage-reversal",
-        label="NIFTY Percentage Trailing Reversal",
-        strategy=NiftyTrailingReversal,
+        label="NIFTY Percentage Trailing Reversal · Hedged Current-Month Futures",
+        strategy=NiftyTrailingReversalHedgedFutures,
+        symbol="NSE:NIFTY26NOVFUT",
         timeframe="5m",
+        params=NiftyTrailingReversalHedgedFutures.Params(hedge_points=500),
         quantity=65,
         # Capital sizing may target up to 1,800 units. A net reversal order can be twice the
         # position size because it closes the old side and opens the new side in one order.
@@ -65,37 +67,19 @@ DEPLOYMENTS: list[Deployment] = [
         max_orders_per_day=100,
         backtest_initial_capital=1_000_000,
     ),
-    # Option version: NIFTY supplies the signals; a reversal sells the held CE/PE before buying
-    # the opposite leg through the runner's depth-priced limit and repricing policy.
+    # Same current-month future execution with the optimized 0.4% initial protective stop.
     Deployment(
-        key="nifty-percentage-reversal-options",
-        label="NIFTY Percentage Trailing Reversal · Options",
-        strategy=NiftyTrailingReversalOptions,
-        symbol="NSE:NIFTY50-INDEX",
+        key="nifty-percentage-reversal-optimized",
+        label="NIFTY Percentage Trailing Reversal · Hedged Current-Month Futures · Optimized",
+        strategy=NiftyTrailingReversalOptimizedHedgedFutures,
+        symbol="NSE:NIFTY26NOVFUT",
         timeframe="5m",
-        params=NiftyTrailingReversalOptions.Params(itm_points=1000, history_days=7),
+        params=NiftyTrailingReversalOptimizedHedgedFutures.Params(hedge_points=500),
         quantity=65,
-        max_order_qty=1_800,
+        max_order_qty=10_000,
         max_position=1_800,
         max_orders_per_day=100,
         backtest_initial_capital=1_000_000,
-        backtest_fixed_quantity=65,
-    ),
-    # Independent copy of the complete options execution path. Only the signal condition differs:
-    # its initial protective stop is the grid-search recommendation of 0.4% instead of 0.8%.
-    Deployment(
-        key="nifty-percentage-reversal-options-optimized",
-        label="NIFTY Percentage Trailing Reversal · Options · Optimized",
-        strategy=NiftyTrailingReversalOptionsOptimized,
-        symbol="NSE:NIFTY50-INDEX",
-        timeframe="5m",
-        params=NiftyTrailingReversalOptionsOptimized.Params(itm_points=1000, history_days=7),
-        quantity=65,
-        max_order_qty=1_800,
-        max_position=1_800,
-        max_orders_per_day=100,
-        backtest_initial_capital=1_000_000,
-        backtest_fixed_quantity=65,
     ),
     # Intraday breakout (ported from the TradingView script). By default an instance trades one
     # futures lot (65); users can pick another fixed quantity or capital per trade in the app,

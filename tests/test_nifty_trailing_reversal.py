@@ -9,7 +9,13 @@ from app.brokers.base import Candle
 from app.strategies.backtest import Simulation
 from app.strategies.base import Tick
 from app.strategies.builtin.nifty_trailing_reversal import NiftyTrailingReversal
+from app.strategies.builtin.nifty_trailing_reversal_hedged_futures import (
+    NiftyTrailingReversalHedgedFutures,
+    NiftyTrailingReversalOptimizedHedgedFutures,
+)
+from app.strategies.builtin.nifty_trailing_reversal_optimized import NiftyTrailingReversalOptimized
 from app.strategies.deployment import Deployment
+from app.strategies.deployments import DEPLOYMENTS
 
 IST = ZoneInfo("Asia/Kolkata")
 SYM = "NSE:NIFTY50-INDEX"
@@ -380,3 +386,30 @@ def test_live_stop_waits_for_market_open_then_fires_on_the_first_tick():
         assert [(side, qty) for side, qty, _ in ctx.orders] == [("BUY", 65), ("SELL", 130)]
 
     asyncio.run(replay())
+
+
+def test_percentage_reversal_deployments_trade_current_month_futures_only():
+    original = next(d for d in DEPLOYMENTS if d.key == "nifty-percentage-reversal")
+    optimized = next(d for d in DEPLOYMENTS if d.key == "nifty-percentage-reversal-optimized")
+
+    assert original.strategy is NiftyTrailingReversalHedgedFutures
+    assert optimized.strategy is NiftyTrailingReversalOptimizedHedgedFutures
+    assert original.symbol == optimized.symbol == "NSE:NIFTY26NOVFUT"
+    assert original.label == "NIFTY Percentage Trailing Reversal · Hedged Current-Month Futures"
+    assert optimized.label.endswith("Hedged Current-Month Futures · Optimized")
+    assert original.timeframe == optimized.timeframe == "5m"
+    assert original.quantity == optimized.quantity == 65
+    assert original.max_order_qty == optimized.max_order_qty == 10_000
+    assert original.max_position == optimized.max_position == 1_800
+    assert original.params.hedge_points == optimized.params.hedge_points == 500
+    assert not any(
+        "options" in deployment.key
+        for deployment in DEPLOYMENTS
+        if "nifty-percentage-reversal" in deployment.key
+    )
+
+
+def test_optimized_futures_variant_keeps_the_point_four_percent_initial_stop():
+    assert NiftyTrailingReversal.initial_stop_pct == 0.8
+    assert NiftyTrailingReversalOptimized.initial_stop_pct == 0.4
+    assert NiftyTrailingReversalOptimized.trailing_stop_pct == 0.4

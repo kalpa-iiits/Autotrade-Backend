@@ -359,8 +359,8 @@ recorded orders are the durable simulation history.
 |---|---|
 | `sma_crossover` | fast/slow moving average cross on bar closes; long-only or with shorts |
 | `intraday_breakout` | port of the TradingView "NIFTY 1-minute breakout": from 10:30, trade the first break of the last 5 one-minute candles' high/low; stop 0.25x and trail 0.40x the 14-day average daily range; skip if the 5-candle range is wider than 0.4x it; max 8 entries/day; entries until 14:45; square-off 15:15 (IST). Deployed as `nifty-1m-breakout` on the NIFTY future, 1 lot (65). Roll the symbol to the next contract before monthly expiry. |
-| `nifty_trailing_reversal` | capital-sized direct-instrument NIFTY long/short reversal on 1–60 minute timeframes (5-minute default/Pine behavior): 0.8% initial stop, 0.4% scheduled-close trail and overnight holding. Deployed as `nifty-percentage-reversal`; tester sizing defaults to percentage of capital rather than 65 fixed units. |
-| `nifty_trailing_reversal_options` | the same NIFTY signals, executed with a long ITM CE or PE. Exact signal/stop state survives deployment restarts; recent one-minute history initializes instances that have no compatible checkpoint. Deployed separately as `nifty-percentage-reversal-options`. |
+| `nifty_trailing_reversal_hedged_futures` | current-month NIFTY futures long/short reversal on 5-minute candles: 0.8% initial stop, 0.4% scheduled-close trail and overnight holding. A long future first buys a current-month PE about 500 points OTM; a short future first buys a corresponding CE to reduce margin. Deployed as `nifty-percentage-reversal` with `NSE:NIFTY26NOVFUT`; update the future symbol before the monthly roll. |
+| `nifty_trailing_reversal_optimized_hedged_futures` | the same hedged current-month futures execution with a 0.4% initial stop, deployed as `nifty-percentage-reversal-optimized`. |
 
 Strategies can read the broker's candle history with `await self.ctx.history("D" or "1", days=...)`
 (Fyers, Zerodha; the paper broker makes up candles for its own symbols).

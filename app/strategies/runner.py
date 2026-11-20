@@ -150,6 +150,11 @@ class StrategyContext:
         return self._inst.position
 
     @property
+    def positions(self) -> dict[str, int]:
+        """Filled quantity by symbol, including auxiliary hedge legs."""
+        return dict(self._inst.positions)
+
+    @property
     def last_price(self) -> float | None:
         return self._inst.last_price
 
@@ -268,6 +273,7 @@ class RunningInstance:
         self.symbol = config.symbol
         self.strategy: Strategy | None = None
         self.position = 0
+        self.positions: dict[str, int] = {}
         self.last_price: float | None = None
         self.lot_size = 1  # the instrument's trading lot, for capital sizing
         self.tick_size: float | None = None
@@ -425,8 +431,10 @@ class StrategyRunner:
             inst.tick_size = await service.broker.get_tick_size(config.symbol)
             if config.size_mode == "capital":
                 inst.lot_size = await service.broker.get_lot_size(config.symbol) or 1
-        (inst.position, inst.filled, inst.pending_order_id,
-         inst.last_fill_price) = await self._load_position(config)
+        (inst.position, inst.positions, inst.filled, inst.pending_order_id,
+         inst.last_fill_price) = await self._load_position(
+            config, primary_symbol_only=dep.strategy.primary_symbol_only,
+        )
         inst.orders_today = await self._orders_today(instance_id)
         if inst.position:
             inst.held_symbol = await self._held_symbol(config)
@@ -721,14 +729,23 @@ class StrategyRunner:
 
     def _apply_order(self, inst: RunningInstance, order: Order) -> None:
         pending_finished = order.status in TERMINAL and inst.pending_order_id == order.id
-        was_closing = ((order.side == Side.SELL and inst.position > 0)
-                       or (order.side == Side.BUY and inst.position < 0))
+        symbol_position = inst.positions.get(order.symbol, 0)
+        was_closing = ((order.side == Side.SELL and symbol_position > 0)
+                       or (order.side == Side.BUY and symbol_position < 0))
         filled = order.filled_quantity or (order.quantity if order.status == OrderStatus.FILLED else 0)
         new = filled - inst.filled.get(order.id, 0)
         if new > 0:
             inst.filled[order.id] = filled
-            inst.position += new if order.side == Side.BUY else -new
-            if order.filled_price is not None:
+            delta = new if order.side == Side.BUY else -new
+            updated = symbol_position + delta
+            if updated:
+                inst.positions[order.symbol] = updated
+            else:
+                inst.positions.pop(order.symbol, None)
+            tracks_primary = not inst.strategy or not inst.strategy.primary_symbol_only
+            if tracks_primary or order.symbol == inst.symbol:
+                inst.position += delta
+            if order.filled_price is not None and (tracks_primary or order.symbol == inst.symbol):
                 inst.last_fill_price = float(order.filled_price)
         if pending_finished:
             inst.pending_order_id = None
@@ -739,7 +756,7 @@ class StrategyRunner:
 
     # ---------- trade requests ----------
 
-    def _check(self, inst: RunningInstance, side: Side, quantity: int) -> str | None:
+    def _check(self, inst: RunningInstance, side: Side, quantity: int, symbol: str) -> str | None:
         """The reason a trade is blocked, or None if it may go ahead."""
         cfg = inst.config
         service = self.service(inst.account_id)
@@ -751,7 +768,12 @@ class StrategyRunner:
             return "Trade ledger has unsaved order updates (see /health); orders paused"
         if inst.pending_order_id:
             return f"Order {inst.pending_order_id} is still open"
-        new_position = inst.position + (quantity if side == Side.BUY else -quantity)
+        auxiliary = bool(
+            inst.strategy and inst.strategy.primary_symbol_only and symbol != inst.symbol
+        )
+        new_position = inst.position if auxiliary else inst.position + (
+            quantity if side == Side.BUY else -quantity
+        )
         reduces_only = abs(new_position) < abs(inst.position) and (new_position * inst.position >= 0)
         if reduces_only:
             return None  # limits must never stop a strategy from getting out of a position
@@ -765,8 +787,11 @@ class StrategyRunner:
 
     async def request(self, inst: RunningInstance, side: Side, quantity: int, reason: str | None,
                       symbol: str | None = None, product: Product | None = None) -> None:
-        """Place an order on `symbol` (default the instance's own) and record it as a signal.
-        The instance keeps one net position whichever symbol it trades."""
+        """Place an order on `symbol` (default the configured instrument) and record it.
+
+        Ordinary strategies keep one aggregate position. Multi-leg strategies can mark their
+        configured instrument as primary so auxiliary hedge fills are tracked separately.
+        """
         if quantity <= 0:
             return
         symbol = symbol or inst.symbol
@@ -780,7 +805,7 @@ class StrategyRunner:
                 instance_id=inst.id, symbol=symbol, side=side.value, quantity=quantity,
                 price=price, reason=(reason or "")[:512] or None,
             )
-            if blocked := self._check(inst, side, quantity):
+            if blocked := self._check(inst, side, quantity, symbol):
                 signal.outcome, signal.message = "blocked", blocked
             else:
                 inst.last_fill_price = None
@@ -831,7 +856,8 @@ class StrategyRunner:
         service = self.service(inst.account_id)
         signal.broker = service.name
         order_type, limit_price = OrderType.MARKET, None
-        closing = inst.position > 0 if side == Side.SELL else inst.position < 0
+        symbol_position = inst.positions.get(signal.symbol, 0)
+        closing = symbol_position > 0 if side == Side.SELL else symbol_position < 0
         option = bool(OPTION_SYMBOL.search(signal.symbol))
         if option:
             buffer_pct = (self.settings.option_exit_limit_buffer_pct if closing
@@ -1012,7 +1038,10 @@ class StrategyRunner:
         # Direct-instrument strategies trade their configured symbol. Options strategies use
         # it only as the signal underlying. For those, reconcile every option position on the
         # account: an unrecorded CE/PE may be an order accepted just before a process crash.
-        options_strategy = config.strategy.endswith("_options")
+        options_strategy = (
+            config.strategy.endswith("_options")
+            or config.strategy.endswith("_hedged_futures")
+        )
         if options_strategy:
             instance_symbols.update(symbol for symbol in expected if OPTION_SYMBOL.search(symbol))
             instance_symbols.update(
@@ -1088,28 +1117,32 @@ class StrategyRunner:
         return symbol if symbol and symbol != config.symbol else None
 
     async def _load_position(
-        self, config: StrategyInstance
-    ) -> tuple[int, dict[str, int], str | None, float | None]:
+        self, config: StrategyInstance, primary_symbol_only: bool = False,
+    ) -> tuple[int, dict[str, int], dict[str, int], str | None, float | None]:
         """Rebuild position, pending order and latest actual fill after a restart."""
         async with db.session() as s:
             rows = (await s.execute(
-                select(OrderRecord.id, OrderRecord.side, OrderRecord.filled_quantity,
+                select(OrderRecord.id, OrderRecord.symbol, OrderRecord.side, OrderRecord.filled_quantity,
                        OrderRecord.status, OrderRecord.filled_price)
                 .join(StrategySignal, (StrategySignal.order_id == OrderRecord.id)
                       & (OrderRecord.account_id == config.account_id))
                 .where(StrategySignal.instance_id == config.id, StrategySignal.outcome == "placed")
                 .order_by(StrategySignal.id)
             )).all()
-        position, filled, pending, last_fill = 0, {}, None, None
-        for order_id, side, qty, status, fill_price in rows:
+        position, positions, filled, pending, last_fill = 0, {}, {}, None, None
+        for order_id, symbol, side, qty, status, fill_price in rows:
             filled[order_id] = qty or 0
-            position += (qty or 0) if side == Side.BUY.value else -(qty or 0)
-            if qty and fill_price is not None:
+            delta = (qty or 0) if side == Side.BUY.value else -(qty or 0)
+            positions[symbol] = positions.get(symbol, 0) + delta
+            if not primary_symbol_only or symbol == config.symbol:
+                position += delta
+            if qty and fill_price is not None and (not primary_symbol_only or symbol == config.symbol):
                 last_fill = float(fill_price)
             if status not in {s.value for s in TERMINAL}:
                 self._order_owner[(config.account_id, order_id)] = config.id
                 pending = order_id
-        return position, filled, pending, last_fill
+        positions = {symbol: quantity for symbol, quantity in positions.items() if quantity}
+        return position, positions, filled, pending, last_fill
 
     async def _orders_today(self, instance_id: int) -> int:
         async with db.session() as s:

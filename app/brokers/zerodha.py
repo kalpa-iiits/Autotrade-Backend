@@ -11,6 +11,7 @@ frames for ticks.
 import asyncio
 import json
 import logging
+import re
 import struct
 from datetime import date, datetime, time
 from urllib.parse import urlencode
@@ -288,6 +289,9 @@ class ZerodhaBroker(Broker):
     async def get_option_contracts(self, underlying: str) -> list[OptionContract]:
         _, tradingsymbol = split_symbol(underlying)
         name = KITE_INDEX_OPTIONS.get(tradingsymbol, tradingsymbol)  # "NIFTY 50" trades as "NIFTY"
+        future = re.fullmatch(r"(NIFTY|BANKNIFTY|FINNIFTY)\d{2}[A-Z]{3}FUT", tradingsymbol)
+        if future:
+            name = future.group(1)
         today = datetime.now().date()
         if self._options_cache is None or self._options_cache[0] != today:
             try:

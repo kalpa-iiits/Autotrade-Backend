@@ -535,6 +535,9 @@ class FyersBroker(Broker):
         # The underlying's name in the masters: an instrument's ticker ("NIFTY" for NIFTY50-INDEX).
         name = next((i.ticker for i in await _load_nse_instruments() if i.symbol == underlying), None)
         if name is None:
+            future = re.fullmatch(r"(?:NSE:)?(NIFTY|BANKNIFTY|FINNIFTY)\d{2}[A-Z]{3}FUT", underlying)
+            name = future.group(1) if future else None
+        if name is None:
             return []
         today = datetime.now(IST).date()
         async with _options_lock:
