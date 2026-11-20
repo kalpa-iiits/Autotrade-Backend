@@ -14,7 +14,7 @@ from pydantic import Field
 
 from app.brokers.base import OptionContract
 from app.orders.schemas import Product
-from app.strategies.base import Tick
+from app.strategies.base import TIMEFRAMES, Tick
 from app.strategies.builtin.intraday_breakout_options import pick_contract
 from app.strategies.builtin.nifty_trailing_reversal_optimized import IST, NiftyTrailingReversalOptimized
 
@@ -451,6 +451,10 @@ class NiftyTrailingReversalOptimizedITMOptionSeller(NiftyTrailingReversalOptimiz
     tags = ("Positional", "NIFTY", "Weekly options", "900 ITM", "65 units")
     capital_sizing = False
     primary_symbol_only = True
+    # Expose every engine-supported interval to Strategy Tester. The production deployment
+    # remains explicitly configured at 5m, preserving its perfected live signal cadence.
+    timeframes = tuple(TIMEFRAMES)
+    default_timeframe = "5m"
     backtest_note = ("The tester replays the unchanged NIFTY signal engine. Live option "
                      "execution uses current-week quotes and the frozen DTE/IV reset table.")
 

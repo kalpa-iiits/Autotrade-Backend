@@ -3,7 +3,7 @@ from datetime import date, datetime, timedelta
 
 from app.brokers.base import Candle, OptionContract
 from app.orders.schemas import Product
-from app.strategies.base import Tick
+from app.strategies.base import TIMEFRAMES, Tick
 from app.strategies.backtest import Simulation
 from app.strategies.deployment import Deployment
 from app.strategies.builtin.nifty_trailing_reversal_hedged_futures import (
@@ -331,6 +331,14 @@ def test_rules_keep_optimized_signal_triggers_unchanged():
     assert strategy.trailing_stop_pct == 0.4
     assert strategy.cadence_minutes == 10
     assert any("2–3 LOW ₹900/HIGH ₹700" in condition for condition in risk["conditions"])
+
+
+def test_tester_exposes_all_supported_timeframes_but_keeps_five_minute_default():
+    strategy = NiftyTrailingReversalOptimizedITMOptionSeller
+
+    assert strategy.timeframes == tuple(TIMEFRAMES)
+    assert strategy.timeframes == ("1m", "3m", "5m", "10m", "15m", "30m", "60m")
+    assert strategy.default_timeframe == "5m"
 
 
 def test_dte_and_iv_grid_selects_every_published_reset_bucket():
