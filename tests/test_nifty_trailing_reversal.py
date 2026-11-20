@@ -14,6 +14,9 @@ from app.strategies.builtin.nifty_trailing_reversal_hedged_futures import (
     NiftyTrailingReversalOptimizedHedgedFutures,
 )
 from app.strategies.builtin.nifty_trailing_reversal_optimized import NiftyTrailingReversalOptimized
+from app.strategies.builtin.nifty_trailing_reversal_itm_option_seller import (
+    NiftyTrailingReversalOptimizedITMOptionSeller,
+)
 from app.strategies.deployment import Deployment
 from app.strategies.deployments import DEPLOYMENTS
 
@@ -388,7 +391,7 @@ def test_live_stop_waits_for_market_open_then_fires_on_the_first_tick():
     asyncio.run(replay())
 
 
-def test_percentage_reversal_deployments_trade_current_month_futures_only():
+def test_percentage_reversal_futures_deployments_remain_unchanged_and_option_seller_is_separate():
     original = next(d for d in DEPLOYMENTS if d.key == "nifty-percentage-reversal")
     optimized = next(d for d in DEPLOYMENTS if d.key == "nifty-percentage-reversal-optimized")
 
@@ -402,11 +405,16 @@ def test_percentage_reversal_deployments_trade_current_month_futures_only():
     assert original.max_order_qty == optimized.max_order_qty == 10_000
     assert original.max_position == optimized.max_position == 1_800
     assert original.params.hedge_points == optimized.params.hedge_points == 500
-    assert not any(
-        "options" in deployment.key
-        for deployment in DEPLOYMENTS
-        if "nifty-percentage-reversal" in deployment.key
+    option = next(
+        d for d in DEPLOYMENTS
+        if d.key == "nifty-percentage-reversal-optimized-option-seller"
     )
+    assert option.strategy is NiftyTrailingReversalOptimizedITMOptionSeller
+    assert option.symbol == "NSE:NIFTY50-INDEX"
+    assert option.quantity == 65
+    assert option.max_order_qty == option.max_position == 65
+    assert not option.strategy.capital_sizing
+    assert option.params.itm_points == 900
 
 
 def test_optimized_futures_variant_keeps_the_point_four_percent_initial_stop():

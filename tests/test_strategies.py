@@ -179,8 +179,12 @@ def test_invalid_deployments_fail_fast():
 
 def test_all_production_deployments_allow_the_shared_position_ceiling():
     assert deployments.DEPLOYMENTS
-    assert all(d.max_position == 1_800 for d in deployments.DEPLOYMENTS)
-    assert all((d.max_order_qty or d.quantity) >= 1_800 for d in deployments.DEPLOYMENTS)
+    strictly_one_lot = "nifty-percentage-reversal-optimized-option-seller"
+    shared = [d for d in deployments.DEPLOYMENTS if d.key != strictly_one_lot]
+    assert all(d.max_position == 1_800 for d in shared)
+    assert all((d.max_order_qty or d.quantity) >= 1_800 for d in shared)
+    capped = next(d for d in deployments.DEPLOYMENTS if d.key == strictly_one_lot)
+    assert capped.max_order_qty == capped.max_position == capped.quantity == 65
 
 
 def test_changed_settings_come_back_stopped(deploy):

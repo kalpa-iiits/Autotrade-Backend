@@ -234,6 +234,42 @@ class StrategyContext:
             raise OrderError("Broker account not available")
         return await service.require().get_option_greeks(self.symbol, expiry)
 
+    async def quote(self, symbol: str) -> float | None:
+        """Last traded price for an auxiliary instrument such as the held option."""
+        return await self._runner._quote(self._inst.account_id, symbol)
+
+    async def executable_quote(self, symbol: str, side: str):
+        """Fresh executable option price, timestamped when the broker response is observed."""
+        depth = await self._runner._depth(self._inst.account_id, symbol)
+        price = (depth.bid if side == "SELL" else depth.ask) if depth is not None else None
+        if not price or price <= 0:
+            return None
+        # Avoid a runner-level import cycle during module discovery.
+        from app.strategies.builtin.nifty_trailing_reversal_itm_option_seller import QuoteSnapshot
+        return QuoteSnapshot(float(price), utcnow(), "depth")
+
+    async def latest_option_fill(self, symbol: str, after: datetime) -> float | None:
+        """Most recent completed sell fill for this instance's option audit trail."""
+        async with db.session() as s:
+            value = await s.scalar(
+                select(OrderRecord.filled_price)
+                .join(
+                    StrategySignal,
+                    (StrategySignal.order_id == OrderRecord.id)
+                    & (OrderRecord.account_id == self._inst.account_id),
+                )
+                .where(
+                    StrategySignal.instance_id == self._inst.id,
+                    OrderRecord.symbol == symbol,
+                    OrderRecord.side == Side.SELL.value,
+                    OrderRecord.status == OrderStatus.FILLED.value,
+                    OrderRecord.updated_at >= after,
+                )
+                .order_by(OrderRecord.updated_at.desc())
+                .limit(1)
+            )
+        return float(value) if value is not None else None
+
     def _sized(self, reason: str | None) -> int:
         quantity = self.quantity
         cfg = self._inst.config
@@ -1041,6 +1077,7 @@ class StrategyRunner:
         options_strategy = (
             config.strategy.endswith("_options")
             or config.strategy.endswith("_hedged_futures")
+            or config.strategy.endswith("_itm_option_seller")
         )
         if options_strategy:
             instance_symbols.update(symbol for symbol in expected if OPTION_SYMBOL.search(symbol))

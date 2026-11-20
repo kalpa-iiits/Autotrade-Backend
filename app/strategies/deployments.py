@@ -20,6 +20,9 @@ from app.strategies.builtin.nifty_trailing_reversal_hedged_futures import (
     NiftyTrailingReversalHedgedFutures,
     NiftyTrailingReversalOptimizedHedgedFutures,
 )
+from app.strategies.builtin.nifty_trailing_reversal_itm_option_seller import (
+    NiftyTrailingReversalOptimizedITMOptionSeller,
+)
 from app.strategies.builtin.sma_crossover import SmaCrossover
 from app.strategies.builtin.smart_money_concepts_options import (
     InternalChoch3RCalls,
@@ -80,6 +83,27 @@ DEPLOYMENTS: list[Deployment] = [
         max_position=1_800,
         max_orders_per_day=100,
         backtest_initial_capital=1_000_000,
+    ),
+    # Same optimized NIFTY trigger engine, but the execution leg is one current-week option
+    # short. It is separate from the futures deployment so existing live instances are not
+    # silently converted to a materially different instrument.
+    Deployment(
+        key="nifty-percentage-reversal-optimized-option-seller",
+        label="NIFTY Percentage Trailing Reversal · 900-ITM Weekly Option Seller · Optimized",
+        strategy=NiftyTrailingReversalOptimizedITMOptionSeller,
+        symbol="NSE:NIFTY50-INDEX",
+        timeframe="5m",
+        params=NiftyTrailingReversalOptimizedITMOptionSeller.Params(
+            itm_points=900,
+        ),
+        quantity=65,
+        # This deployment alone is hard-capped at the requested one NIFTY lot / 65 units.
+        max_order_qty=65,
+        max_position=65,
+        max_orders_per_day=100,
+        backtest_initial_capital=1_000_000,
+        backtest_fixed_quantity=65,
+        backtest_commission_per_unit=0,
     ),
     # Intraday breakout (ported from the TradingView script). By default an instance trades one
     # futures lot (65); users can pick another fixed quantity or capital per trade in the app,
