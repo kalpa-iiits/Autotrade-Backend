@@ -21,7 +21,7 @@ from app.strategies.builtin.nifty_trailing_reversal_optimized import IST, NiftyT
 EXPIRY_TIME = time(15, 30)
 EXPIRY_EXIT_TIME = time(15, 10)
 OPTION_QUANTITY = 65
-HEDGE_POINTS = 800.0
+HEDGE_POINTS = 1_000.0
 SECONDS_PER_YEAR = 365.25 * 24 * 60 * 60
 
 
@@ -329,7 +329,7 @@ class ShortWeeklyOptionLegs:
             return
         symbol, quantity = obsolete
         await self._ctx.sell(
-            quantity, "remove obsolete 800-point OTM margin hedge",
+            quantity, "remove obsolete 1000-point OTM margin hedge",
             symbol=symbol, product=Product.DELIVERY,
         )
 
@@ -556,8 +556,8 @@ class NiftyTrailingReversalOptimizedITMOptionSeller(NiftyTrailingReversalOptimiz
     legacy_checkpoint_names = ("nifty_trailing_reversal_optimized_itm_option_seller",)
     description = ("NIFTY Adaptive Premium Reset Seller: unchanged optimized NIFTY signals "
                    "executed by selling exactly 65 units of a current-week 900-ITM option "
-                   "with frozen DTE/IV premium resets and a bought 800-OTM margin hedge.")
-    tags = ("Positional", "NIFTY", "Weekly options", "900 ITM", "800 OTM hedge", "65 units")
+                   "with frozen DTE/IV premium resets and a bought 1000-OTM margin hedge.")
+    tags = ("Positional", "NIFTY", "Weekly options", "900 ITM", "1000 OTM hedge", "65 units")
     capital_sizing = False
     primary_symbol_only = True
     # Expose every engine-supported interval to Strategy Tester. The production deployment
@@ -577,7 +577,7 @@ class NiftyTrailingReversalOptimizedITMOptionSeller(NiftyTrailingReversalOptimiz
             if rule["kind"] == "filter":
                 rule["conditions"] += ["Signals/stops use NIFTY index prices only",
                                        "Exactly 65 units of one nearest-expiry option are short",
-                                       "Buy 65 units of the same-expiry option 800 points OTM as a margin hedge",
+                                       "Buy 65 units of the same-expiry option 1000 points OTM as a margin hedge",
                                        "Prefer strikes divisible by 100; fall back only if unavailable"]
             elif rule["kind"] == "entry_long":
                 rule["title"] = "LONG signal: short 900-ITM put"
