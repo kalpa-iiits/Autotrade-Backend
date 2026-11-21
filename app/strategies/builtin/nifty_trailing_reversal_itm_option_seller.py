@@ -91,6 +91,7 @@ def classify_reset(kind: str, strike: float, spot: float, option_price: float,
 class ShortWeeklyOptionLegs:
     """Map spot direction to one weekly option short plus its bought OTM margin hedge."""
     state_key = "weekly_option_leg"
+    order_product = Product.DELIVERY
 
     def __init__(self, ctx, itm_points: float, hedge_points: float = HEDGE_POINTS) -> None:
         self._ctx = ctx
@@ -230,6 +231,18 @@ class ShortWeeklyOptionLegs:
         self.set_desired(-1)
         await self.advance(datetime.now(IST), reason or "reversal")
 
+    async def _buy_overnight(self, quantity: int, reason: str, symbol: str) -> None:
+        """Place a carry-forward option order, independent of the account default."""
+        await self._ctx.buy(
+            quantity, reason, symbol=symbol, product=self.order_product,
+        )
+
+    async def _sell_overnight(self, quantity: int, reason: str, symbol: str) -> None:
+        """Place a carry-forward option order, independent of the account default."""
+        await self._ctx.sell(
+            quantity, reason, symbol=symbol, product=self.order_product,
+        )
+
     async def _quote(self, symbol: str, side: str, now: datetime) -> QuoteSnapshot | None:
         method = getattr(self._ctx, "executable_quote", None)
         if method is not None:
@@ -315,11 +328,11 @@ class ShortWeeklyOptionLegs:
         self.hedge_symbol = contract.symbol
         await self._save_leg_state()
         if held < self.option_quantity:
-            await self._ctx.buy(
+            await self._buy_overnight(
                 self.option_quantity - held,
                 f"margin hedge; buy {kind} {contract.strike:g} "
                 f"({self.hedge_points:g} points OTM) expiring {contract.expiry:%d %b}",
-                symbol=contract.symbol, product=Product.DELIVERY,
+                contract.symbol,
             )
         return self._long_options().get(contract.symbol, 0) >= self.option_quantity
 
@@ -332,9 +345,9 @@ class ShortWeeklyOptionLegs:
         if obsolete is None:
             return
         symbol, quantity = obsolete
-        await self._ctx.sell(
+        await self._sell_overnight(
             quantity, "remove obsolete 1000-point OTM margin hedge",
-            symbol=symbol, product=Product.DELIVERY,
+            symbol,
         )
 
     def _audit_record(self, now: datetime, contract: OptionContract, quote: QuoteSnapshot,
@@ -466,8 +479,8 @@ class ShortWeeklyOptionLegs:
             return
         positions, wanted = self._short_options(), self._kind(self.desired_direction)
         if self.replace_symbol and self.replace_symbol in positions:
-            await self._ctx.buy(abs(positions[self.replace_symbol]), reason,
-                                symbol=self.replace_symbol, product=Product.DELIVERY)
+            await self._buy_overnight(abs(positions[self.replace_symbol]), reason,
+                                      self.replace_symbol)
             return
         if self.replace_symbol and self.replace_symbol not in positions:
             self.replace_symbol = None
@@ -481,8 +494,9 @@ class ShortWeeklyOptionLegs:
         if obsolete is not None:
             if self.pending_contract is None and not await self._prepare(wanted, now, "reversal"):
                 return
-            await self._ctx.buy(abs(positions[obsolete]), f"{reason}; cover obsolete {obsolete[-2:]}",
-                                symbol=obsolete, product=Product.DELIVERY)
+            await self._buy_overnight(
+                abs(positions[obsolete]), f"{reason}; cover obsolete {obsolete[-2:]}", obsolete,
+            )
             return
         held = next(((s, q) for s, q in positions.items() if s.endswith(wanted)), None)
         if held is not None:
@@ -496,15 +510,17 @@ class ShortWeeklyOptionLegs:
             if self._ctx.order_pending:
                 return
             if abs(quantity) > self.option_quantity:
-                await self._ctx.buy(abs(quantity) - self.option_quantity,
-                                    "reconcile option quantity above configured size", symbol=symbol,
-                                    product=Product.DELIVERY)
+                await self._buy_overnight(
+                    abs(quantity) - self.option_quantity,
+                    "reconcile option quantity above configured size", symbol,
+                )
             elif abs(quantity) < self.option_quantity:
                 quote = await self._quote(symbol, "SELL", now)
                 if quote is not None:
-                    await self._ctx.sell(self.option_quantity - abs(quantity),
-                                         "reconcile partial option entry to configured size", symbol=symbol,
-                                         product=Product.DELIVERY)
+                    await self._sell_overnight(
+                        self.option_quantity - abs(quantity),
+                        "reconcile partial option entry to configured size", symbol,
+                    )
             elif not self._ctx.order_pending and self.pending_reason != "expiry":
                 await self._remove_obsolete_hedge()
             return
@@ -547,11 +563,11 @@ class ShortWeeklyOptionLegs:
             "record": record,
         }
         await self._save_leg_state()
-        await self._ctx.sell(
+        await self._sell_overnight(
             self.option_quantity,
             f"{event}; short {wanted} {contract.strike:g} {contract.expiry:%d %b}; "
             f"reset ₹{self.frozen.reset_level:g}; {self.option_quantity} units",
-            symbol=contract.symbol, product=Product.DELIVERY,
+            contract.symbol,
         )
 
 

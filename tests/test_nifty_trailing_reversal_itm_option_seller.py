@@ -83,6 +83,17 @@ def test_long_signal_shorts_exactly_one_current_week_900_itm_put():
     assert legs.position == 65
 
 
+def test_strategy_forces_overnight_product_even_when_caller_requests_intraday():
+    ctx = OptionSellerContext()
+    ctx.quotes["NSE:NIFTY26N2425900PE"] = 950
+    legs = ShortWeeklyOptionLegs(ctx, 900)
+
+    asyncio.run(legs.buy(reason="initial LONG", product=Product.INTRADAY))
+
+    assert ctx.orders
+    assert all(order[3] == Product.DELIVERY for order in ctx.orders)
+
+
 def test_frontend_quantity_scales_short_and_margin_hedge_together():
     ctx = OptionSellerContext(quantity=130)
     ctx.quotes["NSE:NIFTY26N2425900PE"] = 950
