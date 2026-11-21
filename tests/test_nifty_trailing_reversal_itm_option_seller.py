@@ -77,6 +77,7 @@ def test_long_signal_shorts_exactly_one_current_week_900_itm_put():
     asyncio.run(legs.advance(AT, "initial LONG"))
 
     assert ctx.orders == [
+        ("BUY", 65, "NSE:NIFTY26N2424200PE", Product.DELIVERY),
         ("SELL", 65, "NSE:NIFTY26N2425900PE", Product.DELIVERY),
     ]
     assert legs.position == 65
@@ -96,6 +97,7 @@ def test_selection_prefers_liquid_100_point_strike_over_exact_50_point_target():
     asyncio.run(legs.advance(AT, "initial LONG"))
 
     assert ctx.orders == [
+        ("BUY", 65, "NSE:NIFTY26N2424200PE", Product.DELIVERY),
         ("SELL", 65, "NSE:NIFTY26N2426000PE", Product.DELIVERY),
     ]
 
@@ -105,6 +107,8 @@ def test_selection_falls_back_to_non_100_strike_only_when_no_100_strike_is_liste
     ctx.last_price = 25_050
     ctx.contracts = [OptionContract(
         "NSE:NIFTY26N2425950PE", "PE", 25_950, EXPIRY, 65,
+    ), OptionContract(
+        "NSE:NIFTY26N2424250PE", "PE", 24_250, EXPIRY, 65,
     )]
     ctx.quotes["NSE:NIFTY26N2425950PE"] = 950
     legs = ShortWeeklyOptionLegs(ctx, 900)
@@ -113,8 +117,24 @@ def test_selection_falls_back_to_non_100_strike_only_when_no_100_strike_is_liste
     asyncio.run(legs.advance(AT, "initial LONG"))
 
     assert ctx.orders == [
+        ("BUY", 65, "NSE:NIFTY26N2424250PE", Product.DELIVERY),
         ("SELL", 65, "NSE:NIFTY26N2425950PE", Product.DELIVERY),
     ]
+
+
+def test_short_entry_waits_when_same_expiry_800_otm_hedge_is_unavailable():
+    ctx = OptionSellerContext()
+    ctx.contracts = [OptionContract(
+        "NSE:NIFTY26N2425900PE", "PE", 25_900, EXPIRY, 65,
+    )]
+    ctx.quotes["NSE:NIFTY26N2425900PE"] = 950
+    legs = ShortWeeklyOptionLegs(ctx, 900)
+    legs.set_desired(1)
+
+    asyncio.run(legs.advance(AT, "initial LONG"))
+
+    assert not ctx.orders
+    assert any("margin hedge" in message for message in ctx.logs)
 
 
 def test_reversal_covers_put_before_shorting_one_900_itm_call():
@@ -132,6 +152,7 @@ def test_reversal_covers_put_before_shorting_one_900_itm_call():
 
     assert ctx.orders == [
         ("BUY", 65, pe, Product.DELIVERY),
+        ("BUY", 65, "NSE:NIFTY26N2425800CE", Product.DELIVERY),
         ("SELL", 65, "NSE:NIFTY26N2424100CE", Product.DELIVERY),
     ]
     assert legs.position == -65
@@ -158,10 +179,11 @@ def test_reset_uses_frozen_level_and_replaces_on_downward_crossing_without_two_l
 
     assert ctx.orders == [
         ("BUY", 65, old, Product.DELIVERY),
+        ("BUY", 65, "NSE:NIFTY26N2424300PE", Product.DELIVERY),
         ("SELL", 65, "NSE:NIFTY26N2426000PE", Product.DELIVERY),
     ]
     assert min(ctx.positions.values()) == -65
-    assert sum(abs(quantity) for quantity in ctx.positions.values()) == 65
+    assert sum(abs(quantity) for quantity in ctx.positions.values()) == 130
 
 
 def test_premium_gap_below_reset_stays_pending_until_replacement_quote_appears():
@@ -190,6 +212,7 @@ def test_premium_gap_below_reset_stays_pending_until_replacement_quote_appears()
 
     assert ctx.orders == [
         ("BUY", 65, old, Product.DELIVERY),
+        ("BUY", 65, "NSE:NIFTY26N2424300PE", Product.DELIVERY),
         ("SELL", 65, fresh, Product.DELIVERY),
     ]
     assert not legs.reset_pending
@@ -219,6 +242,7 @@ def test_premium_reset_explicitly_keeps_the_held_expiry():
 
     assert ctx.orders == [
         ("BUY", 65, old, Product.DELIVERY),
+        ("BUY", 65, "NSE:NIFTY26N2624300PE", Product.DELIVERY),
         ("SELL", 65, replacement, Product.DELIVERY),
     ]
 
@@ -240,7 +264,8 @@ def test_missing_replacement_quote_keeps_existing_short_untouched():
 def test_expiry_cover_waits_until_next_session_then_reopens_and_reclassifies():
     expiry_at = datetime(2026, 11, 24, 15, 10, tzinfo=IST)
     old = "NSE:NIFTY26N2425900PE"
-    ctx = OptionSellerContext({old: -65})
+    old_hedge = "NSE:NIFTY26N2424200PE"
+    ctx = OptionSellerContext({old: -65, old_hedge: 65})
     next_expiry = date(2026, 12, 1)
     ctx.contracts += [
         OptionContract(f"NSE:NIFTY26D01{strike}PE", "PE", float(strike), next_expiry, 65)
@@ -251,12 +276,13 @@ def test_expiry_cover_waits_until_next_session_then_reopens_and_reclassifies():
     ctx.quotes[close_candidate] = 960
     ctx.quotes[gap_candidate] = 960
     legs = ShortWeeklyOptionLegs(ctx, 900)
+    legs.hedge_symbol = old_hedge
     legs.set_desired(1)
 
     async def roll():
         await legs.monitor_expiry(expiry_at)
         await legs.advance(expiry_at)
-        assert ctx.positions == {}
+        assert ctx.positions == {"NSE:NIFTY26D0124200PE": 65}
         # Reselect from the next session's spot rather than carrying the 25,900 strike selected
         # as the pre-close safety candidate through this 200-point overnight gap.
         ctx.last_price = 25_200
@@ -265,7 +291,9 @@ def test_expiry_cover_waits_until_next_session_then_reopens_and_reclassifies():
     asyncio.run(roll())
 
     assert ctx.orders == [
+        ("BUY", 65, "NSE:NIFTY26D0124200PE", Product.DELIVERY),
         ("BUY", 65, old, Product.DELIVERY),
+        ("SELL", 65, old_hedge, Product.DELIVERY),
         ("SELL", 65, gap_candidate, Product.DELIVERY),
     ]
     assert legs.frozen is not None and legs.frozen.classified_at.date() == date(2026, 11, 25)
@@ -318,7 +346,10 @@ def test_expiry_reopen_processes_opening_gap_signal_before_choosing_option_type(
 
     asyncio.run(reopen())
 
-    assert ctx.orders == [("SELL", 65, ce, Product.DELIVERY)]
+    assert ctx.orders == [
+        ("BUY", 65, "NSE:NIFTY26N2424800CE", Product.DELIVERY),
+        ("SELL", 65, ce, Product.DELIVERY),
+    ]
     assert strategy.ctx.desired_direction == -1
 
 
@@ -427,6 +458,10 @@ def test_opening_gap_reversal_stays_latched_and_uses_gap_reference_until_quote_a
         ctx.last_price = 25_000
         await strategy.on_tick(Tick("NSE:NIFTY50-INDEX", 25_000, prior_session))
         assert strategy.stop == 24_900
+        assert ctx.orders == [
+            ("BUY", 65, "NSE:NIFTY26N2424200PE", Product.DELIVERY),
+        ]
+        ctx.orders.clear()
 
         # The first tradable tick gaps through the stop. With no CE bid yet, retain the PE but
         # keep the reversal pending at 24,000 instead of reverting to the old 24,900 stop.
@@ -449,7 +484,9 @@ def test_opening_gap_reversal_stays_latched_and_uses_gap_reference_until_quote_a
 
     assert ctx.orders == [
         ("BUY", 65, old, Product.DELIVERY),
+        ("BUY", 65, "NSE:NIFTY26N2424800CE", Product.DELIVERY),
         ("SELL", 65, fresh, Product.DELIVERY),
+        ("SELL", 65, "NSE:NIFTY26N2424200PE", Product.DELIVERY),
     ]
     assert strategy.stop == 24_096
     assert not strategy._reversal_pending

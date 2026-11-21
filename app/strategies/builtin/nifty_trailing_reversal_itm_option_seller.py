@@ -21,6 +21,7 @@ from app.strategies.builtin.nifty_trailing_reversal_optimized import IST, NiftyT
 EXPIRY_TIME = time(15, 30)
 EXPIRY_EXIT_TIME = time(15, 10)
 OPTION_QUANTITY = 65
+HEDGE_POINTS = 800.0
 SECONDS_PER_YEAR = 365.25 * 24 * 60 * 60
 
 
@@ -89,16 +90,19 @@ def classify_reset(kind: str, strike: float, spot: float, option_price: float,
 
 
 class ShortWeeklyOptionLegs:
-    """Map optimized spot direction to exactly one 65-unit current-week option short."""
+    """Map spot direction to one weekly option short plus its bought OTM margin hedge."""
     state_key = "weekly_option_leg"
 
-    def __init__(self, ctx, itm_points: float) -> None:
+    def __init__(self, ctx, itm_points: float, hedge_points: float = HEDGE_POINTS) -> None:
         self._ctx = ctx
         self.itm_points = itm_points
+        self.hedge_points = hedge_points
         self.desired_direction = self._actual_direction()
         self.replace_symbol: str | None = None
         self.pending_contract: OptionContract | None = None
+        self.pending_hedge_contract: OptionContract | None = None
         self.pending_reason: str | None = None
+        self.hedge_symbol: str | None = None
         self.frozen: FrozenReset | None = None
         self.last_premium: float | None = None
         self.reset_armed = False
@@ -149,6 +153,10 @@ class ShortWeeklyOptionLegs:
         return {s: q for s, q in self._ctx.positions.items()
                 if q < 0 and s.endswith(("CE", "PE"))}
 
+    def _long_options(self) -> dict[str, int]:
+        return {s: q for s, q in self._ctx.positions.items()
+                if q > 0 and s.endswith(("CE", "PE"))}
+
     def _actual_direction(self) -> int:
         positions = self._short_options()
         if any(s.endswith("PE") for s in positions):
@@ -175,6 +183,8 @@ class ShortWeeklyOptionLegs:
         except (TypeError, ValueError):
             self.roll_after = None
         self.pending_audit = state.get("pending_audit") if isinstance(state.get("pending_audit"), dict) else None
+        value = state.get("hedge_symbol")
+        self.hedge_symbol = value if isinstance(value, str) else None
 
     def _leg_state(self) -> dict:
         return {
@@ -184,6 +194,7 @@ class ShortWeeklyOptionLegs:
             "reset_pending": self.reset_pending,
             "roll_after": self.roll_after.isoformat() if self.roll_after else None,
             "pending_audit": self.pending_audit,
+            "hedge_symbol": self.hedge_symbol,
         }
 
     async def _save_leg_state(self) -> None:
@@ -196,7 +207,8 @@ class ShortWeeklyOptionLegs:
             raise ValueError(f"invalid option direction {direction}")
         if direction != self.desired_direction:
             pending_roll = self.roll_after
-            self.replace_symbol = self.pending_contract = self.pending_reason = None
+            self.replace_symbol = self.pending_contract = self.pending_hedge_contract = None
+            self.pending_reason = None
             self.frozen = self.last_premium = self.roll_after = None
             self.reset_armed = self.reset_pending = False
             # A spot reversal after the expiry close changes the option type, not the rule that
@@ -257,6 +269,70 @@ class ShortWeeklyOptionLegs:
         ]
         return pick_contract(hundreds, kind, spot, self.itm_points, start) if hundreds else nearest
 
+    async def _select_hedge(self, kind: str, expiry: date) -> OptionContract | None:
+        spot = self._ctx.last_price
+        if not spot:
+            return None
+        contracts = await self._contracts()
+        target = spot - self.hedge_points if kind == "PE" else spot + self.hedge_points
+        eligible = [
+            contract for contract in contracts
+            if contract.kind == kind and contract.expiry == expiry
+            and (contract.strike < spot if kind == "PE" else contract.strike > spot)
+        ]
+        if not eligible:
+            return None
+        hundreds = [
+            contract for contract in eligible
+            if abs(contract.strike / 100 - round(contract.strike / 100)) < 1e-9
+        ]
+        choices = hundreds or eligible
+        return min(choices, key=lambda contract: (abs(contract.strike - target), contract.strike))
+
+    async def _ensure_hedge(self, kind: str, expiry: date) -> bool:
+        longs = self._long_options()
+        contract = self.pending_hedge_contract
+        if contract is None:
+            if self.hedge_symbol and longs.get(self.hedge_symbol, 0) >= OPTION_QUANTITY:
+                held_contract = self.contracts_by_symbol.get(self.hedge_symbol)
+                if held_contract is None:
+                    await self._contracts()
+                    held_contract = self.contracts_by_symbol.get(self.hedge_symbol)
+                if (held_contract is not None and held_contract.kind == kind
+                        and held_contract.expiry == expiry):
+                    return True
+            contract = await self._select_hedge(kind, expiry)
+        if contract is None:
+            self._ctx.log(
+                f"entry deferred: no {kind} {self.hedge_points:g}-point OTM margin hedge"
+            )
+            return False
+        held = longs.get(contract.symbol, 0)
+        self.hedge_symbol = contract.symbol
+        await self._save_leg_state()
+        if held < OPTION_QUANTITY:
+            await self._ctx.buy(
+                OPTION_QUANTITY - held,
+                f"margin hedge; buy {kind} {contract.strike:g} "
+                f"({self.hedge_points:g} points OTM) expiring {contract.expiry:%d %b}",
+                symbol=contract.symbol, product=Product.DELIVERY,
+            )
+        return self._long_options().get(contract.symbol, 0) >= OPTION_QUANTITY
+
+    async def _remove_obsolete_hedge(self) -> None:
+        obsolete = next(
+            ((symbol, quantity) for symbol, quantity in self._long_options().items()
+             if symbol != self.hedge_symbol),
+            None,
+        )
+        if obsolete is None:
+            return
+        symbol, quantity = obsolete
+        await self._ctx.sell(
+            quantity, "remove obsolete 800-point OTM margin hedge",
+            symbol=symbol, product=Product.DELIVERY,
+        )
+
     def _audit_record(self, now: datetime, contract: OptionContract, quote: QuoteSnapshot,
                       frozen: FrozenReset, reason: str) -> dict:
         record = {
@@ -270,6 +346,7 @@ class ShortWeeklyOptionLegs:
             "IV_regime": frozen.iv_regime, "frozen_reset_level": frozen.reset_level,
             "quantity": OPTION_QUANTITY, "order_fill_price": None,
             "quote_source": quote.source, "reason": reason,
+            "hedge_symbol": self.hedge_symbol, "hedge_distance": self.hedge_points,
         }
         return record
 
@@ -303,7 +380,14 @@ class ShortWeeklyOptionLegs:
         if await self._quote(contract.symbol, "SELL", now) is None:
             self._ctx.log(f"{reason} deferred: replacement quote unavailable or stale")
             return False
+        hedge = await self._select_hedge(kind, contract.expiry)
+        if hedge is None:
+            self._ctx.log(
+                f"{reason} deferred: {self.hedge_points:g}-point OTM {kind} hedge unavailable"
+            )
+            return False
         self.pending_contract, self.pending_reason = contract, reason
+        self.pending_hedge_contract = hedge
         return True
 
     async def request_reset(self, now: datetime) -> None:
@@ -358,6 +442,14 @@ class ShortWeeklyOptionLegs:
             next_day = local.date() + timedelta(days=1)
             if not await self._prepare(self._kind(self.desired_direction), now, "expiry", next_day):
                 return
+            # Acquire the next-week margin hedge during the expiry rollover. The short strike is
+            # still reselected from the next session's spot, but it can never open before this
+            # already-held hedge (or a new opposite-type hedge after an opening-gap reversal).
+            next_contract = self.pending_contract
+            if (next_contract is None
+                    or not await self._ensure_hedge(next_contract.kind, next_contract.expiry)
+                    or self._ctx.order_pending):
+                return
             self.replace_symbol, self.roll_after = current, next_day
             self.frozen = self.last_premium = None
             self.reset_armed = self.reset_pending = False
@@ -379,7 +471,7 @@ class ShortWeeklyOptionLegs:
             # prerequisite. Do not carry yesterday's strike through an overnight gap: the next
             # executable session must select 900-ITM again from that session's current spot.
             if self.roll_after is not None:
-                self.pending_contract = self.pending_reason = None
+                self.pending_contract = self.pending_hedge_contract = self.pending_reason = None
             positions = self._short_options()
         obsolete = next((s for s in positions if not s.endswith(wanted)), None)
         if obsolete is not None:
@@ -391,6 +483,14 @@ class ShortWeeklyOptionLegs:
         held = next(((s, q) for s, q in positions.items() if s.endswith(wanted)), None)
         if held is not None:
             symbol, quantity = held
+            contract = self.contracts_by_symbol.get(symbol)
+            if contract is None:
+                await self._contracts()
+                contract = self.contracts_by_symbol.get(symbol)
+            if contract is None or not await self._ensure_hedge(wanted, contract.expiry):
+                return
+            if self._ctx.order_pending:
+                return
             if abs(quantity) > OPTION_QUANTITY:
                 await self._ctx.buy(abs(quantity) - OPTION_QUANTITY,
                                     "reconcile option quantity above 65", symbol=symbol,
@@ -401,8 +501,11 @@ class ShortWeeklyOptionLegs:
                     await self._ctx.sell(OPTION_QUANTITY - abs(quantity),
                                          "reconcile partial option entry to 65", symbol=symbol,
                                          product=Product.DELIVERY)
+            elif not self._ctx.order_pending and self.pending_reason != "expiry":
+                await self._remove_obsolete_hedge()
             return
         if self.roll_after and now.astimezone(IST).date() < self.roll_after:
+            await self._remove_obsolete_hedge()
             return
 
         contract = self.pending_contract or await self._select(wanted, now)
@@ -419,13 +522,17 @@ class ShortWeeklyOptionLegs:
         except ValueError as exc:
             self._ctx.log(f"entry deferred: {exc}")
             return
+        if not await self._ensure_hedge(wanted, contract.expiry):
+            return
+        if self._ctx.order_pending:
+            return
         event = self.pending_reason or ("reset" if self.reset_pending else reason)
         if self.frozen is None or event in {"reversal", "expiry"} or "reverse" in event:
             self.frozen = calculated
         self.last_premium, self.roll_after = quote.price, None
         self.reset_armed = quote.price > self.frozen.reset_level
         self.reset_pending = False
-        self.pending_contract = self.pending_reason = None
+        self.pending_contract = self.pending_hedge_contract = self.pending_reason = None
         record = self._audit_record(now, contract, quote, self.frozen, event)
         submitted = dict(record)
         submitted["stage"] = "submitted"
@@ -449,8 +556,8 @@ class NiftyTrailingReversalOptimizedITMOptionSeller(NiftyTrailingReversalOptimiz
     legacy_checkpoint_names = ("nifty_trailing_reversal_optimized_itm_option_seller",)
     description = ("NIFTY Adaptive Premium Reset Seller: unchanged optimized NIFTY signals "
                    "executed by selling exactly 65 units of a current-week 900-ITM option "
-                   "with frozen DTE/IV premium resets.")
-    tags = ("Positional", "NIFTY", "Weekly options", "900 ITM", "65 units")
+                   "with frozen DTE/IV premium resets and a bought 800-OTM margin hedge.")
+    tags = ("Positional", "NIFTY", "Weekly options", "900 ITM", "800 OTM hedge", "65 units")
     capital_sizing = False
     primary_symbol_only = True
     # Expose every engine-supported interval to Strategy Tester. The production deployment
@@ -470,6 +577,7 @@ class NiftyTrailingReversalOptimizedITMOptionSeller(NiftyTrailingReversalOptimiz
             if rule["kind"] == "filter":
                 rule["conditions"] += ["Signals/stops use NIFTY index prices only",
                                        "Exactly 65 units of one nearest-expiry option are short",
+                                       "Buy 65 units of the same-expiry option 800 points OTM as a margin hedge",
                                        "Prefer strikes divisible by 100; fall back only if unavailable"]
             elif rule["kind"] == "entry_long":
                 rule["title"] = "LONG signal: short 900-ITM put"
@@ -482,7 +590,8 @@ class NiftyTrailingReversalOptimizedITMOptionSeller(NiftyTrailingReversalOptimiz
                     "Reset only on a downward crossing with a fresh executable replacement quote",
                 ]
             elif rule["kind"] == "exit":
-                rule["conditions"] += ["Cover before replacement; never retain both directions",
+                rule["conditions"] += ["Buy the OTM hedge before its protected short option",
+                                       "Cover before replacement; never retain both short directions",
                                        "Start expiry rollover at 15:10 IST and reopen next executable session"]
         return rules
 
