@@ -412,7 +412,7 @@ def test_percentage_reversal_futures_deployments_remain_unchanged_and_option_sel
     assert option.strategy is NiftyTrailingReversalOptimizedITMOptionSeller
     assert option.symbol == "NSE:NIFTY50-INDEX"
     assert option.quantity == 65
-    assert option.max_order_qty == option.max_position == 65
+    assert option.max_order_qty == option.max_position == 1_800
     assert not option.strategy.capital_sizing
     assert option.params.itm_points == 900
 

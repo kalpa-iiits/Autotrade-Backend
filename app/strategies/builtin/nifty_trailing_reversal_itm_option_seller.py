@@ -1,4 +1,4 @@
-"""Optimized NIFTY trailing-reversal signals executed with one short weekly ITM option.
+"""Optimized NIFTY trailing-reversal signals executed with a short weekly ITM option.
 
 The index is the only signal/stop source. Option prices only select, classify, reset and roll
 the execution leg described by the published strategy rules.
@@ -20,7 +20,6 @@ from app.strategies.builtin.nifty_trailing_reversal_optimized import IST, NiftyT
 
 EXPIRY_TIME = time(15, 30)
 EXPIRY_EXIT_TIME = time(15, 10)
-OPTION_QUANTITY = 65
 HEDGE_POINTS = 1_000.0
 SECONDS_PER_YEAR = 365.25 * 24 * 60 * 60
 
@@ -128,11 +127,16 @@ class ShortWeeklyOptionLegs:
     def position(self) -> int:
         actual = self._actual_direction()
         if actual:
-            return actual * OPTION_QUANTITY
+            return actual * self.option_quantity
         # While waiting for the next session after expiry, keep the spot signal virtually in
         # its continuing direction so its overnight stop can react to the first 09:15 tick.
-        return (self.desired_direction * OPTION_QUANTITY
+        return (self.desired_direction * self.option_quantity
                 if self.pending_contract or self.roll_after else 0)
+
+    @property
+    def option_quantity(self) -> int:
+        """Configured units per leg; the short and its margin hedge always match."""
+        return self._ctx.quantity
 
     @property
     def order_pending(self) -> bool:
@@ -293,7 +297,7 @@ class ShortWeeklyOptionLegs:
         longs = self._long_options()
         contract = self.pending_hedge_contract
         if contract is None:
-            if self.hedge_symbol and longs.get(self.hedge_symbol, 0) >= OPTION_QUANTITY:
+            if self.hedge_symbol and longs.get(self.hedge_symbol, 0) >= self.option_quantity:
                 held_contract = self.contracts_by_symbol.get(self.hedge_symbol)
                 if held_contract is None:
                     await self._contracts()
@@ -310,14 +314,14 @@ class ShortWeeklyOptionLegs:
         held = longs.get(contract.symbol, 0)
         self.hedge_symbol = contract.symbol
         await self._save_leg_state()
-        if held < OPTION_QUANTITY:
+        if held < self.option_quantity:
             await self._ctx.buy(
-                OPTION_QUANTITY - held,
+                self.option_quantity - held,
                 f"margin hedge; buy {kind} {contract.strike:g} "
                 f"({self.hedge_points:g} points OTM) expiring {contract.expiry:%d %b}",
                 symbol=contract.symbol, product=Product.DELIVERY,
             )
-        return self._long_options().get(contract.symbol, 0) >= OPTION_QUANTITY
+        return self._long_options().get(contract.symbol, 0) >= self.option_quantity
 
     async def _remove_obsolete_hedge(self) -> None:
         obsolete = next(
@@ -344,7 +348,7 @@ class ShortWeeklyOptionLegs:
             "option_premium": quote.price, "intrinsic_value": frozen.intrinsic_value,
             "time_value": frozen.time_value, "iv_proxy": frozen.iv_proxy,
             "IV_regime": frozen.iv_regime, "frozen_reset_level": frozen.reset_level,
-            "quantity": OPTION_QUANTITY, "order_fill_price": None,
+            "quantity": self.option_quantity, "order_fill_price": None,
             "quote_source": quote.source, "reason": reason,
             "hedge_symbol": self.hedge_symbol, "hedge_distance": self.hedge_points,
         }
@@ -491,15 +495,15 @@ class ShortWeeklyOptionLegs:
                 return
             if self._ctx.order_pending:
                 return
-            if abs(quantity) > OPTION_QUANTITY:
-                await self._ctx.buy(abs(quantity) - OPTION_QUANTITY,
-                                    "reconcile option quantity above 65", symbol=symbol,
+            if abs(quantity) > self.option_quantity:
+                await self._ctx.buy(abs(quantity) - self.option_quantity,
+                                    "reconcile option quantity above configured size", symbol=symbol,
                                     product=Product.DELIVERY)
-            elif abs(quantity) < OPTION_QUANTITY:
+            elif abs(quantity) < self.option_quantity:
                 quote = await self._quote(symbol, "SELL", now)
                 if quote is not None:
-                    await self._ctx.sell(OPTION_QUANTITY - abs(quantity),
-                                         "reconcile partial option entry to 65", symbol=symbol,
+                    await self._ctx.sell(self.option_quantity - abs(quantity),
+                                         "reconcile partial option entry to configured size", symbol=symbol,
                                          product=Product.DELIVERY)
             elif not self._ctx.order_pending and self.pending_reason != "expiry":
                 await self._remove_obsolete_hedge()
@@ -544,9 +548,9 @@ class ShortWeeklyOptionLegs:
         }
         await self._save_leg_state()
         await self._ctx.sell(
-            OPTION_QUANTITY,
+            self.option_quantity,
             f"{event}; short {wanted} {contract.strike:g} {contract.expiry:%d %b}; "
-            f"reset ₹{self.frozen.reset_level:g}; one lot (65 units)",
+            f"reset ₹{self.frozen.reset_level:g}; {self.option_quantity} units",
             symbol=contract.symbol, product=Product.DELIVERY,
         )
 
@@ -555,9 +559,9 @@ class NiftyTrailingReversalOptimizedITMOptionSeller(NiftyTrailingReversalOptimiz
     name = "nifty_adaptive_premium_reset_seller"
     legacy_checkpoint_names = ("nifty_trailing_reversal_optimized_itm_option_seller",)
     description = ("NIFTY Adaptive Premium Reset Seller: unchanged optimized NIFTY signals "
-                   "executed by selling exactly 65 units of a current-week 900-ITM option "
+                   "executed by selling the configured quantity of a current-week 900-ITM option "
                    "with frozen DTE/IV premium resets and a bought 1000-OTM margin hedge.")
-    tags = ("Positional", "NIFTY", "Weekly options", "900 ITM", "1000 OTM hedge", "65 units")
+    tags = ("Positional", "NIFTY", "Weekly options", "900 ITM", "1000 OTM hedge")
     capital_sizing = False
     primary_symbol_only = True
     # Expose every engine-supported interval to Strategy Tester. The production deployment
@@ -576,8 +580,8 @@ class NiftyTrailingReversalOptimizedITMOptionSeller(NiftyTrailingReversalOptimiz
         for rule in rules:
             if rule["kind"] == "filter":
                 rule["conditions"] += ["Signals/stops use NIFTY index prices only",
-                                       "Exactly 65 units of one nearest-expiry option are short",
-                                       "Buy 65 units of the same-expiry option 1000 points OTM as a margin hedge",
+                                       "The configured quantity of one nearest-expiry option is short",
+                                       "Buy the same quantity of the same-expiry option 1000 points OTM as a margin hedge",
                                        "Prefer strikes divisible by 100; fall back only if unavailable"]
             elif rule["kind"] == "entry_long":
                 rule["title"] = "LONG signal: short 900-ITM put"

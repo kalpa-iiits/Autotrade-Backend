@@ -97,9 +97,9 @@ DEPLOYMENTS: list[Deployment] = [
             itm_points=900,
         ),
         quantity=65,
-        # This deployment alone is hard-capped at the requested one NIFTY lot / 65 units.
-        max_order_qty=65,
-        max_position=65,
+        # Keep the default at one NIFTY lot while allowing larger fixed-size deployments.
+        max_order_qty=1_800,
+        max_position=1_800,
         max_orders_per_day=100,
         backtest_initial_capital=1_000_000,
         backtest_fixed_quantity=65,

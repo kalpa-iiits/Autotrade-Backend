@@ -24,9 +24,9 @@ AT = datetime(2026, 11, 20, 10, 0, tzinfo=IST)
 
 
 class OptionSellerContext:
-    def __init__(self, positions=None):
+    def __init__(self, positions=None, quantity=65):
         self.positions = dict(positions or {})
-        self.quantity = 65
+        self.quantity = quantity
         self.last_price = 25_000
         self.order_pending = False
         self.strategy_state = {}
@@ -81,6 +81,21 @@ def test_long_signal_shorts_exactly_one_current_week_900_itm_put():
         ("SELL", 65, "NSE:NIFTY26N2425900PE", Product.DELIVERY),
     ]
     assert legs.position == 65
+
+
+def test_frontend_quantity_scales_short_and_margin_hedge_together():
+    ctx = OptionSellerContext(quantity=130)
+    ctx.quotes["NSE:NIFTY26N2425900PE"] = 950
+    legs = ShortWeeklyOptionLegs(ctx, 900)
+    legs.set_desired(1)
+
+    asyncio.run(legs.advance(AT, "initial LONG"))
+
+    assert ctx.orders == [
+        ("BUY", 130, "NSE:NIFTY26N2424000PE", Product.DELIVERY),
+        ("SELL", 130, "NSE:NIFTY26N2425900PE", Product.DELIVERY),
+    ]
+    assert legs.position == 130
 
 
 def test_selection_prefers_liquid_100_point_strike_over_exact_50_point_target():
