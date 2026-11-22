@@ -66,7 +66,9 @@ class FrozenReset:
 
 
 def classify_reset(kind: str, strike: float, spot: float, option_price: float,
-                   expiry: date, now: datetime) -> FrozenReset:
+                   expiry: date, now: datetime, *, reset_01: float = 850,
+                   reset_23_low: float = 900, reset_23_high: float = 700,
+                   reset_47_low: float = 850, reset_47_high: float = 900) -> FrozenReset:
     """Calculate the rule's DTE/IV classification at entry or an expiry roll."""
     local = now.astimezone(IST)
     dte = (expiry - local.date()).days
@@ -80,11 +82,11 @@ def classify_reset(kind: str, strike: float, spot: float, option_price: float,
     threshold = 0.013692 if dte <= 1 else 0.010253 if dte <= 3 else 0.009954
     regime = "HIGH" if iv_proxy >= threshold else "LOW"
     if dte <= 1:
-        reset = 850.0
+        reset = reset_01
     elif dte <= 3:
-        reset = 700.0 if regime == "HIGH" else 900.0
+        reset = reset_23_high if regime == "HIGH" else reset_23_low
     else:
-        reset = 900.0 if regime == "HIGH" else 850.0
+        reset = reset_47_high if regime == "HIGH" else reset_47_low
     return FrozenReset(dte, intrinsic, time_value, iv_proxy, regime, reset, local, expiry)
 
 
@@ -94,6 +96,11 @@ class ShortWeeklyOptionLegs:
     order_product = Product.DELIVERY
     same_session_expiry_roll = False
     require_fresh_hedge_quote = False
+    reset_01 = 850.0
+    reset_23_low = 900.0
+    reset_23_high = 700.0
+    reset_47_low = 850.0
+    reset_47_high = 900.0
 
     def __init__(self, ctx, itm_points: float, hedge_points: float = HEDGE_POINTS) -> None:
         self._ctx = ctx
@@ -176,6 +183,17 @@ class ShortWeeklyOptionLegs:
     @staticmethod
     def _kind(direction: int) -> str:
         return "PE" if direction > 0 else "CE"
+
+    def _classify_reset(self, kind: str, strike: float, spot: float, option_price: float,
+                        expiry: date, now: datetime) -> FrozenReset:
+        return classify_reset(
+            kind, strike, spot, option_price, expiry, now,
+            reset_01=self.reset_01,
+            reset_23_low=self.reset_23_low,
+            reset_23_high=self.reset_23_high,
+            reset_47_low=self.reset_47_low,
+            reset_47_high=self.reset_47_high,
+        )
 
     def _restore(self) -> None:
         state = getattr(self._ctx, "strategy_state", {}).get(self.state_key, {})
@@ -643,8 +661,10 @@ class ShortWeeklyOptionLegs:
             self._ctx.log("entry deferred: executable option quote unavailable or stale")
             return
         try:
-            calculated = classify_reset(contract.kind, contract.strike, self._ctx.last_price,
-                                        quote.price, contract.expiry, now)
+            calculated = self._classify_reset(
+                contract.kind, contract.strike, self._ctx.last_price,
+                quote.price, contract.expiry, now,
+            )
         except ValueError as exc:
             self._ctx.log(f"entry deferred: {exc}")
             return

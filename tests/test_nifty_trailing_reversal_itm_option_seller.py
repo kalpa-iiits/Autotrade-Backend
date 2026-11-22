@@ -700,6 +700,24 @@ def test_dte_and_iv_grid_selects_every_published_reset_bucket():
     assert (result(4, 1_200).iv_regime, result(4, 1_200).reset_level) == ("HIGH", 900)
 
 
+def test_13l_replaces_both_900_reset_cells_with_850_only_for_its_variant():
+    from app.strategies.builtin.nifty_adaptive_premium_reset_13l import (
+        StrictHundredStrikeWeeklyOptionLegs,
+    )
+
+    legs = StrictHundredStrikeWeeklyOptionLegs(OptionSellerContext(), 900)
+
+    low_2dte = legs._classify_reset(
+        "PE", 25_900, 25_000, 900, AT.date() + timedelta(days=2), AT,
+    )
+    high_4dte = legs._classify_reset(
+        "PE", 25_900, 25_000, 1_200, AT.date() + timedelta(days=4), AT,
+    )
+
+    assert (low_2dte.iv_regime, low_2dte.reset_level) == ("LOW", 850)
+    assert (high_4dte.iv_regime, high_4dte.reset_level) == ("HIGH", 850)
+
+
 def test_frozen_reset_state_survives_adapter_restart():
     ctx = OptionSellerContext()
     first = ShortWeeklyOptionLegs(ctx, 900)
