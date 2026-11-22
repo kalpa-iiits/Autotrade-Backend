@@ -7,6 +7,7 @@ from app.brokers.base import Candle
 from app.strategies.backtest import Simulation
 from app.strategies.builtin.nifty_adaptive_premium_reset_13l import (
     NiftyAdaptivePremiumReset13LStrategy,
+    StrictHundredStrikeWeeklyOptionLegs,
 )
 from app.strategies.builtin.nifty_trailing_reversal_itm_option_seller import (
     NiftyTrailingReversalOptimizedITMOptionSeller,
@@ -43,6 +44,8 @@ def test_13l_strategy_changes_only_rule_metadata_and_initial_stop():
     assert new.trailing_stop_pct == old.trailing_stop_pct == 0.4
     assert new.cadence_minutes == old.cadence_minutes == 10
     assert new.timeframes == old.timeframes == ("5m",)
+    assert new.option_legs_class is StrictHundredStrikeWeeklyOptionLegs
+    assert old.option_legs_class is not StrictHundredStrikeWeeklyOptionLegs
 
     # The complete lifecycle stays inherited from the older strategy. These are the methods that
     # drive option selection, resets, reversal sequencing, expiry rolls and clock retries.
@@ -131,6 +134,8 @@ def test_13l_rules_match_the_attached_candidate_and_keep_reset_grid():
     assert any("0.10% from the fill" in condition for condition in risk)
     assert any("0.40% behind the completed close" in condition for condition in risk)
     assert any("configured quantity" in condition for condition in filters)
+    assert any("nearest listed strike divisible by 100" in condition for condition in filters)
+    assert not any("fall back" in condition for condition in filters)
     assert not any("fixed at 65 units" in condition for condition in risk)
     assert any("0–1 DTE ₹850" in condition for condition in risk)
     assert any("2–3 LOW ₹900/HIGH ₹700" in condition for condition in risk)

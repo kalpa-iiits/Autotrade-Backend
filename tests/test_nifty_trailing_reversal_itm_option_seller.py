@@ -148,6 +148,62 @@ def test_selection_falls_back_to_non_100_strike_only_when_no_100_strike_is_liste
     ]
 
 
+def test_13l_selection_defers_when_only_non_100_short_and_hedge_strikes_are_listed():
+    from app.strategies.builtin.nifty_adaptive_premium_reset_13l import (
+        StrictHundredStrikeWeeklyOptionLegs,
+    )
+
+    ctx = OptionSellerContext()
+    ctx.last_price = 25_050
+    ctx.contracts = [OptionContract(
+        "NSE:NIFTY26N2425950PE", "PE", 25_950, EXPIRY, 65,
+    ), OptionContract(
+        "NSE:NIFTY26N2424050PE", "PE", 24_050, EXPIRY, 65,
+    )]
+    ctx.quotes["NSE:NIFTY26N2425950PE"] = 950
+    legs = StrictHundredStrikeWeeklyOptionLegs(ctx, 900)
+    legs.set_desired(1)
+
+    asyncio.run(legs.advance(AT, "initial LONG"))
+
+    assert not ctx.orders
+    assert any("no current-week PE" in message for message in ctx.logs)
+
+
+def test_13l_uses_next_deeper_itm_100_strike_when_target_is_between_strikes():
+    from app.strategies.builtin.nifty_adaptive_premium_reset_13l import (
+        StrictHundredStrikeWeeklyOptionLegs,
+    )
+
+    pe_ctx = OptionSellerContext()
+    pe_ctx.last_price = 25_050  # 25,950 PE target rounds deeper ITM to 26,000 PE.
+    pe_ctx.contracts.append(OptionContract(
+        "NSE:NIFTY26N2425950PE", "PE", 25_950, EXPIRY, 65,
+    ))
+    pe_ctx.quotes["NSE:NIFTY26N2426000PE"] = 950
+    pe_legs = StrictHundredStrikeWeeklyOptionLegs(pe_ctx, 900)
+    pe_legs.set_desired(1)
+
+    ce_ctx = OptionSellerContext()
+    ce_ctx.last_price = 25_050  # 24,150 CE target rounds deeper ITM to 24,100 CE.
+    ce_ctx.contracts.append(OptionContract(
+        "NSE:NIFTY26N2424150CE", "CE", 24_150, EXPIRY, 65,
+    ))
+    ce_ctx.quotes["NSE:NIFTY26N2424100CE"] = 950
+    ce_legs = StrictHundredStrikeWeeklyOptionLegs(ce_ctx, 900)
+    ce_legs.set_desired(-1)
+
+    asyncio.run(pe_legs.advance(AT, "initial LONG"))
+    asyncio.run(ce_legs.advance(AT, "initial SHORT"))
+
+    assert pe_ctx.orders[-1] == (
+        "SELL", 65, "NSE:NIFTY26N2426000PE", Product.DELIVERY,
+    )
+    assert ce_ctx.orders[-1] == (
+        "SELL", 65, "NSE:NIFTY26N2424100CE", Product.DELIVERY,
+    )
+
+
 def test_short_entry_waits_when_same_expiry_1000_otm_hedge_is_unavailable():
     ctx = OptionSellerContext()
     ctx.contracts = [OptionContract(

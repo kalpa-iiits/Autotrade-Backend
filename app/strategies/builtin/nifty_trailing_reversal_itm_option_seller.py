@@ -661,6 +661,7 @@ class NiftyTrailingReversalOptimizedITMOptionSeller(NiftyTrailingReversalOptimiz
     default_timeframe = "5m"
     backtest_note = ("The tester replays the unchanged NIFTY signal engine. Live option "
                      "execution uses current-week quotes and the frozen DTE/IV reset table.")
+    option_legs_class = ShortWeeklyOptionLegs
 
     class Params(NiftyTrailingReversalOptimized.Params):
         itm_points: float = Field(900, gt=0, description="Weekly option distance in the money")
@@ -692,7 +693,7 @@ class NiftyTrailingReversalOptimizedITMOptionSeller(NiftyTrailingReversalOptimiz
 
     async def on_start(self) -> None:
         if hasattr(self.ctx, "option_contracts"):
-            self.ctx = ShortWeeklyOptionLegs(self.ctx, self.params.itm_points)
+            self.ctx = self.option_legs_class(self.ctx, self.params.itm_points)
         await super().on_start()
         if isinstance(self.ctx, ShortWeeklyOptionLegs) and self._direction:
             self.ctx.set_desired(self._direction)
