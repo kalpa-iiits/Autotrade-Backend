@@ -1,16 +1,33 @@
+import asyncio
+from datetime import datetime, timedelta
+
 import pytest
 
+from app.brokers.base import Candle
+from app.strategies.backtest import Simulation
 from app.strategies.builtin.nifty_adaptive_premium_reset_13l import (
     NiftyAdaptivePremiumReset13LStrategy,
 )
 from app.strategies.builtin.nifty_trailing_reversal_itm_option_seller import (
     NiftyTrailingReversalOptimizedITMOptionSeller,
 )
+from app.strategies.builtin.nifty_trailing_reversal_optimized import (
+    IST,
+    NiftyTrailingReversalOptimized,
+)
+from app.strategies.deployment import Deployment
 from app.strategies.deployments import DEPLOYMENTS
 
 
 def deployment(key):
     return next(value for value in DEPLOYMENTS if value.key == key)
+
+
+class ExperimentalSignalReference(NiftyTrailingReversalOptimized):
+    """Independent 0.10% signal reference for backtest-parity regression coverage."""
+
+    name = "test_13l_signal_reference"
+    initial_stop_pct = 0.1
 
 
 def test_13l_strategy_changes_only_rule_metadata_and_initial_stop():
@@ -21,6 +38,8 @@ def test_13l_strategy_changes_only_rule_metadata_and_initial_stop():
     assert new.legacy_checkpoint_names == ()
     assert new.initial_stop_pct == 0.1
     assert old.initial_stop_pct == 0.4
+    assert "trailing_stop_pct" not in new.__dict__
+    assert "cadence_minutes" not in new.__dict__
     assert new.trailing_stop_pct == old.trailing_stop_pct == 0.4
     assert new.cadence_minutes == old.cadence_minutes == 10
     assert new.timeframes == old.timeframes == ("5m",)
@@ -30,6 +49,8 @@ def test_13l_strategy_changes_only_rule_metadata_and_initial_stop():
     assert new.on_start is old.on_start
     assert new.on_tick is old.on_tick
     assert new.on_clock is old.on_clock
+    assert new.on_bar is old.on_bar
+    assert new.on_backtest_candle is old.on_backtest_candle
 
 
 def test_13l_stop_math_uses_point_one_initial_and_point_four_trail():
@@ -43,6 +64,62 @@ def test_13l_stop_math_uses_point_one_initial_and_point_four_trail():
     strategy.stop = 24_975
     strategy._ratchet(25_100, long=True)
     assert strategy.stop == pytest.approx(24_999.6)
+
+
+def test_13l_backtest_trades_exactly_match_point_one_signal_reference():
+    first = datetime(2026, 11, 2, 9, 15, tzinfo=IST)
+    candles = [
+        Candle(first, 24_950, 25_000, 24_900, 24_980),
+        # The initial LONG fills at 25,000. Its 0.10% stop at 24,975 is hit intrabar.
+        Candle(first + timedelta(minutes=5), 25_000, 25_020, 24_950, 24_960),
+        # The next candle gaps above the SHORT stop, so historical replay uses 25,050.
+        Candle(first + timedelta(minutes=10), 25_050, 25_060, 25_010, 25_030),
+        Candle(first + timedelta(minutes=15), 25_030, 25_100, 25_020, 25_090),
+        Candle(first + timedelta(minutes=20), 25_090, 25_100, 25_000, 25_010),
+    ]
+
+    async def replay(strategy, params):
+        candidate = Deployment(
+            key=f"test-{strategy.name}",
+            strategy=strategy,
+            symbol="NSE:NIFTY50-INDEX",
+            timeframe="5m",
+            params=params,
+            quantity=65,
+            max_order_qty=1_800,
+            max_position=1_800,
+            max_orders_per_day=100,
+            backtest_fixed_quantity=65,
+        )
+        simulation = Simulation(candidate, candidate.symbol, "5m", daily=[])
+        await simulation.run(candles)
+        return [
+            (
+                trade.direction,
+                trade.entry_at,
+                trade.entry_price,
+                trade.exit_at,
+                trade.exit_price,
+                trade.quantity,
+            )
+            for trade in simulation.trades
+        ]
+
+    reference = asyncio.run(replay(
+        ExperimentalSignalReference,
+        ExperimentalSignalReference.Params(),
+    ))
+    strategy = asyncio.run(replay(
+        NiftyAdaptivePremiumReset13LStrategy,
+        NiftyAdaptivePremiumReset13LStrategy.Params(itm_points=900),
+    ))
+    previous = asyncio.run(replay(
+        NiftyTrailingReversalOptimizedITMOptionSeller,
+        NiftyTrailingReversalOptimizedITMOptionSeller.Params(itm_points=900),
+    ))
+
+    assert strategy == reference
+    assert strategy != previous
 
 
 def test_13l_rules_match_the_attached_candidate_and_keep_reset_grid():
