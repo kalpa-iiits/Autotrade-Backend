@@ -956,6 +956,39 @@ def test_option_strategies_take_fixed_quantity_only(deploy):
     assert catalog["opt"]["capital_sizing"] is False and catalog["opt"]["backtest_note"]
 
 
+def test_13l_quantity_can_be_edited_from_frontend_api(deploy):
+    production = next(
+        value for value in deployments.DEPLOYMENTS
+        if value.key == "nifty-adaptive-premium-reset-13l"
+    )
+    c = deploy(production)
+    inst = by_key(c, production.key)
+
+    updated = c.patch(
+        f"/api/strategies/{inst['id']}",
+        json={"fixed_quantity": 130},
+        headers=AUTH,
+    )
+    assert updated.status_code == 200
+    assert updated.json()["fixed_quantity"] == updated.json()["total_quantity"] == 130
+
+    partial_lot = c.patch(
+        f"/api/strategies/{inst['id']}",
+        json={"fixed_quantity": 131},
+        headers=AUTH,
+    )
+    assert partial_lot.status_code == 422
+    assert "whole number of 65-unit lots" in partial_lot.json()["detail"]
+
+    over_limit = c.patch(
+        f"/api/strategies/{inst['id']}",
+        json={"fixed_quantity": 1_820},
+        headers=AUTH,
+    )
+    assert over_limit.status_code == 422
+    assert "at most 1800 units" in over_limit.json()["detail"]
+
+
 def test_before_market_open_boundary_in_ist():
     from datetime import timezone as tz
     from zoneinfo import ZoneInfo

@@ -15,6 +15,9 @@ try a strategy without real money, run it on a paper account.
 
 from app.strategies.builtin.intraday_breakout import IntradayBreakout
 from app.strategies.builtin.intraday_breakout_options import IntradayBreakoutOptions
+from app.strategies.builtin.nifty_adaptive_premium_reset_13l import (
+    NiftyAdaptivePremiumReset13LStrategy,
+)
 from app.strategies.builtin.nifty_intraday_limited_options import NiftyIntradayLimitedOptions
 from app.strategies.builtin.nifty_trailing_reversal_hedged_futures import (
     NiftyTrailingReversalHedgedFutures,
@@ -98,6 +101,26 @@ DEPLOYMENTS: list[Deployment] = [
         ),
         quantity=65,
         # Keep the default at one NIFTY lot while allowing larger fixed-size deployments.
+        max_order_qty=1_800,
+        max_position=1_800,
+        max_orders_per_day=100,
+        backtest_initial_capital=1_000_000,
+        backtest_fixed_quantity=65,
+        backtest_commission_per_unit=0,
+    ),
+    # The experimental candidate reuses the adaptive seller's complete option execution path.
+    # Its isolated class changes the initial NIFTY stop to 0.10%; sizing remains frontend-editable
+    # in whole NIFTY lots, with the same limits as the source strategy.
+    Deployment(
+        key="nifty-adaptive-premium-reset-13l",
+        label="13 L strategy",
+        strategy=NiftyAdaptivePremiumReset13LStrategy,
+        symbol="NSE:NIFTY50-INDEX",
+        timeframe="5m",
+        params=NiftyAdaptivePremiumReset13LStrategy.Params(
+            itm_points=900,
+        ),
+        quantity=65,
         max_order_qty=1_800,
         max_position=1_800,
         max_orders_per_day=100,
