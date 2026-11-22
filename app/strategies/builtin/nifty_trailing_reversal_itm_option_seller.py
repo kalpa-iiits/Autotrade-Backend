@@ -68,11 +68,12 @@ class FrozenReset:
 def classify_reset(kind: str, strike: float, spot: float, option_price: float,
                    expiry: date, now: datetime, *, reset_01: float = 850,
                    reset_23_low: float = 900, reset_23_high: float = 700,
-                   reset_47_low: float = 850, reset_47_high: float = 900) -> FrozenReset:
+                   reset_47_low: float = 850, reset_47_high: float = 900,
+                   max_dte: int = 7) -> FrozenReset:
     """Calculate the rule's DTE/IV classification at entry or an expiry roll."""
     local = now.astimezone(IST)
     dte = (expiry - local.date()).days
-    if not 0 <= dte <= 7:
+    if not 0 <= dte <= max_dte:
         raise ValueError(f"current-week option has unsupported DTE {dte}")
     expiry_at = datetime.combine(expiry, EXPIRY_TIME, tzinfo=IST)
     remaining = max((expiry_at - local).total_seconds(), 1.0) / SECONDS_PER_YEAR
@@ -101,6 +102,7 @@ class ShortWeeklyOptionLegs:
     reset_23_high = 700.0
     reset_47_low = 850.0
     reset_47_high = 900.0
+    max_reset_dte = 7
 
     def __init__(self, ctx, itm_points: float, hedge_points: float = HEDGE_POINTS) -> None:
         self._ctx = ctx
@@ -193,6 +195,7 @@ class ShortWeeklyOptionLegs:
             reset_23_high=self.reset_23_high,
             reset_47_low=self.reset_47_low,
             reset_47_high=self.reset_47_high,
+            max_dte=self.max_reset_dte,
         )
 
     def _restore(self) -> None:

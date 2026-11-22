@@ -44,6 +44,9 @@ class StrictHundredStrikeWeeklyOptionLegs(ShortWeeklyOptionLegs):
     require_fresh_hedge_quote = True
     reset_23_low = 850.0
     reset_47_high = 850.0
+    # A Tuesday holiday moves the expiry exit to Monday. Rolling that session into the following
+    # Tuesday is eight calendar days, while an ordinary Tuesday-to-Tuesday roll is seven.
+    max_reset_dte = 8
 
     async def _select(self, kind, now, earliest_expiry=None, exact_expiry=None):
         contract = await super()._select(kind, now, earliest_expiry, exact_expiry)
@@ -102,7 +105,7 @@ class NiftyAdaptivePremiumReset13LStrategy(NiftyTrailingReversalOptimizedITMOpti
             "Prefer strikes divisible by 100; fall back only if unavailable":
                 "Use the nearest listed strike divisible by 100; never use a non-100 strike",
             "Reset: 0–1 DTE ₹850; 2–3 LOW ₹900/HIGH ₹700; 4–6 LOW ₹850/HIGH ₹900":
-                "Reset: 0–1 DTE ₹850; 2–3 LOW ₹850/HIGH ₹700; 4–7 LOW/HIGH ₹850",
+                "Reset: 0–1 DTE ₹850; 2–3 LOW ₹850/HIGH ₹700; 4–8 LOW/HIGH ₹850",
             "Start expiry rollover at 15:10 IST and reopen next executable session":
                 "At 15:10 on expiry day, or the previous NSE session for a holiday expiry, cover and roll into the next weekly contract in the same session",
         }

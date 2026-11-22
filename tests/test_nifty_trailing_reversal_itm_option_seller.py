@@ -213,19 +213,47 @@ def test_13l_exits_holiday_expiry_on_previous_nse_session_at_1510():
 
     short = "NSE:NIFTY26N2425900PE"  # Nominal 24 Nov 2026 expiry is an NSE holiday.
     hedge = "NSE:NIFTY26N2424000PE"
+    next_expiry = date(2026, 12, 1)
+    replacement = "NSE:NIFTY26D0125900PE"
+    replacement_hedge = "NSE:NIFTY26D0124000PE"
     ctx = OptionSellerContext({short: -65, hedge: 65})
+    ctx.contracts += [
+        OptionContract(f"NSE:NIFTY26D01{strike}PE", "PE", float(strike), next_expiry, 65)
+        for strike in range(24_000, 26_501, 100)
+    ]
+    ctx.quotes[replacement] = 950
+    ctx.quotes[replacement_hedge] = 50
     legs = StrictHundredStrikeWeeklyOptionLegs(ctx, 900)
     legs.hedge_symbol = hedge
     legs.set_desired(1)
 
-    asyncio.run(legs.advance(datetime(2026, 11, 23, 15, 9, tzinfo=IST)))
-    assert not ctx.orders
+    async def roll():
+        at = datetime(2026, 11, 23, 15, 10, tzinfo=IST)
+        await legs.advance(at.replace(minute=9))
+        assert not ctx.orders
 
-    asyncio.run(legs.advance(datetime(2026, 11, 23, 15, 10, tzinfo=IST)))
+        await legs.advance(at)
+        assert ctx.orders == [("BUY", 65, short, Product.DELIVERY)]
+        assert legs.roll_after == at.date()
+        assert legs.roll_expiry_after == date(2026, 11, 25)
 
-    assert ctx.orders == [("BUY", 65, short, Product.DELIVERY)]
-    assert legs.roll_after == date(2026, 11, 23)
-    assert legs.roll_expiry_after == date(2026, 11, 25)
+        await legs.advance(at)
+        await legs.advance(at)
+
+    asyncio.run(roll())
+
+    assert ctx.orders == [
+        ("BUY", 65, short, Product.DELIVERY),
+        ("BUY", 65, replacement_hedge, Product.DELIVERY),
+        ("SELL", 65, replacement, Product.DELIVERY),
+        ("SELL", 65, hedge, Product.DELIVERY),
+    ]
+    assert ctx.positions == {replacement: -65, replacement_hedge: 65}
+    assert legs.roll_after is None
+    assert legs.roll_expiry_after is None
+    assert legs.frozen is not None
+    assert legs.frozen.dte == 8
+    assert legs.frozen.expiry == next_expiry
 
 
 def test_13l_does_not_exit_a_normal_expiry_on_the_previous_session():
