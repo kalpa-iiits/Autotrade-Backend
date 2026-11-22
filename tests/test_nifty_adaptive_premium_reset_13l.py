@@ -4,6 +4,7 @@ from datetime import datetime, timedelta
 import pytest
 
 from app.brokers.base import Candle
+from app.strategies.base import Tick
 from app.strategies.backtest import Simulation
 from app.strategies.builtin.nifty_adaptive_premium_reset_13l import (
     NiftyAdaptivePremiumReset13LStrategy,
@@ -164,3 +165,55 @@ def test_13l_deployment_is_separate_editable_quantity_and_old_seller_is_unchange
     assert old.quantity == old.backtest_fixed_quantity == 65
     assert old.max_order_qty == old.max_position == 1_800
     assert old.strategy.initial_stop_pct == 0.4
+
+
+@pytest.mark.parametrize(
+    ("starting_position", "stop", "gap_price", "side", "ending_position", "new_stop"),
+    [
+        (65, 24_975, 24_500, "SELL", -65, 24_524.5),
+        (-65, 25_025, 25_500, "BUY", 65, 25_474.5),
+    ],
+)
+def test_13l_0915_gap_through_stop_reverses_from_the_first_tradable_tick(
+    starting_position, stop, gap_price, side, ending_position, new_stop,
+):
+    class SignalContext:
+        def __init__(self):
+            self.position = starting_position
+            self.quantity = 65
+            self.tick_size = None
+            self.order_pending = False
+            self.last_fill_price = None
+            self.orders = []
+
+        async def buy(self, quantity=None, reason=None):
+            quantity = quantity or self.quantity
+            self.position += quantity
+            self.orders.append(("BUY", quantity, reason))
+
+        async def sell(self, quantity=None, reason=None):
+            quantity = quantity or self.quantity
+            self.position -= quantity
+            self.orders.append(("SELL", quantity, reason))
+
+    ctx = SignalContext()
+    strategy = NiftyAdaptivePremiumReset13LStrategy(
+        NiftyAdaptivePremiumReset13LStrategy.Params(itm_points=900), ctx, 300,
+    )
+    day = datetime(2026, 11, 20, tzinfo=IST)
+
+    async def gap():
+        await strategy.on_start()
+        strategy.stop = stop
+        # Pre-open values beyond the stop must not trigger an untradeable order.
+        await strategy.on_tick(Tick("NSE:NIFTY50-INDEX", gap_price,
+                                    day.replace(hour=9, minute=14, second=59)))
+        assert not ctx.orders
+        await strategy.on_tick(Tick("NSE:NIFTY50-INDEX", gap_price,
+                                    day.replace(hour=9, minute=15)))
+
+    asyncio.run(gap())
+
+    assert ctx.orders[0][:2] == (side, 130)
+    assert ctx.position == ending_position
+    assert strategy.stop == pytest.approx(new_stop)

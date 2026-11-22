@@ -462,6 +462,49 @@ def test_premium_gap_below_reset_stays_pending_until_replacement_quote_appears()
     assert not legs.reset_pending
 
 
+def test_13l_overnight_gap_below_850_resets_from_first_0915_clock_check():
+    from app.strategies.builtin.nifty_adaptive_premium_reset_13l import (
+        StrictHundredStrikeWeeklyOptionLegs,
+    )
+
+    opened = datetime(2026, 11, 19, 15, 20, tzinfo=IST)
+    next_open = datetime(2026, 11, 20, 9, 15, tzinfo=IST)
+    old = "NSE:NIFTY26N2425900PE"
+    old_hedge = "NSE:NIFTY26N2424000PE"
+    replacement = "NSE:NIFTY26N2426400PE"
+    replacement_hedge = "NSE:NIFTY26N2424500PE"
+    ctx = OptionSellerContext({old: -65, old_hedge: 65})
+    legs = StrictHundredStrikeWeeklyOptionLegs(ctx, 900)
+    legs.hedge_symbol = old_hedge
+    legs.desired_direction = 1
+    # The entry sold above the frozen ₹850 level, so the reset carries overnight armed.
+    legs.frozen = legs._classify_reset("PE", 25_900, 25_000, 900, EXPIRY, opened)
+    assert legs.frozen.reset_level == 850
+    legs.last_premium = 900
+    legs.reset_armed = True
+
+    async def gap_and_reset():
+        # NIFTY gaps up 500 points. The current ask of the held PE gaps below ₹850.
+        ctx.last_price = 25_500
+        ctx.quotes[old] = 700
+        ctx.quotes[replacement] = 950
+        ctx.quotes[replacement_hedge] = 50
+        await legs.monitor_reset(next_open)
+        await legs.advance(next_open)
+        await legs.advance(next_open)
+
+    asyncio.run(gap_and_reset())
+
+    assert ctx.orders == [
+        ("BUY", 65, old, Product.DELIVERY),
+        ("BUY", 65, replacement_hedge, Product.DELIVERY),
+        ("SELL", 65, replacement, Product.DELIVERY),
+        ("SELL", 65, old_hedge, Product.DELIVERY),
+    ]
+    assert ctx.positions == {replacement: -65, replacement_hedge: 65}
+    assert not legs.reset_pending
+
+
 def test_premium_reset_explicitly_keeps_the_held_expiry():
     later_expiry = date(2026, 11, 26)
     old = "NSE:NIFTY26N2625900PE"
