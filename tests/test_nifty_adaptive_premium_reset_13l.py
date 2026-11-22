@@ -130,12 +130,14 @@ def test_13l_rules_match_the_attached_candidate_and_keep_reset_grid():
     rules = strategy.rules(strategy.Params(itm_points=900))
     filters = next(rule for rule in rules if rule["kind"] == "filter")["conditions"]
     risk = next(rule for rule in rules if rule["kind"] == "risk")["conditions"]
+    exits = next(rule for rule in rules if rule["kind"] == "exit")["conditions"]
 
     assert any("0.10% from the fill" in condition for condition in risk)
     assert any("0.40% behind the completed close" in condition for condition in risk)
     assert any("configured quantity" in condition for condition in filters)
     assert any("nearest listed strike divisible by 100" in condition for condition in filters)
     assert not any("fall back" in condition for condition in filters)
+    assert any("previous NSE session" in condition for condition in exits)
     assert not any("fixed at 65 units" in condition for condition in risk)
     assert any("0–1 DTE ₹850" in condition for condition in risk)
     assert any("2–3 LOW ₹900/HIGH ₹700" in condition for condition in risk)

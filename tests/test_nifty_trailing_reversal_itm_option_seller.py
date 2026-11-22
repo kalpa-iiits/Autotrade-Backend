@@ -204,6 +204,50 @@ def test_13l_uses_next_deeper_itm_100_strike_when_target_is_between_strikes():
     )
 
 
+def test_13l_exits_holiday_expiry_on_previous_nse_session_at_1510():
+    from app.strategies.builtin.nifty_adaptive_premium_reset_13l import (
+        StrictHundredStrikeWeeklyOptionLegs,
+    )
+
+    short = "NSE:NIFTY26N2425900PE"  # Nominal 24 Nov 2026 expiry is an NSE holiday.
+    hedge = "NSE:NIFTY26N2424000PE"
+    ctx = OptionSellerContext({short: -65, hedge: 65})
+    legs = StrictHundredStrikeWeeklyOptionLegs(ctx, 900)
+    legs.hedge_symbol = hedge
+    legs.set_desired(1)
+
+    asyncio.run(legs.advance(datetime(2026, 11, 23, 15, 9, tzinfo=IST)))
+    assert not ctx.orders
+
+    asyncio.run(legs.advance(datetime(2026, 11, 23, 15, 10, tzinfo=IST)))
+
+    assert ctx.orders == [("BUY", 65, short, Product.DELIVERY)]
+    assert legs.roll_after == date(2026, 11, 25)
+
+
+def test_13l_does_not_exit_a_normal_expiry_on_the_previous_session():
+    from app.strategies.builtin.nifty_adaptive_premium_reset_13l import (
+        StrictHundredStrikeWeeklyOptionLegs,
+    )
+
+    normal_expiry = date(2026, 11, 17)
+    short = "NSE:NIFTY26N1725900PE"
+    hedge = "NSE:NIFTY26N1724000PE"
+    ctx = OptionSellerContext({short: -65, hedge: 65})
+    ctx.contracts = [
+        OptionContract(short, "PE", 25_900, normal_expiry, 65),
+        OptionContract(hedge, "PE", 24_000, normal_expiry, 65),
+    ]
+    legs = StrictHundredStrikeWeeklyOptionLegs(ctx, 900)
+    legs.hedge_symbol = hedge
+    legs.set_desired(1)
+
+    asyncio.run(legs.advance(datetime(2026, 11, 16, 15, 10, tzinfo=IST)))
+
+    assert not ctx.orders
+    assert ctx.positions == {short: -65, hedge: 65}
+
+
 def test_short_entry_waits_when_same_expiry_1000_otm_hedge_is_unavailable():
     ctx = OptionSellerContext()
     ctx.contracts = [OptionContract(
