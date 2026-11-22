@@ -891,13 +891,18 @@ class StrategyRunner:
             return option_limit_price(last, side, self.settings.option_ltp_buffer_pct), f"last {last:g}; no depth"
         return None
 
+    @staticmethod
+    def _is_closing_order(inst: RunningInstance, symbol: str, side: Side) -> bool:
+        """Whether this side reduces the instance's current position in the symbol."""
+        position = inst.positions.get(symbol, 0)
+        return position > 0 if side == Side.SELL else position < 0
+
     async def _place(self, inst: RunningInstance, side: Side, quantity: int,
                      signal: StrategySignal, product: Product | None = None) -> None:
         service = self.service(inst.account_id)
         signal.broker = service.name
         order_type, limit_price = OrderType.MARKET, None
-        symbol_position = inst.positions.get(signal.symbol, 0)
-        closing = symbol_position > 0 if side == Side.SELL else symbol_position < 0
+        closing = self._is_closing_order(inst, signal.symbol, side)
         option = bool(OPTION_SYMBOL.search(signal.symbol))
         if option:
             buffer_pct = (self.settings.option_exit_limit_buffer_pct if closing
@@ -1016,8 +1021,9 @@ class StrategyRunner:
                 not OPTION_SYMBOL.search(row.symbol) or row.limit_price is None):
             return
         side = Side(row.side)
+        closing = self._is_closing_order(inst, row.symbol, side)
         task = asyncio.create_task(self._chase(
-            inst, row.id, row.symbol, side, float(row.limit_price), side == Side.SELL,
+            inst, row.id, row.symbol, side, float(row.limit_price), closing,
         ))
         self._chases.add(task)
         task.add_done_callback(self._chases.discard)

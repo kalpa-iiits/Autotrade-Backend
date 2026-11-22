@@ -9,7 +9,7 @@ from sqlalchemy import select
 
 from app.core.config import settings
 from app.main import app
-from app.orders.schemas import Product
+from app.orders.schemas import Product, Side
 from app.strategies import deployments
 from app.strategies.base import Bar, BarBuilder, Strategy, Tick
 from app.strategies.builtin.sma_crossover import SmaCrossover
@@ -312,6 +312,42 @@ def option_orders(client):
 
 def wait(client, seconds=0.15):
     run(client, asyncio.sleep, seconds)
+
+
+@pytest.mark.parametrize(("side", "position", "closing"), [
+    ("SELL", 0, False),     # opening a short
+    ("SELL", -30, False),   # increasing a partially filled short
+    ("BUY", -30, True),     # covering a partially filled short
+    ("SELL", 30, True),     # closing a long hedge
+    ("BUY", 30, False),     # increasing a long hedge
+])
+def test_restarted_option_chase_classifies_order_from_position(
+        options, monkeypatch, side, position, closing):
+    quiet, instance_record = options()
+    limit = 1000 if side == "SELL" else 1  # deliberately leave the paper order open
+    response = quiet.post("/api/accounts/1/orders", json={
+        "symbol": OPT, "side": side, "quantity": 65,
+        "order_type": "LIMIT", "limit_price": limit,
+    }, headers=AUTH)
+    assert response.status_code == 201, response.text
+    order = response.json()
+    assert order["status"] == "OPEN"
+
+    runner = quiet.app.state.strategy_runner
+    running = runner.running[instance_record["id"]]
+    running.positions[OPT] = position
+    running.pending_order_id = order["id"]
+    resumed = []
+
+    async def capture_chase(inst, order_id, symbol, order_side, first_limit, is_closing):
+        resumed.append((inst, order_id, symbol, order_side, first_limit, is_closing))
+
+    monkeypatch.setattr(runner, "_chase", capture_chase)
+    run(quiet, runner._resume_pending_option_chase, running)
+    run(quiet, asyncio.sleep, 0)  # let the newly created chase task run
+
+    assert len(resumed) == 1
+    assert resumed[0][1:] == (order["id"], OPT, Side(side), float(limit), closing)
 
 
 def test_option_entry_and_exit_use_depth_priced_limits(options):
