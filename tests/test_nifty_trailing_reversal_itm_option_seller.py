@@ -1,6 +1,8 @@
 import asyncio
 from datetime import date, datetime, timedelta
 
+import pytest
+
 from app.brokers.base import Candle, OptionContract
 from app.orders.schemas import Product
 from app.strategies.base import Tick
@@ -87,11 +89,88 @@ def test_strategy_forces_overnight_product_even_when_caller_requests_intraday():
     ctx = OptionSellerContext()
     ctx.quotes["NSE:NIFTY26N2425900PE"] = 950
     legs = ShortWeeklyOptionLegs(ctx, 900)
+    legs._session_open = lambda _now: True
 
     asyncio.run(legs.buy(reason="initial LONG", product=Product.INTRADAY))
 
     assert ctx.orders
     assert all(order[3] == Product.DELIVERY for order in ctx.orders)
+
+
+def test_option_wrapper_never_orders_before_0915_from_ticks_or_clock():
+    ctx = OptionSellerContext()
+    ctx.quotes["NSE:NIFTY26N2425900PE"] = 950
+    strategy = NiftyTrailingReversalOptimizedITMOptionSeller(
+        NiftyTrailingReversalOptimizedITMOptionSeller.Params(itm_points=900), ctx, 300,
+    )
+    pre_open = datetime(2026, 11, 20, 9, 14, 59, tzinfo=IST)
+
+    async def wait_for_open():
+        await strategy.on_start()
+        assert isinstance(strategy.ctx, ShortWeeklyOptionLegs)
+        strategy.ctx.set_desired(1)
+        await strategy.on_tick(Tick("NSE:NIFTY50-INDEX", 25_000, pre_open))
+        await strategy.on_clock(pre_open)
+        assert not ctx.orders
+
+        await strategy.on_tick(Tick(
+            "NSE:NIFTY50-INDEX", 25_000, pre_open + timedelta(seconds=1),
+        ))
+
+    asyncio.run(wait_for_open())
+
+    assert ctx.orders == [
+        ("BUY", 65, "NSE:NIFTY26N2424000PE", Product.DELIVERY),
+        ("SELL", 65, "NSE:NIFTY26N2425900PE", Product.DELIVERY),
+    ]
+
+
+@pytest.mark.parametrize(
+    "outside_session",
+    [
+        datetime(2026, 11, 20, 8, 0, tzinfo=IST),
+        datetime(2026, 11, 20, 15, 30, tzinfo=IST),
+        datetime(2026, 11, 21, 10, 0, tzinfo=IST),
+    ],
+)
+def test_option_adapter_does_not_start_transitions_outside_regular_session(outside_session):
+    ctx = OptionSellerContext()
+    ctx.quotes["NSE:NIFTY26N2425900PE"] = 950
+    legs = ShortWeeklyOptionLegs(ctx, 900)
+    legs.set_desired(1)
+
+    asyncio.run(legs.advance(outside_session))
+
+    assert not ctx.orders
+
+
+def test_new_entry_after_1510_skips_the_expiring_contract():
+    expiry = date(2026, 11, 17)
+    next_expiry = date(2026, 11, 24)
+    expiring = "NSE:NIFTY26N1725900PE"
+    replacement = "NSE:NIFTY26N2425900PE"
+    replacement_hedge = "NSE:NIFTY26N2424000PE"
+    ctx = OptionSellerContext()
+    ctx.contracts = [
+        OptionContract(f"NSE:NIFTY26N17{strike}PE", "PE", float(strike), expiry, 65)
+        for strike in range(24_000, 26_501, 100)
+    ] + [
+        OptionContract(f"NSE:NIFTY26N24{strike}PE", "PE", float(strike), next_expiry, 65)
+        for strike in range(24_000, 26_501, 100)
+    ]
+    ctx.quotes[expiring] = 950
+    ctx.quotes[replacement] = 960
+    legs = ShortWeeklyOptionLegs(ctx, 900)
+    legs.set_desired(1)
+
+    asyncio.run(legs.advance(datetime(2026, 11, 17, 15, 11, tzinfo=IST)))
+
+    assert ctx.orders == [
+        ("BUY", 65, replacement_hedge, Product.DELIVERY),
+        ("SELL", 65, replacement, Product.DELIVERY),
+    ]
+    assert ctx.positions == {replacement: -65, replacement_hedge: 65}
+    assert legs.frozen is not None and legs.frozen.expiry == next_expiry
 
 
 def test_frontend_quantity_scales_short_and_margin_hedge_together():
@@ -254,6 +333,39 @@ def test_13l_exits_holiday_expiry_on_previous_nse_session_at_1510():
     assert legs.frozen is not None
     assert legs.frozen.dte == 8
     assert legs.frozen.expiry == next_expiry
+
+
+def test_13l_new_entry_after_holiday_expiry_cutoff_skips_expiring_contract():
+    from app.strategies.builtin.nifty_adaptive_premium_reset_13l import (
+        StrictHundredStrikeWeeklyOptionLegs,
+    )
+
+    nominal_holiday_expiry = date(2026, 11, 24)
+    next_expiry = date(2026, 12, 1)
+    expiring = "NSE:NIFTY26N2425900PE"
+    replacement = "NSE:NIFTY26D0125900PE"
+    replacement_hedge = "NSE:NIFTY26D0124000PE"
+    ctx = OptionSellerContext()
+    ctx.contracts += [
+        OptionContract(f"NSE:NIFTY26D01{strike}PE", "PE", float(strike), next_expiry, 65)
+        for strike in range(24_000, 26_501, 100)
+    ]
+    assert any(contract.symbol == expiring and contract.expiry == nominal_holiday_expiry
+               for contract in ctx.contracts)
+    ctx.quotes[expiring] = 950
+    ctx.quotes[replacement] = 960
+    ctx.quotes[replacement_hedge] = 50
+    legs = StrictHundredStrikeWeeklyOptionLegs(ctx, 900)
+    legs.set_desired(1)
+
+    asyncio.run(legs.advance(datetime(2026, 11, 23, 15, 11, tzinfo=IST)))
+
+    assert ctx.orders == [
+        ("BUY", 65, replacement_hedge, Product.DELIVERY),
+        ("SELL", 65, replacement, Product.DELIVERY),
+    ]
+    assert ctx.positions == {replacement: -65, replacement_hedge: 65}
+    assert legs.frozen is not None and legs.frozen.expiry == next_expiry
 
 
 def test_13l_does_not_exit_a_normal_expiry_on_the_previous_session():

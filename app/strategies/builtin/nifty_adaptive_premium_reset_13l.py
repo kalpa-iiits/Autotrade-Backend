@@ -8,7 +8,6 @@ expiry exits and same-session weekly rollover.
 from datetime import date, timedelta
 
 from app.strategies.builtin.nifty_trailing_reversal_itm_option_seller import (
-    EXPIRY_EXIT_TIME,
     NiftyTrailingReversalOptimizedITMOptionSeller,
     ShortWeeklyOptionLegs,
 )
@@ -56,22 +55,14 @@ class StrictHundredStrikeWeeklyOptionLegs(ShortWeeklyOptionLegs):
         contract = await super()._select_hedge(kind, expiry)
         return contract if contract is not None and _hundred_strike(contract.strike) else None
 
-    async def _expiry_due(self, symbol, now):
-        due = await super()._expiry_due(symbol, now)
-        if due is not None:
-            return due
-        contract = self.contracts_by_symbol.get(symbol)
-        expiry = contract.expiry if contract else (self.frozen.expiry if self.frozen else None)
-        if expiry is None:
-            return None
-        exit_day = _previous_nse_session(expiry)
-        local = now.astimezone(IST)
-        if exit_day < expiry and (
-            exit_day < local.date()
-            or (exit_day == local.date() and local.time() >= EXPIRY_EXIT_TIME)
-        ):
-            return expiry
-        return None
+    def _session_open(self, now):
+        return (
+            super()._session_open(now)
+            and now.astimezone(IST).date() not in NSE_FO_HOLIDAYS
+        )
+
+    def _expiry_exit_day(self, expiry):
+        return _previous_nse_session(expiry)
 
 
 class NiftyAdaptivePremiumReset13LStrategy(NiftyTrailingReversalOptimizedITMOptionSeller):

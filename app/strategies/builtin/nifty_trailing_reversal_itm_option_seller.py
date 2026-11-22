@@ -14,7 +14,7 @@ from pydantic import Field
 
 from app.brokers.base import OptionContract
 from app.orders.schemas import Product
-from app.strategies.base import Tick
+from app.strategies.base import MARKET_OPEN, Tick
 from app.strategies.builtin.intraday_breakout_options import pick_contract
 from app.strategies.builtin.nifty_trailing_reversal_optimized import IST, NiftyTrailingReversalOptimized
 
@@ -297,13 +297,34 @@ class ShortWeeklyOptionLegs:
         self.contracts_by_symbol.update((c.symbol, c) for c in contracts)
         return contracts
 
+    def _session_open(self, now: datetime) -> bool:
+        local = now.astimezone(IST)
+        return (
+            local.weekday() < 5
+            and MARKET_OPEN <= local.time() < EXPIRY_TIME
+        )
+
+    def _expiry_exit_day(self, expiry: date) -> date:
+        return expiry
+
+    def _expiry_entry_eligible(self, expiry: date, now: datetime) -> bool:
+        local = now.astimezone(IST)
+        exit_day = self._expiry_exit_day(expiry)
+        return (
+            local.date() < exit_day
+            or (local.date() == exit_day and local.time() < EXPIRY_EXIT_TIME)
+        )
+
     async def _select(self, kind: str, now: datetime,
                       earliest_expiry: date | None = None,
                       exact_expiry: date | None = None) -> OptionContract | None:
         spot = self._ctx.last_price
         if not spot:
             return None
-        contracts = await self._contracts()
+        contracts = [
+            contract for contract in await self._contracts()
+            if self._expiry_entry_eligible(contract.expiry, now)
+        ]
         if exact_expiry is not None:
             contracts = [contract for contract in contracts if contract.expiry == exact_expiry]
         start = earliest_expiry or now.astimezone(IST).date()
@@ -511,7 +532,9 @@ class ShortWeeklyOptionLegs:
         if expiry is None:
             return None
         local = now.astimezone(IST)
-        if expiry < local.date() or (expiry == local.date() and local.time() >= EXPIRY_EXIT_TIME):
+        exit_day = self._expiry_exit_day(expiry)
+        if (exit_day < local.date()
+                or (exit_day == local.date() and local.time() >= EXPIRY_EXIT_TIME)):
             return expiry
         return None
 
@@ -554,6 +577,10 @@ class ShortWeeklyOptionLegs:
 
     async def advance(self, now: datetime, reason: str = "option transition") -> None:
         await self._complete_fill_audit()
+        # All option-order paths converge here: ticks, clocks, restarts and retries. Keep the
+        # session boundary here so a caller cannot accidentally bypass it.
+        if not self._session_open(now):
+            return
         if self._ctx.order_pending:
             return
         positions = self._short_options()
