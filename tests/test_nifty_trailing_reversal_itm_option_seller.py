@@ -181,6 +181,7 @@ def test_13l_uses_next_deeper_itm_100_strike_when_target_is_between_strikes():
         "NSE:NIFTY26N2425950PE", "PE", 25_950, EXPIRY, 65,
     ))
     pe_ctx.quotes["NSE:NIFTY26N2426000PE"] = 950
+    pe_ctx.quotes["NSE:NIFTY26N2424000PE"] = 50
     pe_legs = StrictHundredStrikeWeeklyOptionLegs(pe_ctx, 900)
     pe_legs.set_desired(1)
 
@@ -190,6 +191,7 @@ def test_13l_uses_next_deeper_itm_100_strike_when_target_is_between_strikes():
         "NSE:NIFTY26N2424150CE", "CE", 24_150, EXPIRY, 65,
     ))
     ce_ctx.quotes["NSE:NIFTY26N2424100CE"] = 950
+    ce_ctx.quotes["NSE:NIFTY26N2426000CE"] = 50
     ce_legs = StrictHundredStrikeWeeklyOptionLegs(ce_ctx, 900)
     ce_legs.set_desired(-1)
 
@@ -222,7 +224,8 @@ def test_13l_exits_holiday_expiry_on_previous_nse_session_at_1510():
     asyncio.run(legs.advance(datetime(2026, 11, 23, 15, 10, tzinfo=IST)))
 
     assert ctx.orders == [("BUY", 65, short, Product.DELIVERY)]
-    assert legs.roll_after == date(2026, 11, 25)
+    assert legs.roll_after == date(2026, 11, 23)
+    assert legs.roll_expiry_after == date(2026, 11, 25)
 
 
 def test_13l_does_not_exit_a_normal_expiry_on_the_previous_session():
@@ -246,6 +249,121 @@ def test_13l_does_not_exit_a_normal_expiry_on_the_previous_session():
 
     assert not ctx.orders
     assert ctx.positions == {short: -65, hedge: 65}
+
+
+def test_13l_rolls_into_next_week_in_same_session_after_expiry_cover():
+    from app.strategies.builtin.nifty_adaptive_premium_reset_13l import (
+        StrictHundredStrikeWeeklyOptionLegs,
+    )
+
+    expiry = date(2026, 11, 17)
+    next_expiry = date(2026, 11, 24)
+    at = datetime(2026, 11, 17, 15, 10, tzinfo=IST)
+    old = "NSE:NIFTY26N1725900PE"
+    old_hedge = "NSE:NIFTY26N1724000PE"
+    new = "NSE:NIFTY26N2425900PE"
+    new_hedge = "NSE:NIFTY26N2424000PE"
+    ctx = OptionSellerContext({old: -65, old_hedge: 65})
+    ctx.contracts = [
+        OptionContract(old, "PE", 25_900, expiry, 65),
+        OptionContract(old_hedge, "PE", 24_000, expiry, 65),
+        OptionContract(new, "PE", 25_900, next_expiry, 65),
+        OptionContract(new_hedge, "PE", 24_000, next_expiry, 65),
+    ]
+    ctx.quotes[new] = 950
+    ctx.quotes[new_hedge] = 50
+    legs = StrictHundredStrikeWeeklyOptionLegs(ctx, 900)
+    legs.hedge_symbol = old_hedge
+    legs.set_desired(1)
+
+    async def roll():
+        await legs.monitor_expiry(at)
+        assert ctx.positions == {old_hedge: 65}
+        assert legs.roll_after == expiry
+        assert legs.roll_expiry_after == expiry + timedelta(days=1)
+        assert ctx.strategy_state[legs.state_key]["roll_after"] == "2026-11-17"
+        assert ctx.strategy_state[legs.state_key]["roll_expiry_after"] == "2026-11-18"
+        await legs.advance(at)
+        await legs.advance(at)
+
+    asyncio.run(roll())
+
+    assert ctx.orders == [
+        ("BUY", 65, old, Product.DELIVERY),
+        ("BUY", 65, new_hedge, Product.DELIVERY),
+        ("SELL", 65, new, Product.DELIVERY),
+        ("SELL", 65, old_hedge, Product.DELIVERY),
+    ]
+    assert ctx.positions == {new: -65, new_hedge: 65}
+    assert legs.roll_after is None
+    assert legs.roll_expiry_after is None
+    assert legs.frozen is not None and legs.frozen.expiry == next_expiry
+
+    # A reversal later in the same session must stay on the newly rolled expiry rather than
+    # selecting the just-expired contract, which can remain visible in the broker chain.
+    next_call = "NSE:NIFTY26N2424100CE"
+    next_call_hedge = "NSE:NIFTY26N2426000CE"
+    ctx.contracts += [
+        OptionContract(next_call, "CE", 24_100, next_expiry, 65),
+        OptionContract(next_call_hedge, "CE", 26_000, next_expiry, 65),
+    ]
+    ctx.quotes[next_call] = 950
+    ctx.quotes[next_call_hedge] = 50
+    legs.set_desired(-1)
+
+    async def reverse_after_roll():
+        later = at + timedelta(minutes=10)
+        await legs.advance(later)
+        await legs.advance(later)
+        await legs.advance(later)
+
+    asyncio.run(reverse_after_roll())
+
+    assert ctx.orders[-4:] == [
+        ("BUY", 65, new, Product.DELIVERY),
+        ("BUY", 65, next_call_hedge, Product.DELIVERY),
+        ("SELL", 65, next_call, Product.DELIVERY),
+        ("SELL", 65, new_hedge, Product.DELIVERY),
+    ]
+    assert ctx.positions == {next_call: -65, next_call_hedge: 65}
+
+
+def test_13l_same_session_roll_requires_current_quote_at_1510():
+    from app.strategies.builtin.nifty_adaptive_premium_reset_13l import (
+        StrictHundredStrikeWeeklyOptionLegs,
+    )
+
+    at = datetime(2026, 11, 17, 15, 10, tzinfo=IST)
+    next_expiry = date(2026, 11, 24)
+    short = "NSE:NIFTY26N2425900PE"
+    hedge = "NSE:NIFTY26N2424000PE"
+
+    class CurrentQuoteContext(OptionSellerContext):
+        observed_at = at - timedelta(seconds=16)
+
+        async def executable_quote(self, symbol, side):
+            return QuoteSnapshot(950, self.observed_at, "current-roll-depth")
+
+    ctx = CurrentQuoteContext()
+    ctx.contracts = [
+        OptionContract(short, "PE", 25_900, next_expiry, 65),
+        OptionContract(hedge, "PE", 24_000, next_expiry, 65),
+    ]
+    legs = StrictHundredStrikeWeeklyOptionLegs(ctx, 900)
+    legs.desired_direction = 1
+    legs.roll_after = at.date()
+    legs.roll_expiry_after = at.date() + timedelta(days=1)
+
+    asyncio.run(legs.advance(at, "expiry roll"))
+    assert not ctx.orders
+
+    ctx.observed_at = at
+    asyncio.run(legs.advance(at, "expiry roll"))
+
+    assert ctx.orders == [
+        ("BUY", 65, hedge, Product.DELIVERY),
+        ("SELL", 65, short, Product.DELIVERY),
+    ]
 
 
 def test_short_entry_waits_when_same_expiry_1000_otm_hedge_is_unavailable():

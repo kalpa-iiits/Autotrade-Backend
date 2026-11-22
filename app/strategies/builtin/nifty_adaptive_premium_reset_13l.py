@@ -1,8 +1,8 @@
 """Experimental rule variant of the adaptive NIFTY premium-reset seller.
 
-Only the published signal rules differ. Option selection, hedging, quote validation,
-premium resets, reversals, expiry handling and recovery all stay on the existing seller's
-execution path.
+Signals, hedging, quote validation, premium resets, reversals and recovery use the existing
+seller's execution path. Candidate-specific overrides enforce 100-point strikes, holiday-aware
+expiry exits and same-session weekly rollover.
 """
 
 from datetime import date, timedelta
@@ -39,6 +39,9 @@ def _hundred_strike(strike: float) -> bool:
 
 class StrictHundredStrikeWeeklyOptionLegs(ShortWeeklyOptionLegs):
     """Select the nearest listed 100-point strike; never use a non-100 fallback."""
+
+    same_session_expiry_roll = True
+    require_fresh_hedge_quote = True
 
     async def _select(self, kind, now, earliest_expiry=None, exact_expiry=None):
         contract = await super()._select(kind, now, earliest_expiry, exact_expiry)
@@ -82,8 +85,8 @@ class NiftyAdaptivePremiumReset13LStrategy(NiftyTrailingReversalOptimizedITMOpti
     initial_stop_pct = 0.1
     option_legs_class = StrictHundredStrikeWeeklyOptionLegs
     backtest_note = (
-        "The tester replays the experimental 0.10% initial-stop NIFTY signal engine. Live "
-        "option execution is inherited unchanged from NIFTY Adaptive Premium Reset Seller."
+        "The published ₹12.91L replay used next-session expiry rollover. The live strategy "
+        "uses the user-selected same-session 15:10 rollover rule."
     )
 
     @classmethod
@@ -96,12 +99,18 @@ class NiftyAdaptivePremiumReset13LStrategy(NiftyTrailingReversalOptimizedITMOpti
                 "Every 10 minutes from 09:15 IST, ratchet to 0.40% behind the completed close",
             "Prefer strikes divisible by 100; fall back only if unavailable":
                 "Use the nearest listed strike divisible by 100; never use a non-100 strike",
+            "Reset: 0–1 DTE ₹850; 2–3 LOW ₹900/HIGH ₹700; 4–6 LOW ₹850/HIGH ₹900":
+                "Reset: 0–1 DTE ₹850; 2–3 LOW ₹900/HIGH ₹700; 4–7 LOW ₹850/HIGH ₹900",
             "Start expiry rollover at 15:10 IST and reopen next executable session":
-                "Exit at 15:10 on expiry day, or the previous NSE session when expiry is a holiday; reopen next executable session",
+                "At 15:10 on expiry day, or the previous NSE session for a holiday expiry, cover and roll into the next weekly contract in the same session",
         }
         for rule in rules:
             rule["conditions"] = [
                 display_overrides.get(condition, condition)
                 for condition in rule["conditions"]
             ]
+            if rule["kind"] == "exit":
+                rule["conditions"].append(
+                    "At rollover, price the hedge buy from the current ask and the short sale from the current bid"
+                )
         return rules

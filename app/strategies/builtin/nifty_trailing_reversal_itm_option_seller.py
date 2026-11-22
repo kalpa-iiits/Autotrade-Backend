@@ -70,7 +70,7 @@ def classify_reset(kind: str, strike: float, spot: float, option_price: float,
     """Calculate the rule's DTE/IV classification at entry or an expiry roll."""
     local = now.astimezone(IST)
     dte = (expiry - local.date()).days
-    if not 0 <= dte <= 6:
+    if not 0 <= dte <= 7:
         raise ValueError(f"current-week option has unsupported DTE {dte}")
     expiry_at = datetime.combine(expiry, EXPIRY_TIME, tzinfo=IST)
     remaining = max((expiry_at - local).total_seconds(), 1.0) / SECONDS_PER_YEAR
@@ -92,6 +92,8 @@ class ShortWeeklyOptionLegs:
     """Map spot direction to one weekly option short plus its bought OTM margin hedge."""
     state_key = "weekly_option_leg"
     order_product = Product.DELIVERY
+    same_session_expiry_roll = False
+    require_fresh_hedge_quote = False
 
     def __init__(self, ctx, itm_points: float, hedge_points: float = HEDGE_POINTS) -> None:
         self._ctx = ctx
@@ -108,6 +110,7 @@ class ShortWeeklyOptionLegs:
         self.reset_armed = False
         self.reset_pending = False
         self.roll_after: date | None = None
+        self.roll_expiry_after: date | None = None
         self.pending_audit: dict | None = None
         self.contracts_by_symbol: dict[str, OptionContract] = {}
         self._restore()
@@ -129,8 +132,8 @@ class ShortWeeklyOptionLegs:
         actual = self._actual_direction()
         if actual:
             return actual * self.option_quantity
-        # While waiting for the next session after expiry, keep the spot signal virtually in
-        # its continuing direction so its overnight stop can react to the first 09:15 tick.
+        # While waiting to complete an expiry roll, keep the spot signal virtually in its
+        # continuing direction so its stop can react before the replacement option is tradable.
         return (self.desired_direction * self.option_quantity
                 if self.pending_contract or self.roll_after else 0)
 
@@ -187,6 +190,11 @@ class ShortWeeklyOptionLegs:
             self.roll_after = date.fromisoformat(state["roll_after"]) if state.get("roll_after") else None
         except (TypeError, ValueError):
             self.roll_after = None
+        try:
+            self.roll_expiry_after = (date.fromisoformat(state["roll_expiry_after"])
+                                      if state.get("roll_expiry_after") else None)
+        except (TypeError, ValueError):
+            self.roll_expiry_after = None
         self.pending_audit = state.get("pending_audit") if isinstance(state.get("pending_audit"), dict) else None
         value = state.get("hedge_symbol")
         self.hedge_symbol = value if isinstance(value, str) else None
@@ -198,6 +206,8 @@ class ShortWeeklyOptionLegs:
             "reset_armed": self.reset_armed,
             "reset_pending": self.reset_pending,
             "roll_after": self.roll_after.isoformat() if self.roll_after else None,
+            "roll_expiry_after": (self.roll_expiry_after.isoformat()
+                                  if self.roll_expiry_after else None),
             "pending_audit": self.pending_audit,
             "hedge_symbol": self.hedge_symbol,
         }
@@ -212,13 +222,15 @@ class ShortWeeklyOptionLegs:
             raise ValueError(f"invalid option direction {direction}")
         if direction != self.desired_direction:
             pending_roll = self.roll_after
+            pending_roll_expiry = self.roll_expiry_after
             self.replace_symbol = self.pending_contract = self.pending_hedge_contract = None
             self.pending_reason = None
-            self.frozen = self.last_premium = self.roll_after = None
+            self.frozen = self.last_premium = self.roll_after = self.roll_expiry_after = None
             self.reset_armed = self.reset_pending = False
-            # A spot reversal after the expiry close changes the option type, not the rule that
-            # no new weekly option opens until the next executable session.
+            # A spot reversal after the expiry close changes the option type while preserving the
+            # pending roll's execution date and minimum eligible weekly expiry.
             self.roll_after = pending_roll
+            self.roll_expiry_after = pending_roll_expiry
         self.desired_direction = direction
 
     async def buy(self, quantity: int | None = None, reason: str | None = None,
@@ -307,7 +319,8 @@ class ShortWeeklyOptionLegs:
         return min(choices, key=lambda contract: (abs(contract.strike - target), contract.strike))
 
     async def _ensure_hedge(self, kind: str, expiry: date,
-                            required_quantity: int | None = None) -> bool:
+                            required_quantity: int | None = None,
+                            now: datetime | None = None) -> bool:
         """Make the active margin hedge exactly match the exposure it protects.
 
         Existing short exposure is passed explicitly while a configured size reduction is in
@@ -337,6 +350,11 @@ class ShortWeeklyOptionLegs:
         self.hedge_symbol = contract.symbol
         await self._save_leg_state()
         if held < target_quantity:
+            if self.require_fresh_hedge_quote and (
+                now is None or await self._quote(contract.symbol, "BUY", now) is None
+            ):
+                self._ctx.log("entry deferred: current hedge ask unavailable or stale")
+                return False
             await self._buy_overnight(
                 target_quantity - held,
                 f"margin hedge; buy {kind} {contract.strike:g} "
@@ -524,7 +542,9 @@ class ShortWeeklyOptionLegs:
             expiry = await self._expiry_due(symbol, now)
             if expiry is None:
                 continue
-            self.roll_after = expiry + timedelta(days=1)
+            self.roll_expiry_after = expiry + timedelta(days=1)
+            self.roll_after = (now.astimezone(IST).date() if self.same_session_expiry_roll
+                               else self.roll_expiry_after)
             self.replace_symbol = self.pending_contract = self.pending_hedge_contract = None
             self.pending_reason = None
             self.last_premium = None
@@ -556,8 +576,18 @@ class ShortWeeklyOptionLegs:
             positions = self._short_options()
         obsolete = next((s for s in positions if not s.endswith(wanted)), None)
         if obsolete is not None:
-            if self.pending_contract is None and not await self._prepare(wanted, now, "reversal"):
-                return
+            if self.pending_contract is None:
+                held_contract = self.contracts_by_symbol.get(obsolete)
+                if held_contract is None:
+                    await self._contracts()
+                    held_contract = self.contracts_by_symbol.get(obsolete)
+                # A reversal stays on the held weekly expiry. This matters after a same-session
+                # 15:10 roll, while the just-expired contract can still appear in the chain.
+                held_expiry = held_contract.expiry if held_contract is not None else None
+                if not await self._prepare(
+                    wanted, now, "reversal", exact_expiry=held_expiry,
+                ):
+                    return
             await self._buy_overnight(
                 abs(positions[obsolete]), f"{reason}; cover obsolete {obsolete[-2:]}", obsolete,
             )
@@ -571,7 +601,7 @@ class ShortWeeklyOptionLegs:
                 contract = self.contracts_by_symbol.get(symbol)
             if (contract is None
                     or not await self._ensure_hedge(
-                        wanted, contract.expiry, required_quantity=abs(quantity),
+                        wanted, contract.expiry, required_quantity=abs(quantity), now=now,
                     )):
                 return
             if self._ctx.order_pending:
@@ -601,7 +631,10 @@ class ShortWeeklyOptionLegs:
             await self._remove_obsolete_hedge()
             return
 
-        contract = self.pending_contract or await self._select(wanted, now)
+        contract = self.pending_contract or await self._select(
+            wanted, now,
+            earliest_expiry=self.roll_expiry_after if self.roll_after else None,
+        )
         if contract is None:
             self._ctx.log(f"entry deferred: no current-week {wanted} near {self.itm_points:g} ITM")
             return
@@ -615,14 +648,14 @@ class ShortWeeklyOptionLegs:
         except ValueError as exc:
             self._ctx.log(f"entry deferred: {exc}")
             return
-        if not await self._ensure_hedge(wanted, contract.expiry):
+        if not await self._ensure_hedge(wanted, contract.expiry, now=now):
             return
         if self._ctx.order_pending:
             return
         event = self.pending_reason or ("reset" if self.reset_pending else reason)
         if self.frozen is None or event in {"reversal", "expiry"} or "reverse" in event:
             self.frozen = calculated
-        self.last_premium, self.roll_after = quote.price, None
+        self.last_premium, self.roll_after, self.roll_expiry_after = quote.price, None, None
         self.reset_armed = quote.price > self.frozen.reset_level
         self.reset_pending = False
         self.pending_contract = self.pending_hedge_contract = self.pending_reason = None
