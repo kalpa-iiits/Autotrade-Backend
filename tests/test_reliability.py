@@ -34,6 +34,7 @@ from tests.test_strategies import (  # noqa: F401
     CLOCK_SCRIPT,
     SCRIPT,
     SYM,
+    Scripted,
     by_key,
     deploy,
     dep,
@@ -87,16 +88,45 @@ def test_strategy_startup_reconciliation_rejects_unmatched_open_order(deploy):
 
 
 def test_options_reconciliation_rejects_unrecorded_broker_option_position(deploy):
-    c = deploy(dep("reconcile-option"))
+    class OptionExecutingScripted(Scripted):
+        reconcile_option_positions = True
+
+    c = deploy(dep("reconcile-option", strategy=OptionExecutingScripted))
     inst = start_strategy(c, "reconcile-option")
     runner = c.app.state.strategy_runner
     service = c.app.state.accounts.get(1).service
     running = runner.running[inst["id"]]
-    running.config.strategy = "test_options"
     symbol = "NSE:NIFTY071124700CE"
     service.broker.positions[symbol] = Position(symbol=symbol, quantity=65, avg_price=100)
 
     with pytest.raises(StrategyError, match=rf"{symbol}: database 0, broker 65"):
+        run(c, runner._reconcile_broker_state, running.config, service)
+
+
+def test_renamed_adaptive_seller_reconciles_unrecorded_option_position(deploy):
+    from app.strategies.builtin.nifty_trailing_reversal_itm_option_seller import (
+        NiftyTrailingReversalOptimizedITMOptionSeller,
+    )
+
+    deployment = dep(
+        "reconcile-adaptive-seller",
+        strategy=NiftyTrailingReversalOptimizedITMOptionSeller,
+        symbol="NSE:NIFTY50-INDEX",
+        quantity=65,
+        max_order_qty=1_800,
+        max_position=1_800,
+        max_orders_per_day=100,
+    )
+    c = deploy(deployment)
+    inst = start_strategy(c, deployment.key)
+    runner = c.app.state.strategy_runner
+    service = c.app.state.accounts.get(1).service
+    running = runner.running[inst["id"]]
+    symbol = "NSE:NIFTY26N2425900PE"
+    service.broker.positions[symbol] = Position(symbol=symbol, quantity=-65, avg_price=950)
+
+    assert running.config.strategy == "nifty_adaptive_premium_reset_seller"
+    with pytest.raises(StrategyError, match=rf"{symbol}: database 0, broker -65"):
         run(c, runner._reconcile_broker_state, running.config, service)
 
 

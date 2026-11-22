@@ -88,6 +88,7 @@ class InternalChoch3ROptions(Strategy):
     """Shared signal and bracket engine; subclasses select the independent option direction."""
 
     checkpoint_version = 1
+    reconcile_option_positions = True
     direction: ClassVar[Literal[1, -1]]
     option_kind: ClassVar[Literal["CE", "PE"]]
     capital_sizing = False

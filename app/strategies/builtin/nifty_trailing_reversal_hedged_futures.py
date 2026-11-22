@@ -29,6 +29,7 @@ MONTHS = {name: month for month, name in enumerate(
 
 class _HedgedFuturesExecution:
     primary_symbol_only = True
+    reconcile_option_positions = True
 
     async def on_start(self) -> None:
         await super().on_start()

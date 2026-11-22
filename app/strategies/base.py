@@ -115,6 +115,10 @@ class Strategy(ABC):
     # Multi-leg strategies may trade auxiliary symbols without letting those quantities alter
     # the configured instrument's directional position, sizing, or protective stops.
     primary_symbol_only: ClassVar[bool] = False
+    # Strategies whose execution or hedge legs are options must reconcile every option on the
+    # broker account. This catches an order accepted just before a crash even when no database
+    # signal was saved for its dynamically selected contract.
+    reconcile_option_positions: ClassVar[bool] = False
 
     # Timeframes this strategy may run on, and the one new deployments get by default.
     timeframes: ClassVar[tuple[str, ...]] = tuple(TIMEFRAMES)

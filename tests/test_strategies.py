@@ -880,6 +880,55 @@ def test_auxiliary_hedge_does_not_change_primary_position_and_restores_separatel
     assert restored.positions == {hedge: 65, future: 65}
 
 
+def test_auxiliary_option_cover_bypasses_limits_but_new_risk_remains_capped(deploy):
+    class MultiLegScripted(Scripted):
+        primary_symbol_only = True
+
+    option = "NSE:NIFTY26NOV25000PE"
+    deployment = dep(
+        "option-limits", strategy=MultiLegScripted, quantity=65,
+        max_order_qty=65, max_position=65, max_orders_per_day=1,
+    )
+    c = deploy(deployment)
+    runtime(c).service.broker.prices[option] = 100.0
+    inst = start_strategy(c, deployment.key)
+
+    SCRIPT.append(("sell", 65, "open short", option))
+    tick(c)
+    running = c.app.state.strategy_runner.running[inst["id"]]
+    assert running.position == 0
+    assert running.positions == {option: -65}
+
+    # Enlarging this auxiliary leg is still subject to its per-symbol position ceiling.
+    SCRIPT.append(("sell", 65, "increase short", option))
+    tick(c)
+
+    # A full cover must remain possible even when its quantity is now above both configured
+    # size limits and the only ordinary order permitted today has already been used.
+    running.config.max_order_qty = 1
+    running.config.max_position = 1
+    SCRIPT.append(("buy", 65, "risk-reducing cover", option))
+    tick(c)
+    assert running.positions == {}
+
+    # Restore the size limits to isolate the daily-order check: a fresh auxiliary position is
+    # risk-increasing and therefore remains blocked after the cover.
+    running.config.max_order_qty = 65
+    running.config.max_position = 65
+    SCRIPT.append(("buy", 65, "new risk", option))
+    tick(c)
+
+    got = list(reversed(signals(c, inst["id"])))
+    assert [(row["side"], row["quantity"], row["outcome"]) for row in got] == [
+        ("SELL", 65, "placed"),
+        ("SELL", 65, "blocked"),
+        ("BUY", 65, "placed"),
+        ("BUY", 65, "blocked"),
+    ]
+    assert "max_position" in got[1]["message"]
+    assert "max_orders_per_day" in got[3]["message"]
+
+
 def test_strategy_product_override_reaches_entry_and_exit_orders(deploy):
     c = deploy(dep("a"))
     start_strategy(c, "a")

@@ -14,7 +14,7 @@ from pydantic import Field
 
 from app.brokers.base import OptionContract
 from app.orders.schemas import Product
-from app.strategies.base import TIMEFRAMES, Tick
+from app.strategies.base import Tick
 from app.strategies.builtin.intraday_breakout_options import pick_contract
 from app.strategies.builtin.nifty_trailing_reversal_optimized import IST, NiftyTrailingReversalOptimized
 
@@ -306,19 +306,28 @@ class ShortWeeklyOptionLegs:
         choices = hundreds or eligible
         return min(choices, key=lambda contract: (abs(contract.strike - target), contract.strike))
 
-    async def _ensure_hedge(self, kind: str, expiry: date) -> bool:
+    async def _ensure_hedge(self, kind: str, expiry: date,
+                            required_quantity: int | None = None) -> bool:
+        """Make the active margin hedge exactly match the exposure it protects.
+
+        Existing short exposure is passed explicitly while a configured size reduction is in
+        progress. This keeps the larger hedge until the short is covered, then trims the hedge
+        on the next pass instead of briefly leaving part of the short unhedged.
+        """
+        target_quantity = self.option_quantity if required_quantity is None else required_quantity
         longs = self._long_options()
         contract = self.pending_hedge_contract
         if contract is None:
-            if self.hedge_symbol and longs.get(self.hedge_symbol, 0) >= self.option_quantity:
+            if self.hedge_symbol and longs.get(self.hedge_symbol, 0) > 0:
                 held_contract = self.contracts_by_symbol.get(self.hedge_symbol)
                 if held_contract is None:
                     await self._contracts()
                     held_contract = self.contracts_by_symbol.get(self.hedge_symbol)
                 if (held_contract is not None and held_contract.kind == kind
                         and held_contract.expiry == expiry):
-                    return True
-            contract = await self._select_hedge(kind, expiry)
+                    contract = held_contract
+            if contract is None:
+                contract = await self._select_hedge(kind, expiry)
         if contract is None:
             self._ctx.log(
                 f"entry deferred: no {kind} {self.hedge_points:g}-point OTM margin hedge"
@@ -327,14 +336,19 @@ class ShortWeeklyOptionLegs:
         held = longs.get(contract.symbol, 0)
         self.hedge_symbol = contract.symbol
         await self._save_leg_state()
-        if held < self.option_quantity:
+        if held < target_quantity:
             await self._buy_overnight(
-                self.option_quantity - held,
+                target_quantity - held,
                 f"margin hedge; buy {kind} {contract.strike:g} "
                 f"({self.hedge_points:g} points OTM) expiring {contract.expiry:%d %b}",
                 contract.symbol,
             )
-        return self._long_options().get(contract.symbol, 0) >= self.option_quantity
+        elif held > target_quantity:
+            await self._sell_overnight(
+                held - target_quantity,
+                f"trim margin hedge to {target_quantity} units", contract.symbol,
+            )
+        return self._long_options().get(contract.symbol, 0) == target_quantity
 
     async def _remove_obsolete_hedge(self) -> None:
         obsolete = next(
@@ -445,47 +459,97 @@ class ShortWeeklyOptionLegs:
             await self.request_reset(now)
 
     async def monitor_expiry(self, now: datetime) -> None:
-        if self._ctx.order_pending or not self.desired_direction or self.replace_symbol:
-            return
-        local = now.astimezone(IST)
-        current = next(iter(self._short_options()), None)
-        if current is None:
-            return
-        contract = self.contracts_by_symbol.get(current)
+        # Expiry safety lives in ``advance`` so it also runs on the first tick after a restart,
+        # before the periodic clock callback. Keep this method as the explicit clock hook.
+        await self.advance(now, "weekly expiry exit")
+
+    async def _expiry_due(self, symbol: str, now: datetime) -> date | None:
+        contract = self.contracts_by_symbol.get(symbol)
         if contract is None:
             await self._contracts()
-            contract = self.contracts_by_symbol.get(current)
-        if contract and contract.expiry == local.date() and local.time() >= EXPIRY_EXIT_TIME:
-            next_day = local.date() + timedelta(days=1)
-            if not await self._prepare(self._kind(self.desired_direction), now, "expiry", next_day):
-                return
-            # Acquire the next-week margin hedge during the expiry rollover. The short strike is
-            # still reselected from the next session's spot, but it can never open before this
-            # already-held hedge (or a new opposite-type hedge after an opening-gap reversal).
-            next_contract = self.pending_contract
-            if (next_contract is None
-                    or not await self._ensure_hedge(next_contract.kind, next_contract.expiry)
-                    or self._ctx.order_pending):
-                return
-            self.replace_symbol, self.roll_after = current, next_day
-            self.frozen = self.last_premium = None
-            self.reset_armed = self.reset_pending = False
-            await self._save_leg_state()
-            await self.advance(now, "weekly expiry roll")
+            contract = self.contracts_by_symbol.get(symbol)
+        expiry = contract.expiry if contract else (self.frozen.expiry if self.frozen else None)
+        if expiry is None:
+            return None
+        local = now.astimezone(IST)
+        if expiry < local.date() or (expiry == local.date() and local.time() >= EXPIRY_EXIT_TIME):
+            return expiry
+        return None
+
+    async def _cover_duplicate_short(self, positions: dict[str, int], wanted: str) -> bool:
+        """Reduce anomalous multi-contract short exposure one contract at a time."""
+        if len(positions) <= 1:
+            return False
+        await self._contracts()
+        spot = self._ctx.last_price or 0.0
+        target = spot + self.itm_points if wanted == "PE" else spot - self.itm_points
+
+        def keep_rank(item: tuple[str, int]) -> tuple:
+            symbol, quantity = item
+            contract = self.contracts_by_symbol.get(symbol)
+            correct_kind = symbol.endswith(wanted)
+            frozen_expiry = bool(
+                contract and self.frozen and contract.expiry == self.frozen.expiry
+            )
+            strike_distance = abs(contract.strike - target) if contract else float("inf")
+            deeper_tie = (-contract.strike if wanted == "PE" else contract.strike) if contract else 0
+            return (
+                not correct_kind, not frozen_expiry,
+                abs(abs(quantity) - self.option_quantity), strike_distance, deeper_tie, symbol,
+            )
+
+        keep_symbol = min(positions.items(), key=keep_rank)[0]
+        duplicate = next(
+            (item for item in sorted(positions.items()) if item[0] != keep_symbol), None,
+        )
+        if duplicate is None:
+            return False
+        symbol, quantity = duplicate
+        self._ctx.log(
+            f"duplicate short option exposure detected; retaining {keep_symbol} and covering {symbol}"
+        )
+        await self._buy_overnight(
+            abs(quantity), "reconcile duplicate short option exposure", symbol,
+        )
+        return True
 
     async def advance(self, now: datetime, reason: str = "option transition") -> None:
         await self._complete_fill_audit()
-        if self._ctx.order_pending or not self.desired_direction:
+        if self._ctx.order_pending:
             return
-        positions, wanted = self._short_options(), self._kind(self.desired_direction)
+        positions = self._short_options()
+        # Closing an expiring (or already expired after restart) short is unconditional. Do not
+        # make that risk-reducing order depend on a next-week quote or hedge being available.
+        for symbol, quantity in sorted(positions.items()):
+            expiry = await self._expiry_due(symbol, now)
+            if expiry is None:
+                continue
+            self.roll_after = expiry + timedelta(days=1)
+            self.replace_symbol = self.pending_contract = self.pending_hedge_contract = None
+            self.pending_reason = None
+            self.last_premium = None
+            self.reset_armed = self.reset_pending = False
+            # The old hedge becomes obsolete after the short is covered. Keep ``frozen`` until
+            # the short disappears so its expiry remains a restart fallback if the contract is
+            # no longer returned by the broker's option chain.
+            self.hedge_symbol = None
+            await self._save_leg_state()
+            await self._buy_overnight(
+                abs(quantity), f"weekly expiry exit {expiry:%d %b} at 15:10", symbol,
+            )
+            return
+        if not self.desired_direction:
+            return
+        wanted = self._kind(self.desired_direction)
+        if await self._cover_duplicate_short(positions, wanted):
+            return
         if self.replace_symbol and self.replace_symbol in positions:
             await self._buy_overnight(abs(positions[self.replace_symbol]), reason,
                                       self.replace_symbol)
             return
         if self.replace_symbol and self.replace_symbol not in positions:
             self.replace_symbol = None
-            # The next-week contract was identified before the expiry close as a safety
-            # prerequisite. Do not carry yesterday's strike through an overnight gap: the next
+            # Never carry a prepared strike through an overnight expiry wait. The next
             # executable session must select 900-ITM again from that session's current spot.
             if self.roll_after is not None:
                 self.pending_contract = self.pending_hedge_contract = self.pending_reason = None
@@ -505,7 +569,10 @@ class ShortWeeklyOptionLegs:
             if contract is None:
                 await self._contracts()
                 contract = self.contracts_by_symbol.get(symbol)
-            if contract is None or not await self._ensure_hedge(wanted, contract.expiry):
+            if (contract is None
+                    or not await self._ensure_hedge(
+                        wanted, contract.expiry, required_quantity=abs(quantity),
+                    )):
                 return
             if self._ctx.order_pending:
                 return
@@ -524,6 +591,12 @@ class ShortWeeklyOptionLegs:
             elif not self._ctx.order_pending and self.pending_reason != "expiry":
                 await self._remove_obsolete_hedge()
             return
+        if self.roll_after and self.frozen is not None:
+            # The expiry cover has filled. The old classification was retained only as a
+            # restart fallback while that short still existed; the next weekly entry must be
+            # classified afresh.
+            self.frozen = None
+            await self._save_leg_state()
         if self.roll_after and now.astimezone(IST).date() < self.roll_after:
             await self._remove_obsolete_hedge()
             return
@@ -580,9 +653,11 @@ class NiftyTrailingReversalOptimizedITMOptionSeller(NiftyTrailingReversalOptimiz
     tags = ("Positional", "NIFTY", "Weekly options", "900 ITM", "1000 OTM hedge")
     capital_sizing = False
     primary_symbol_only = True
-    # Expose every engine-supported interval to Strategy Tester. The production deployment
-    # remains explicitly configured at 5m, preserving its perfected live signal cadence.
-    timeframes = tuple(TIMEFRAMES)
+    reconcile_option_positions = True
+    # The signal and reset evidence is specific to completed five-minute NIFTY bars. The same
+    # capability list controls live instance creation, so unsupported tester intervals must not
+    # be exposed here.
+    timeframes = ("5m",)
     default_timeframe = "5m"
     backtest_note = ("The tester replays the unchanged NIFTY signal engine. Live option "
                      "execution uses current-week quotes and the frozen DTE/IV reset table.")

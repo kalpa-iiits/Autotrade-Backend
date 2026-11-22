@@ -143,6 +143,7 @@ def pick_contract_by_delta(
 
 class NiftyIntradayLimitedOptions(NiftyIntradayLimited):
     name = "nifty_intraday_limited_options"
+    reconcile_option_positions = True
     description = (
         "NIFTY limited-trade intraday and overnight signals executed with calls and puts "
         "selected near 0.95 absolute delta, with a 700-point ITM fallback."

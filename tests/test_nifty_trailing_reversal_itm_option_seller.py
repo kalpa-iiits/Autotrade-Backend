@@ -3,7 +3,7 @@ from datetime import date, datetime, timedelta
 
 from app.brokers.base import Candle, OptionContract
 from app.orders.schemas import Product
-from app.strategies.base import TIMEFRAMES, Tick
+from app.strategies.base import Tick
 from app.strategies.backtest import Simulation
 from app.strategies.deployment import Deployment
 from app.strategies.builtin.nifty_trailing_reversal_hedged_futures import (
@@ -287,7 +287,7 @@ def test_missing_replacement_quote_keeps_existing_short_untouched():
     assert any("unavailable" in message for message in ctx.logs)
 
 
-def test_expiry_cover_waits_until_next_session_then_reopens_and_reclassifies():
+def test_expiry_cover_does_not_wait_for_next_week_quote_then_reopens_and_reclassifies():
     expiry_at = datetime(2026, 11, 24, 15, 10, tzinfo=IST)
     old = "NSE:NIFTY26N2425900PE"
     old_hedge = "NSE:NIFTY26N2424000PE"
@@ -297,32 +297,103 @@ def test_expiry_cover_waits_until_next_session_then_reopens_and_reclassifies():
         OptionContract(f"NSE:NIFTY26D01{strike}PE", "PE", float(strike), next_expiry, 65)
         for strike in range(24_000, 26_501, 100)
     ]
-    close_candidate = "NSE:NIFTY26D0125900PE"
     gap_candidate = "NSE:NIFTY26D0126100PE"
-    ctx.quotes[close_candidate] = 960
-    ctx.quotes[gap_candidate] = 960
     legs = ShortWeeklyOptionLegs(ctx, 900)
     legs.hedge_symbol = old_hedge
     legs.set_desired(1)
 
     async def roll():
+        # There is deliberately no executable next-week short quote at 15:10. The expiring
+        # risk must still be covered, with reopening deferred to the next session.
         await legs.monitor_expiry(expiry_at)
+        assert ctx.positions == {old_hedge: 65}
+        assert legs.roll_after == date(2026, 11, 25)
+        assert ctx.strategy_state[legs.state_key]["roll_after"] == "2026-11-25"
         await legs.advance(expiry_at)
-        assert ctx.positions == {"NSE:NIFTY26D0124000PE": 65}
+        assert ctx.positions == {}
         # Reselect from the next session's spot rather than carrying the 25,900 strike selected
         # as the pre-close safety candidate through this 200-point overnight gap.
         ctx.last_price = 25_200
+        ctx.quotes[gap_candidate] = 960
         await legs.advance(datetime(2026, 11, 25, 9, 15, tzinfo=IST))
 
     asyncio.run(roll())
 
     assert ctx.orders == [
-        ("BUY", 65, "NSE:NIFTY26D0124000PE", Product.DELIVERY),
         ("BUY", 65, old, Product.DELIVERY),
         ("SELL", 65, old_hedge, Product.DELIVERY),
+        ("BUY", 65, "NSE:NIFTY26D0124200PE", Product.DELIVERY),
         ("SELL", 65, gap_candidate, Product.DELIVERY),
     ]
     assert legs.frozen is not None and legs.frozen.classified_at.date() == date(2026, 11, 25)
+
+
+def test_restart_after_expiry_still_covers_the_stranded_old_contract():
+    old = "NSE:NIFTY26N2425900PE"
+    old_hedge = "NSE:NIFTY26N2424000PE"
+    after_expiry = datetime(2026, 11, 25, 9, 16, tzinfo=IST)
+    ctx = OptionSellerContext({old: -65, old_hedge: 65})
+    ctx.strategy_state = {
+        ShortWeeklyOptionLegs.state_key: {
+            "frozen": classify_reset("PE", 25_900, 25_000, 950, EXPIRY, AT).as_dict(),
+            "last_premium": 900,
+            "reset_armed": True,
+            "reset_pending": False,
+            "roll_after": None,
+            "pending_audit": None,
+            "hedge_symbol": old_hedge,
+        },
+    }
+
+    legs = ShortWeeklyOptionLegs(ctx, 900)
+    asyncio.run(legs.advance(after_expiry))
+
+    assert ctx.orders == [
+        ("BUY", 65, old, Product.DELIVERY),
+    ]
+    assert ctx.positions == {old_hedge: 65}
+    assert legs.roll_after == after_expiry.date()
+    assert ctx.strategy_state[legs.state_key]["roll_after"] == "2026-11-25"
+
+
+def test_size_reduction_covers_short_before_trimming_surplus_margin_hedge():
+    short = "NSE:NIFTY26N2425900PE"
+    hedge = "NSE:NIFTY26N2424000PE"
+    ctx = OptionSellerContext({short: -130, hedge: 130}, quantity=65)
+    legs = ShortWeeklyOptionLegs(ctx, 900)
+    legs.hedge_symbol = hedge
+    legs.set_desired(1)
+
+    async def resize():
+        await legs.advance(AT)
+        assert ctx.positions == {short: -65, hedge: 130}
+        await legs.advance(AT)
+
+    asyncio.run(resize())
+
+    assert ctx.orders == [
+        ("BUY", 65, short, Product.DELIVERY),
+        ("SELL", 65, hedge, Product.DELIVERY),
+    ]
+    assert ctx.positions == {short: -65, hedge: 65}
+
+
+def test_duplicate_same_direction_shorts_are_reduced_to_one_contract():
+    duplicate = "NSE:NIFTY26N2425800PE"
+    wanted = "NSE:NIFTY26N2425900PE"
+    hedge = "NSE:NIFTY26N2424000PE"
+    ctx = OptionSellerContext({duplicate: -65, wanted: -65, hedge: 65})
+    legs = ShortWeeklyOptionLegs(ctx, 900)
+    legs.hedge_symbol = hedge
+    legs.set_desired(1)
+
+    asyncio.run(legs.advance(AT))
+
+    assert ctx.orders == [
+        ("BUY", 65, duplicate, Product.DELIVERY),
+    ]
+    assert ctx.positions == {wanted: -65, hedge: 65}
+    assert any("duplicate short option exposure" in message for message in ctx.logs)
 
 
 def test_expiry_reopen_processes_opening_gap_signal_before_choosing_option_type():
@@ -391,11 +462,10 @@ def test_rules_keep_optimized_signal_triggers_unchanged():
     assert any("2–3 LOW ₹900/HIGH ₹700" in condition for condition in risk["conditions"])
 
 
-def test_tester_exposes_all_supported_timeframes_but_keeps_five_minute_default():
+def test_strategy_exposes_only_its_valid_five_minute_timeframe():
     strategy = NiftyTrailingReversalOptimizedITMOptionSeller
 
-    assert strategy.timeframes == tuple(TIMEFRAMES)
-    assert strategy.timeframes == ("1m", "3m", "5m", "10m", "15m", "30m", "60m")
+    assert strategy.timeframes == ("5m",)
     assert strategy.default_timeframe == "5m"
 
 

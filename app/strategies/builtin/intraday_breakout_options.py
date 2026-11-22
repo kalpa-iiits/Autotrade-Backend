@@ -87,6 +87,7 @@ def pick_contract(contracts: list[OptionContract], kind: str, spot: float, itm_p
 
 class IntradayBreakoutOptions(IntradayBreakout):
     name = "intraday_breakout_options"
+    reconcile_option_positions = True
     description = (
         "Intraday Breakout's signals on the index, traded by buying in-the-money options: a call "
         "on a long signal, a put on a short one, sold when the index trade exits."

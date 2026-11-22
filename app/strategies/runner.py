@@ -807,10 +807,14 @@ class StrategyRunner:
         auxiliary = bool(
             inst.strategy and inst.strategy.primary_symbol_only and symbol != inst.symbol
         )
-        new_position = inst.position if auxiliary else inst.position + (
+        current_position = inst.positions.get(symbol, 0) if auxiliary else inst.position
+        new_position = current_position + (
             quantity if side == Side.BUY else -quantity
         )
-        reduces_only = abs(new_position) < abs(inst.position) and (new_position * inst.position >= 0)
+        reduces_only = (
+            abs(new_position) < abs(current_position)
+            and new_position * current_position >= 0
+        )
         if reduces_only:
             return None  # limits must never stop a strategy from getting out of a position
         if quantity > cfg.max_order_qty:
@@ -1071,13 +1075,14 @@ class StrategyRunner:
                 if order_status not in terminal:
                     recorded_open.add(order_id)
 
-        # Direct-instrument strategies trade their configured symbol. Options strategies use
-        # it only as the signal underlying. For those, reconcile every option position on the
-        # account: an unrecorded CE/PE may be an order accepted just before a process crash.
-        options_strategy = (
-            config.strategy.endswith("_options")
-            or config.strategy.endswith("_hedged_futures")
-            or config.strategy.endswith("_itm_option_seller")
+        # Direct-instrument strategies trade their configured symbol. Option-executing and
+        # option-hedged strategies may select contracts dynamically, so reconcile every option
+        # on the account: an unrecorded CE/PE may be an order accepted just before a crash. Use
+        # the deployment's explicit capability rather than its display/persistence name; names
+        # can change while the safety requirement cannot.
+        deployment = self.deployments.get(config.deployment_key)
+        options_strategy = bool(
+            deployment and deployment.strategy.reconcile_option_positions
         )
         if options_strategy:
             instance_symbols.update(symbol for symbol in expected if OPTION_SYMBOL.search(symbol))
