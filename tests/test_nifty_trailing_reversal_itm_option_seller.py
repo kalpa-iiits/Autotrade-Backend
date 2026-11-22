@@ -667,6 +667,71 @@ def test_size_reduction_covers_short_before_trimming_surplus_margin_hedge():
     assert ctx.positions == {short: -65, hedge: 65}
 
 
+def test_partial_short_entry_keeps_full_hedge_before_completing_short():
+    short = "NSE:NIFTY26N2425900PE"
+    hedge = "NSE:NIFTY26N2424000PE"
+    ctx = OptionSellerContext({short: -30, hedge: 65}, quantity=65)
+    ctx.quotes[short] = 950
+    legs = ShortWeeklyOptionLegs(ctx, 900)
+    legs.hedge_symbol = hedge
+    legs.set_desired(1)
+
+    asyncio.run(legs.advance(AT))
+
+    assert ctx.orders == [
+        ("SELL", 35, short, Product.DELIVERY),
+    ]
+    assert ctx.positions == {short: -65, hedge: 65}
+
+
+def test_size_increase_expands_hedge_before_adding_to_short():
+    short = "NSE:NIFTY26N2425900PE"
+    hedge = "NSE:NIFTY26N2424000PE"
+    ctx = OptionSellerContext({short: -65, hedge: 65}, quantity=130)
+    ctx.quotes[short] = 950
+    legs = ShortWeeklyOptionLegs(ctx, 900)
+    legs.hedge_symbol = hedge
+    legs.set_desired(1)
+
+    asyncio.run(legs.advance(AT))
+
+    assert ctx.orders == [
+        ("BUY", 65, hedge, Product.DELIVERY),
+        ("SELL", 65, short, Product.DELIVERY),
+    ]
+    assert ctx.positions == {short: -130, hedge: 130}
+
+
+def test_live_size_edit_does_not_change_target_mid_reconciliation_pass():
+    short = "NSE:NIFTY26N2425900PE"
+    hedge = "NSE:NIFTY26N2424000PE"
+
+    class SizeEditContext(OptionSellerContext):
+        async def save_strategy_state(self, state):
+            await super().save_strategy_state(state)
+            self.quantity = 130
+
+    ctx = SizeEditContext({short: -65, hedge: 65}, quantity=65)
+    ctx.quotes[short] = 950
+    legs = ShortWeeklyOptionLegs(ctx, 900)
+    legs.hedge_symbol = hedge
+    legs.set_desired(1)
+
+    async def resize():
+        await legs.advance(AT)
+        assert ctx.orders == []
+        assert ctx.positions == {short: -65, hedge: 65}
+        await legs.advance(AT)
+
+    asyncio.run(resize())
+
+    assert ctx.orders == [
+        ("BUY", 65, hedge, Product.DELIVERY),
+        ("SELL", 65, short, Product.DELIVERY),
+    ]
+    assert ctx.positions == {short: -130, hedge: 130}
+
+
 def test_duplicate_same_direction_shorts_are_reduced_to_one_contract():
     duplicate = "NSE:NIFTY26N2425800PE"
     wanted = "NSE:NIFTY26N2425900PE"

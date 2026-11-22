@@ -616,27 +616,32 @@ class ShortWeeklyOptionLegs:
         held = next(((s, q) for s, q in positions.items() if s.endswith(wanted)), None)
         if held is not None:
             symbol, quantity = held
+            # Reconcile both legs against one size snapshot.  When increasing exposure, establish
+            # the larger hedge before adding to the short.  When decreasing, keep the larger hedge
+            # until the excess short has been covered, then trim it on the next pass.
+            target_quantity = self.option_quantity
+            protected_quantity = max(abs(quantity), target_quantity)
             contract = self.contracts_by_symbol.get(symbol)
             if contract is None:
                 await self._contracts()
                 contract = self.contracts_by_symbol.get(symbol)
             if (contract is None
                     or not await self._ensure_hedge(
-                        wanted, contract.expiry, required_quantity=abs(quantity), now=now,
+                        wanted, contract.expiry, required_quantity=protected_quantity, now=now,
                     )):
                 return
             if self._ctx.order_pending:
                 return
-            if abs(quantity) > self.option_quantity:
+            if abs(quantity) > target_quantity:
                 await self._buy_overnight(
-                    abs(quantity) - self.option_quantity,
+                    abs(quantity) - target_quantity,
                     "reconcile option quantity above configured size", symbol,
                 )
-            elif abs(quantity) < self.option_quantity:
+            elif abs(quantity) < target_quantity:
                 quote = await self._quote(symbol, "SELL", now)
                 if quote is not None:
                     await self._sell_overnight(
-                        self.option_quantity - abs(quantity),
+                        target_quantity - abs(quantity),
                         "reconcile partial option entry to configured size", symbol,
                     )
             elif not self._ctx.order_pending and self.pending_reason != "expiry":
