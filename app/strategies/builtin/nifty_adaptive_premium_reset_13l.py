@@ -51,6 +51,10 @@ class StrictHundredStrikeWeeklyOptionLegs(ShortWeeklyOptionLegs):
     # Tuesday is eight calendar days, while an ordinary Tuesday-to-Tuesday roll is seven.
     max_reset_dte = 8
     default_hedge_points = 800.0
+    # Prefer the original deeper exposure, but step toward ATM whenever its live price is not
+    # economically executable. All candidates are checked before any order is submitted.
+    entry_itm_candidates = (1_000.0, 900.0, 800.0)
+    validate_entry_prices = True
 
     def _restore(self) -> None:
         super()._restore()
@@ -60,8 +64,51 @@ class StrictHundredStrikeWeeklyOptionLegs(ShortWeeklyOptionLegs):
             self.frozen = replace(self.frozen, reset_level=self.reset_01)
 
     async def _select(self, kind, now, earliest_expiry=None, exact_expiry=None):
-        contract = await super()._select(kind, now, earliest_expiry, exact_expiry)
-        return contract if contract is not None and _hundred_strike(contract.strike) else None
+        spot = self._ctx.last_price
+        if not spot:
+            return None
+        contracts = [
+            contract for contract in await self._contracts()
+            if contract.kind == kind
+            and _hundred_strike(contract.strike)
+            and self._expiry_entry_eligible(contract.expiry, now)
+        ]
+        if exact_expiry is not None:
+            contracts = [contract for contract in contracts if contract.expiry == exact_expiry]
+        start = earliest_expiry or now.astimezone(IST).date()
+        expiries = sorted({contract.expiry for contract in contracts if contract.expiry >= start})
+        if not expiries:
+            return None
+        chain = [contract for contract in contracts if contract.expiry == expiries[0]]
+
+        for depth in self.entry_itm_candidates:
+            target = spot - depth if kind == "CE" else spot + depth
+            deeper = 1 if kind == "CE" else -1
+            contract = min(
+                chain,
+                key=lambda candidate: (
+                    abs(candidate.strike - target), deeper * candidate.strike,
+                ),
+            )
+            quote = await self._quote(contract.symbol, "SELL", now)
+            if quote is None:
+                self._ctx.log(
+                    f"entry candidate {depth:g}-ITM {contract.symbol} skipped: "
+                    "sell quote unavailable or stale"
+                )
+                continue
+            _, problem = self._entry_price_guard(contract, quote, "SELL")
+            if problem:
+                self._ctx.log(
+                    f"entry candidate {depth:g}-ITM {contract.symbol} skipped: {problem}"
+                )
+                continue
+            self._ctx.log(
+                f"entry candidate selected: {depth:g}-ITM {contract.symbol} at bid "
+                f"{quote.price:g}"
+            )
+            return contract
+        return None
 
     async def _select_hedge(self, kind, expiry):
         contract = await super()._select_hedge(kind, expiry)
@@ -85,11 +132,12 @@ class NiftyAdaptivePremiumReset13LStrategy(NiftyTrailingReversalOptimizedITMOpti
     # strategy, even though both variants intentionally share their execution implementation.
     legacy_checkpoint_names = ()
     description = (
-        "13 L strategy: a current-week 900-ITM NIFTY option short, using a 0.10% initial "
+        "13 L strategy: a current-week NIFTY option short selected from valid 1000/900/800-ITM "
+        "prices, using a 0.10% initial "
         "index stop, 0.40% trailing stop and frozen DTE/IV premium resets. The existing "
         "editable fixed-quantity sizing and bought 800-OTM margin-hedge execution are retained."
     )
-    tags = ("Experimental", "NIFTY", "Weekly options", "900 ITM")
+    tags = ("Experimental", "NIFTY", "Weekly options", "1000/900/800 ITM")
     initial_stop_pct = 0.1
     option_legs_class = StrictHundredStrikeWeeklyOptionLegs
     backtest_note = (
@@ -120,5 +168,14 @@ class NiftyAdaptivePremiumReset13LStrategy(NiftyTrailingReversalOptimizedITMOpti
             if rule["kind"] == "exit":
                 rule["conditions"].append(
                     "At rollover, price the hedge buy from the current ask and the short sale from the current bid"
+                )
+            if rule["kind"] == "filter":
+                rule["conditions"].append(
+                    "Before entry, check 1000-, 900- and 800-ITM quotes in that order; use "
+                    "the deepest contract with a valid two-sided price and intrinsic-value floor"
+                )
+                rule["conditions"].append(
+                    "Reject an overpriced hedge ask; protected limits never cross the validated "
+                    "buy ceiling or short-sale floor"
                 )
         return rules

@@ -31,6 +31,8 @@ class QuoteSnapshot:
     price: float
     observed_at: datetime
     source: str = "live"
+    bid: float | None = None
+    ask: float | None = None
 
 
 @dataclass(frozen=True)
@@ -106,6 +108,14 @@ class ShortWeeklyOptionLegs:
     reset_47_high = 900.0
     max_reset_dte = 7
     default_hedge_points = HEDGE_POINTS
+    validate_entry_prices = False
+    entry_spread_pct = 1.5
+    entry_spread_floor = 10.0
+    intrinsic_tolerance_pct = 0.5
+    intrinsic_tolerance_floor = 10.0
+    # Conservative financing/dividend allowance for European index options. Without this,
+    # spot intrinsic alone can reject a legitimate quote several days before expiry.
+    annual_carry_allowance = 0.10
 
     def __init__(self, ctx, itm_points: float, hedge_points: float | None = None) -> None:
         self._ctx = ctx
@@ -283,17 +293,21 @@ class ShortWeeklyOptionLegs:
         self.set_desired(-1)
         await self.advance(datetime.now(IST), reason or "reversal")
 
-    async def _buy_overnight(self, quantity: int, reason: str, symbol: str):
+    async def _buy_overnight(self, quantity: int, reason: str, symbol: str,
+                             option_price_guard: float | None = None):
         """Place a carry-forward option order, independent of the account default."""
-        return await self._ctx.buy(
-            quantity, reason, symbol=symbol, product=self.order_product,
-        )
+        kwargs = {"symbol": symbol, "product": self.order_product}
+        if option_price_guard is not None:
+            kwargs["option_price_guard"] = option_price_guard
+        return await self._ctx.buy(quantity, reason, **kwargs)
 
-    async def _sell_overnight(self, quantity: int, reason: str, symbol: str):
+    async def _sell_overnight(self, quantity: int, reason: str, symbol: str,
+                              option_price_guard: float | None = None):
         """Place a carry-forward option order, independent of the account default."""
-        return await self._ctx.sell(
-            quantity, reason, symbol=symbol, product=self.order_product,
-        )
+        kwargs = {"symbol": symbol, "product": self.order_product}
+        if option_price_guard is not None:
+            kwargs["option_price_guard"] = option_price_guard
+        return await self._ctx.sell(quantity, reason, **kwargs)
 
     async def _quote(self, symbol: str, side: str, now: datetime) -> QuoteSnapshot | None:
         method = getattr(self._ctx, "executable_quote", None)
@@ -310,6 +324,60 @@ class ShortWeeklyOptionLegs:
             return None
         age = abs((now.astimezone(IST) - raw.observed_at.astimezone(IST)).total_seconds())
         return raw if age <= 15 else None
+
+    def _entry_price_guard(self, contract: OptionContract, quote: QuoteSnapshot,
+                           side: str) -> tuple[float | None, str | None]:
+        """Return the worst acceptable entry price, or why this quote is not tradable.
+
+        The 13L subclass enables this hook. Other strategies retain their existing execution.
+        Production quotes contain both sides of depth; one-sided test/LTP snapshots still get
+        the intrinsic-value check for a short sale.
+        """
+        if not self.validate_entry_prices:
+            return None, None
+        spot = self._ctx.last_price
+        if not spot or quote.price <= 0:
+            return None, "spot or executable price unavailable"
+
+        allowed_spread = None
+        if quote.bid is not None or quote.ask is not None:
+            bid, ask = float(quote.bid or 0), float(quote.ask or 0)
+            if bid <= 0 or ask <= 0 or ask < bid:
+                return None, f"invalid two-sided depth (bid {bid:g}, ask {ask:g})"
+            midpoint = (bid + ask) / 2
+            allowed_spread = max(self.entry_spread_floor,
+                                 midpoint * self.entry_spread_pct / 100)
+            if ask - bid > allowed_spread:
+                return None, (
+                    f"spread {ask - bid:.2f} exceeds {allowed_spread:.2f} "
+                    f"(bid {bid:g}, ask {ask:g})"
+                )
+
+        if side == "SELL":
+            intrinsic = (max(contract.strike - spot, 0.0) if contract.kind == "PE"
+                         else max(spot - contract.strike, 0.0))
+            expiry_at = datetime.combine(contract.expiry, EXPIRY_TIME, tzinfo=IST)
+            years = max(
+                (expiry_at - quote.observed_at.astimezone(IST)).total_seconds(), 0.0,
+            ) / SECONDS_PER_YEAR
+            carry = contract.strike * self.annual_carry_allowance * years
+            tolerance = max(self.intrinsic_tolerance_floor,
+                            intrinsic * self.intrinsic_tolerance_pct / 100)
+            floor = max(intrinsic - carry - tolerance, 0.05)
+            if quote.price < floor:
+                return None, (
+                    f"bid {quote.price:.2f} is below protected floor {floor:.2f} "
+                    f"(intrinsic {intrinsic:.2f}, carry allowance {carry:.2f})"
+                )
+            return floor, None
+
+        # A valid two-sided spread bounds what the hedge may cost. With a test/LTP-only quote,
+        # retain that observed price as the ceiling; live execution always supplies depth.
+        ceiling = ((quote.bid or 0) + allowed_spread
+                   if allowed_spread is not None else quote.price)
+        if quote.price > ceiling:
+            return None, f"ask {quote.price:.2f} exceeds protected ceiling {ceiling:.2f}"
+        return ceiling, None
 
     async def _contracts(self) -> list[OptionContract]:
         contracts = await self._ctx.option_contracts()
@@ -411,16 +479,22 @@ class ShortWeeklyOptionLegs:
         self.hedge_symbol = contract.symbol
         await self._save_leg_state()
         if held < target_quantity:
-            if self.require_fresh_hedge_quote and (
-                now is None or await self._quote(contract.symbol, "BUY", now) is None
-            ):
-                self._ctx.log("entry deferred: current hedge ask unavailable or stale")
-                return False
+            price_guard = None
+            if self.require_fresh_hedge_quote:
+                quote = (await self._quote(contract.symbol, "BUY", now)
+                         if now is not None else None)
+                if quote is None:
+                    self._ctx.log("entry deferred: current hedge ask unavailable or stale")
+                    return False
+                price_guard, problem = self._entry_price_guard(contract, quote, "BUY")
+                if problem:
+                    self._ctx.log(f"entry deferred: invalid hedge price: {problem}")
+                    return False
             await self._buy_overnight(
                 target_quantity - held,
                 f"margin hedge; buy {kind} {contract.strike:g} "
                 f"({self.hedge_points:g} points OTM) expiring {contract.expiry:%d %b}",
-                contract.symbol,
+                contract.symbol, option_price_guard=price_guard,
             )
         elif held > target_quantity:
             await self._sell_overnight(
@@ -520,8 +594,13 @@ class ShortWeeklyOptionLegs:
         if contract is None:
             self._ctx.log(f"{reason} deferred: no fresh current-week {kind} contract")
             return False
-        if await self._quote(contract.symbol, "SELL", now) is None:
+        quote = await self._quote(contract.symbol, "SELL", now)
+        if quote is None:
             self._ctx.log(f"{reason} deferred: replacement quote unavailable or stale")
+            return False
+        _, problem = self._entry_price_guard(contract, quote, "SELL")
+        if problem:
+            self._ctx.log(f"{reason} deferred: invalid replacement price: {problem}")
             return False
         hedge = await self._select_hedge(kind, contract.expiry)
         if hedge is None:
@@ -529,6 +608,19 @@ class ShortWeeklyOptionLegs:
                 f"{reason} deferred: {self.hedge_points:g}-point OTM {kind} hedge unavailable"
             )
             return False
+        # A reset must not cover the existing short and only then discover that the required
+        # replacement hedge is untradeable. If the selected hedge is not already held in full,
+        # validate its ask before marking the old option for replacement.
+        held_hedge = self._long_options().get(hedge.symbol, 0)
+        if self.require_fresh_hedge_quote and held_hedge < self.option_quantity:
+            hedge_quote = await self._quote(hedge.symbol, "BUY", now)
+            if hedge_quote is None:
+                self._ctx.log(f"{reason} deferred: hedge ask unavailable or stale")
+                return False
+            _, problem = self._entry_price_guard(hedge, hedge_quote, "BUY")
+            if problem:
+                self._ctx.log(f"{reason} deferred: invalid hedge price: {problem}")
+                return False
         self.pending_contract, self.pending_reason = contract, reason
         self.pending_hedge_contract = hedge
         return True
@@ -752,6 +844,11 @@ class ShortWeeklyOptionLegs:
         if quote is None:
             self._ctx.log("entry deferred: executable option quote unavailable or stale")
             return
+        short_price_guard, problem = self._entry_price_guard(contract, quote, "SELL")
+        if problem:
+            self.pending_contract = self.pending_hedge_contract = self.pending_reason = None
+            self._ctx.log(f"entry deferred: invalid short price: {problem}")
+            return
         try:
             calculated = self._classify_reset(
                 contract.kind, contract.strike, self._ctx.last_price,
@@ -785,7 +882,7 @@ class ShortWeeklyOptionLegs:
             self.option_quantity,
             f"{event}; short {wanted} {contract.strike:g} {contract.expiry:%d %b}; "
             f"reset ₹{self.frozen.reset_level:g}; {self.option_quantity} units",
-            contract.symbol,
+            contract.symbol, option_price_guard=short_price_guard,
         )
         if self._margin_rejection(result):
             await self._retry_with_closer_hedge(contract, event)

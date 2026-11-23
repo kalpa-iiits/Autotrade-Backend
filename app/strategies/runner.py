@@ -70,6 +70,17 @@ def option_limit_price(price: float, side: Side, buffer_pct: float) -> float:
     return float(max(ticks, 1) * OPTION_TICK)
 
 
+def option_guard_price(price: float, side: Side) -> float:
+    """Round a worst acceptable option-entry price inward to the exchange tick.
+
+    A buy ceiling rounds down so it is never exceeded; a sell floor rounds up so the order
+    never accepts less than the strategy validated.
+    """
+    raw = Decimal(str(price)) / OPTION_TICK
+    rounding = ROUND_FLOOR if side == Side.BUY else ROUND_CEILING
+    return float(max(raw.to_integral_value(rounding), 1) * OPTION_TICK)
+
+
 @dataclass
 class Clock:
     """A clock event in an instance's tick queue (see StrategyRunner._clock)."""
@@ -209,17 +220,21 @@ class StrategyContext:
 
     async def buy(self, quantity: int | None = None, reason: str | None = None,
                   symbol: str | None = None,
-                  product: Product | None = None) -> StrategySignal | None:
+                  product: Product | None = None,
+                  option_price_guard: float | None = None) -> StrategySignal | None:
         """Buy `symbol` (default: the instance's own symbol, whose ticks it receives)."""
         return await self._runner.request(
             self._inst, Side.BUY, quantity or self._sized(reason), reason, symbol, product,
+            option_price_guard,
         )
 
     async def sell(self, quantity: int | None = None, reason: str | None = None,
                    symbol: str | None = None,
-                   product: Product | None = None) -> StrategySignal | None:
+                   product: Product | None = None,
+                   option_price_guard: float | None = None) -> StrategySignal | None:
         return await self._runner.request(
             self._inst, Side.SELL, quantity or self._sized(reason), reason, symbol, product,
+            option_price_guard,
         )
 
     async def option_contracts(self) -> list[OptionContract]:
@@ -248,7 +263,9 @@ class StrategyContext:
             return None
         # Avoid a runner-level import cycle during module discovery.
         from app.strategies.builtin.nifty_trailing_reversal_itm_option_seller import QuoteSnapshot
-        return QuoteSnapshot(float(price), utcnow(), "depth")
+        return QuoteSnapshot(
+            float(price), utcnow(), "depth", bid=float(depth.bid), ask=float(depth.ask),
+        )
 
     async def latest_option_fill(self, symbol: str, after: datetime) -> float | None:
         """Most recent completed sell fill for this instance's option audit trail."""
@@ -829,7 +846,8 @@ class StrategyRunner:
 
     async def request(self, inst: RunningInstance, side: Side, quantity: int, reason: str | None,
                       symbol: str | None = None,
-                      product: Product | None = None) -> StrategySignal | None:
+                      product: Product | None = None,
+                      option_price_guard: float | None = None) -> StrategySignal | None:
         """Place an order on `symbol` (default the configured instrument) and record it.
 
         Ordinary strategies keep one aggregate position. Multi-leg strategies can mark their
@@ -852,7 +870,9 @@ class StrategyRunner:
                 signal.outcome, signal.message = "blocked", blocked
             else:
                 inst.last_fill_price = None
-                await self._place(inst, side, quantity, signal, product)
+                await self._place(
+                    inst, side, quantity, signal, product, option_price_guard,
+                )
             if symbol != inst.symbol and side == Side.BUY and signal.outcome == "placed":
                 inst.held_symbol = symbol
             await self._record(signal, inst.account_id)
@@ -902,7 +922,8 @@ class StrategyRunner:
         return position > 0 if side == Side.SELL else position < 0
 
     async def _place(self, inst: RunningInstance, side: Side, quantity: int,
-                     signal: StrategySignal, product: Product | None = None) -> None:
+                     signal: StrategySignal, product: Product | None = None,
+                     option_price_guard: float | None = None) -> None:
         service = self.service(inst.account_id)
         signal.broker = service.name
         order_type, limit_price = OrderType.MARKET, None
@@ -915,6 +936,11 @@ class StrategyRunner:
                     inst.account_id, signal.symbol, side, buffer_pct):
                 order_type = OrderType.LIMIT
                 limit_price, basis = priced
+                if option_price_guard is not None and not closing:
+                    guard = option_guard_price(option_price_guard, side)
+                    limit_price = (min(limit_price, guard) if side == Side.BUY
+                                   else max(limit_price, guard))
+                    basis += f"; protected at {guard:g}"
                 signal.message = f"Limit {limit_price:.2f} ({basis})"
             else:
                 signal.outcome = "rejected"
@@ -943,7 +969,10 @@ class StrategyRunner:
         if order.status not in TERMINAL:
             inst.pending_order_id = order.id
             if order_type == OrderType.LIMIT:
-                task = asyncio.create_task(self._chase(inst, order.id, signal.symbol, side, limit_price, closing))
+                task = asyncio.create_task(self._chase(
+                    inst, order.id, signal.symbol, side, limit_price, closing,
+                    option_price_guard,
+                ))
                 self._chases.add(task)
                 task.add_done_callback(self._chases.discard)
         # Apply what we know now, plus any update that raced ahead of place_order returning.
@@ -952,7 +981,8 @@ class StrategyRunner:
             self._apply_order(inst, early)
 
     async def _chase(self, inst: RunningInstance, order_id: str, symbol: str, side: Side,
-                     first_limit: float, closing: bool) -> None:
+                     first_limit: float, closing: bool,
+                     option_price_guard: float | None = None) -> None:
         """Keep an unfilled option order where it can fill. Entries and protective exits check
         a fresh book immediately and then at their configured short intervals.
         If the best ask (buying) or bid (selling) + buffer has moved past the limit, move the
@@ -963,6 +993,9 @@ class StrategyRunner:
         cfg = self.settings
         sign = 1 if side == Side.BUY else -1  # "further" = higher to buy, lower to sell
         cap = first_limit * (1 + sign * cfg.option_entry_max_chase_pct / 100)
+        if option_price_guard is not None and not closing:
+            guard = option_guard_price(option_price_guard, side)
+            cap = min(cap, guard) if side == Side.BUY else max(cap, guard)
         limit, checks, first_check = first_limit, 0, True
         while True:
             if not first_check:
@@ -982,6 +1015,9 @@ class StrategyRunner:
                     inst.account_id, symbol, side, buffer_pct=buffer_pct)
                 target = priced[0] if priced else None
                 if not closing:
+                    if target is not None and option_price_guard is not None:
+                        target = (min(target, guard) if side == Side.BUY
+                                  else max(target, guard))
                     if checks > cfg.option_entry_max_reprices:
                         await self._cancel_unfilled(inst, order_id, f"entry unfilled after {checks - 1} checks")
                         return

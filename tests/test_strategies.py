@@ -366,6 +366,20 @@ def test_option_entry_and_exit_use_depth_priced_limits(options):
     assert instance(quiet, inst["id"])["position"] == 0
 
 
+def test_option_entry_price_guard_clamps_order_and_chase(options):
+    quiet, inst = options()
+    # The book ask is 200 and the normal entry buffer would submit 201. The strategy-level
+    # ceiling must win, leaving a patient limit rather than paying an invalid price.
+    SCRIPT.append(("buy", None, "guarded entry", OPT, None, 199.50))
+
+    tick(quiet)
+
+    assert option_orders(quiet) == [("BUY", 199.50, "OPEN")]
+    assert signals(quiet, inst["id"])[0]["message"] == (
+        "Limit 199.50 (ask 200; protected at 199.5)"
+    )
+
+
 def test_without_depth_option_orders_use_ltp_for_a_protected_limit(options, monkeypatch):
     from app.brokers.paper import PaperBroker
 

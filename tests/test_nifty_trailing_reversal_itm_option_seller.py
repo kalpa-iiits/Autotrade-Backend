@@ -34,6 +34,7 @@ class OptionSellerContext:
         self.order_pending = False
         self.strategy_state = {}
         self.orders = []
+        self.price_guards = []
         self.logs = []
         self.quotes = {}
         self.contracts = [
@@ -51,16 +52,20 @@ class OptionSellerContext:
     async def save_strategy_state(self, state):
         self.strategy_state = dict(state)
 
-    async def buy(self, quantity=None, reason=None, symbol=None, product=None):
+    async def buy(self, quantity=None, reason=None, symbol=None, product=None,
+                  option_price_guard=None):
         self.orders.append(("BUY", quantity, symbol, product))
+        self.price_guards.append(("BUY", symbol, option_price_guard))
         updated = self.positions.get(symbol, 0) + quantity
         if updated:
             self.positions[symbol] = updated
         else:
             self.positions.pop(symbol, None)
 
-    async def sell(self, quantity=None, reason=None, symbol=None, product=None):
+    async def sell(self, quantity=None, reason=None, symbol=None, product=None,
+                   option_price_guard=None):
         self.orders.append(("SELL", quantity, symbol, product))
+        self.price_guards.append(("SELL", symbol, option_price_guard))
         updated = self.positions.get(symbol, 0) - quantity
         if updated:
             self.positions[symbol] = updated
@@ -291,6 +296,75 @@ def test_13l_uses_next_deeper_itm_100_strike_when_target_is_between_strikes():
     assert ce_ctx.orders[-1] == (
         "SELL", 65, "NSE:NIFTY26N2424100CE", Product.DELIVERY,
     )
+
+
+def test_13l_scans_1000_900_800_itm_and_submits_full_quantity_at_valid_prices():
+    from app.strategies.builtin.nifty_adaptive_premium_reset_13l import (
+        StrictHundredStrikeWeeklyOptionLegs,
+    )
+
+    class DepthContext(OptionSellerContext):
+        async def executable_quote(self, symbol, side):
+            books = {
+                # The opening 1000-ITM book is both below its intrinsic floor and too wide.
+                "NSE:NIFTY26N2426000PE": (900, 1_000),
+                "NSE:NIFTY26N2425900PE": (850, 950),
+                "NSE:NIFTY26N2425800PE": (805, 810),
+                "NSE:NIFTY26N2424200PE": (45, 50),
+            }
+            book = books.get(symbol)
+            if book is None:
+                return None
+            bid, ask = book
+            return QuoteSnapshot(
+                bid if side == "SELL" else ask, AT, "depth", bid=bid, ask=ask,
+            )
+
+    ctx = DepthContext(quantity=130)
+    legs = StrictHundredStrikeWeeklyOptionLegs(ctx, 900)
+    legs.set_desired(1)
+
+    asyncio.run(legs.advance(AT, "initial LONG"))
+
+    assert ctx.orders == [
+        ("BUY", 130, "NSE:NIFTY26N2424200PE", Product.DELIVERY),
+        ("SELL", 130, "NSE:NIFTY26N2425800PE", Product.DELIVERY),
+    ]
+    assert ctx.price_guards[0] == (
+        "BUY", "NSE:NIFTY26N2424200PE", pytest.approx(55),
+    )
+    assert ctx.price_guards[1][:2] == ("SELL", "NSE:NIFTY26N2425800PE")
+    assert 750 < ctx.price_guards[1][2] < 770  # intrinsic less four days' carry and tolerance
+    assert any("1000-ITM" in message and "skipped" in message for message in ctx.logs)
+    assert any("900-ITM" in message and "skipped" in message for message in ctx.logs)
+    assert any("800-ITM" in message and "selected" in message for message in ctx.logs)
+
+
+def test_13l_rejects_overpriced_hedge_before_opening_short():
+    from app.strategies.builtin.nifty_adaptive_premium_reset_13l import (
+        StrictHundredStrikeWeeklyOptionLegs,
+    )
+
+    class BadHedgeContext(OptionSellerContext):
+        async def executable_quote(self, symbol, side):
+            if symbol == "NSE:NIFTY26N2426000PE":
+                bid, ask = 1_005, 1_010
+            elif symbol == "NSE:NIFTY26N2424200PE":
+                bid, ask = 1, 100
+            else:
+                return None
+            return QuoteSnapshot(
+                bid if side == "SELL" else ask, AT, "depth", bid=bid, ask=ask,
+            )
+
+    ctx = BadHedgeContext(quantity=130)
+    legs = StrictHundredStrikeWeeklyOptionLegs(ctx, 900)
+    legs.set_desired(1)
+
+    asyncio.run(legs.advance(AT, "initial LONG"))
+
+    assert not ctx.orders
+    assert any("invalid hedge price" in message for message in ctx.logs)
 
 
 def test_13l_exits_holiday_expiry_on_previous_nse_session_at_1510():
@@ -705,6 +779,51 @@ def test_13l_overnight_gap_below_700_resets_from_first_0915_clock_check():
     ]
     assert ctx.positions == {replacement: -65, replacement_hedge: 65}
     assert not legs.reset_pending
+
+
+def test_13l_gap_reset_keeps_old_short_when_required_hedge_price_is_invalid():
+    from app.strategies.builtin.nifty_adaptive_premium_reset_13l import (
+        StrictHundredStrikeWeeklyOptionLegs,
+    )
+
+    old = "NSE:NIFTY26N2425900PE"
+    old_hedge = "NSE:NIFTY26N2424200PE"
+    replacement = "NSE:NIFTY26N2426500PE"
+    replacement_hedge = "NSE:NIFTY26N2424700PE"
+    at = datetime(2026, 11, 20, 9, 15, tzinfo=IST)
+
+    class GapDepthContext(OptionSellerContext):
+        async def executable_quote(self, symbol, side):
+            books = {
+                old: (690, 699),
+                replacement: (1_005, 1_010),
+                # A valid replacement short must not cause the old leg to be covered when the
+                # new hedge would require paying through an abnormal book.
+                replacement_hedge: (1, 100),
+            }
+            book = books.get(symbol)
+            if book is None:
+                return None
+            bid, ask = book
+            return QuoteSnapshot(
+                bid if side == "SELL" else ask, at, "depth", bid=bid, ask=ask,
+            )
+
+    ctx = GapDepthContext({old: -130, old_hedge: 130}, quantity=130)
+    ctx.last_price = 25_500
+    legs = StrictHundredStrikeWeeklyOptionLegs(ctx, 900)
+    legs.hedge_symbol = old_hedge
+    legs.desired_direction = 1
+    legs.frozen = legs._classify_reset("PE", 25_900, 25_000, 900, EXPIRY, AT)
+    legs.reset_armed = True
+
+    asyncio.run(legs.monitor_reset(at))
+
+    assert legs.reset_pending
+    assert legs.replace_symbol is None
+    assert not ctx.orders
+    assert ctx.positions == {old: -130, old_hedge: 130}
+    assert any("reset deferred: invalid hedge price" in message for message in ctx.logs)
 
 
 def test_premium_reset_explicitly_keeps_the_held_expiry():
