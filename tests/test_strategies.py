@@ -314,6 +314,27 @@ def wait(client, seconds=0.15):
     run(client, asyncio.sleep, seconds)
 
 
+def test_strategy_basket_places_and_accounts_for_each_leg(options):
+    quiet, inst = options(max_position=65, max_order_qty=65)
+    other = "NSE:NIFTY26N0425000PE"
+    runtime(quiet).service.broker.prices[other] = 195.0
+    SCRIPT.append(("basket", [
+        {"side": "BUY", "quantity": 65, "symbol": OPT, "product": Product.DELIVERY},
+        {"side": "SELL", "quantity": 65, "symbol": other, "product": Product.DELIVERY},
+    ], "synthetic entry"))
+
+    tick(quiet)
+
+    placed = signals(quiet, inst["id"])
+    assert [(signal["side"], signal["symbol"], signal["outcome"]) for signal in placed] == [
+        ("SELL", other, "placed"),
+        ("BUY", OPT, "placed"),
+    ]
+    running = quiet.app.state.strategy_runner.running[inst["id"]]
+    assert running.positions == {OPT: 65, other: -65}
+    assert not running.pending_order_ids
+
+
 @pytest.mark.parametrize(("side", "position", "closing"), [
     ("SELL", 0, False),     # opening a short
     ("SELL", -30, False),   # increasing a partially filled short

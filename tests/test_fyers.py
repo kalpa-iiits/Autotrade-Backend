@@ -16,6 +16,7 @@ from app.orders.schemas import OrderStatus, OrderType, PlaceOrder, Side
 class FakeModel:
     def __init__(self):
         self.placed = []
+        self.baskets = []
         self.cancel_ok = True
         self.modified = []
         self.history_requests = []
@@ -26,6 +27,17 @@ class FakeModel:
         if data["symbol"] == "NSE:BAD-EQ":
             return {"s": "error", "code": -50, "message": "Invalid symbol"}
         return {"s": "ok", "code": 1101, "id": "2410250001", "message": "Order submitted"}
+
+    def place_basket_orders(self, data):
+        self.baskets.append(data)
+        return {"s": "ok", "code": 200, "message": "", "data": [
+            {
+                "statusCode": 200,
+                "statusDescription": "HTTP OK",
+                "body": {"s": "ok", "code": 1101, "id": f"basket-{index}"},
+            }
+            for index, _ in enumerate(data, 1)
+        ]}
 
     def modify_order(self, data):
         self.modified.append(data)
@@ -192,6 +204,54 @@ def test_place_order_maps_payload_and_tracks_socket_updates():
         assert data_sock.closed and order_sock.closed
 
     asyncio.run(run())
+
+
+def test_place_orders_uses_fyers_native_multi_order_and_preserves_leg_results():
+    async def run():
+        broker, model = make_broker()
+        orders = await broker.place_orders([
+            PlaceOrder(
+                action="place_order", symbol="NSE:NIFTY26N2425000CE",
+                side=Side.BUY, quantity=65, order_type=OrderType.LIMIT,
+                limit_price=210, client_order_id="basketleg1",
+            ),
+            PlaceOrder(
+                action="place_order", symbol="NSE:NIFTY26N2425000PE",
+                side=Side.SELL, quantity=65, order_type=OrderType.LIMIT,
+                limit_price=205, client_order_id="basketleg2",
+            ),
+        ])
+        return orders, model
+
+    orders, model = asyncio.run(run())
+
+    assert [order.id for order in orders] == ["basket-1", "basket-2"]
+    assert len(model.baskets) == 1 and len(model.baskets[0]) == 2
+    assert [leg["side"] for leg in model.baskets[0]] == [1, -1]
+    assert [leg["orderTag"] for leg in model.baskets[0]] == ["basketleg1", "basketleg2"]
+
+
+def test_place_orders_reports_a_rejected_fyers_basket_leg_independently():
+    broker, model = make_broker()
+
+    def partial(data):
+        return {"s": "ok", "data": [
+            {"statusCode": 200, "body": {"s": "ok", "id": "accepted"}},
+            {"statusCode": 400, "statusDescription": "400 Bad Request",
+             "body": {"s": "error", "message": "insufficient margin"}},
+        ]}
+
+    model.place_basket_orders = partial
+    requests = [
+        PlaceOrder(action="place_order", symbol="NSE:A-EQ", side=Side.BUY, quantity=1),
+        PlaceOrder(action="place_order", symbol="NSE:B-EQ", side=Side.SELL, quantity=1),
+    ]
+
+    orders = asyncio.run(broker.place_orders(requests))
+
+    assert orders[0].id == "accepted" and orders[0].status == OrderStatus.OPEN
+    assert orders[1].status == OrderStatus.REJECTED
+    assert orders[1].reason == "insufficient margin"
 
 
 def test_rejected_and_cancel():

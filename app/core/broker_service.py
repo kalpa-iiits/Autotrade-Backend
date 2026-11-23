@@ -207,6 +207,43 @@ class BrokerService:
         # Shielded: a caller that goes away (closed request) doesn't abandon a half-sent order.
         return await asyncio.shield(task)
 
+    async def place_orders(self, requests: list[PlaceOrder]) -> list[Order]:
+        """Place a related basket with per-leg idempotency and rate accounting."""
+        if not requests:
+            return []
+        broker = self.require()
+        prepared = [
+            request if request.client_order_id is not None else request.model_copy(
+                update={"client_order_id": new_client_order_id()},
+            )
+            for request in requests
+        ]
+        # Mixed retries are safer through the mature single-order recovery path: each known or
+        # unknown client id is checked against the ledger/orderbook before anything is resent.
+        existing = [
+            await find_by_client_order_id(self.account_id, request.client_order_id)
+            for request in prepared
+        ]
+        if any(existing) or any(
+            request.client_order_id in self._unknown_outcome for request in prepared
+        ):
+            return [await self.place_order(request) for request in prepared]
+        for _ in prepared:
+            await self._orders_limit.acquire()
+        try:
+            orders = await broker.place_orders(prepared)
+        except OrderError:
+            raise
+        except Exception:
+            self._unknown_outcome.update(request.client_order_id for request in prepared)
+            raise
+        if len(orders) != len(prepared):
+            self._unknown_outcome.update(request.client_order_id for request in prepared)
+            raise OrderError("Broker basket response did not contain every submitted leg")
+        for request in prepared:
+            self._unknown_outcome.discard(request.client_order_id)
+        return orders
+
     async def _place_once(self, broker: Broker, req: PlaceOrder) -> Order:
         cid = req.client_order_id
         # Already placed: the trade ledger recorded it when the broker reported it.

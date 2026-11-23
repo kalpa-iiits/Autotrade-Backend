@@ -90,8 +90,8 @@ class OptionSellerContext:
                 "NSE:NIFTY26N2424200PE": 20,
             },
             [
-                ("BUY", 65, "NSE:NIFTY26N2425000CE", Product.DELIVERY),
                 ("BUY", 65, "NSE:NIFTY26N2424200PE", Product.DELIVERY),
+                ("BUY", 65, "NSE:NIFTY26N2425000CE", Product.DELIVERY),
                 ("SELL", 65, "NSE:NIFTY26N2425000PE", Product.DELIVERY),
             ],
         ),
@@ -103,8 +103,8 @@ class OptionSellerContext:
                 "NSE:NIFTY26N2425800CE": 20,
             },
             [
-                ("BUY", 65, "NSE:NIFTY26N2425000PE", Product.DELIVERY),
                 ("BUY", 65, "NSE:NIFTY26N2425800CE", Product.DELIVERY),
+                ("BUY", 65, "NSE:NIFTY26N2425000PE", Product.DELIVERY),
                 ("SELL", 65, "NSE:NIFTY26N2425000CE", Product.DELIVERY),
             ],
         ),
@@ -126,6 +126,59 @@ def test_13l_synthetic_pair_keeps_the_existing_otm_margin_hedge(direction, quote
     assert ctx.orders == expected
     assert legs.position == direction * 65
     assert legs.hedge_points == 800
+
+
+def test_13l_uses_baskets_for_atm_entry_and_complete_exit_after_hedge_fill():
+    class BasketContext(OptionSellerContext):
+        def __init__(self):
+            super().__init__()
+            self.baskets = []
+
+        async def basket(self, legs, reason=None):
+            self.baskets.append((legs, reason))
+            results = []
+            for leg in legs:
+                method = self.buy if leg["side"] == "BUY" else self.sell
+                await method(
+                    leg["quantity"], reason, leg["symbol"], leg.get("product"),
+                    leg.get("option_price_guard"),
+                )
+                results.append(SimpleNamespace(outcome="placed", message=None))
+            return results
+
+    ctx = BasketContext()
+    ctx.quotes.update({
+        "NSE:NIFTY26N2425000CE": 210,
+        "NSE:NIFTY26N2425000PE": 205,
+        "NSE:NIFTY26N2424200PE": 20,
+    })
+    legs = SyntheticWeeklyOptionLegs(ctx)
+    legs.set_desired(1)
+
+    async def enter_and_exit():
+        await legs.advance(AT, "initial LONG")  # hedge only
+        assert not ctx.baskets
+        await legs.advance(AT, "initial LONG")  # two ATM legs in one basket
+        legs.set_desired(0)
+        await legs.advance(AT, "exit synthetic")
+
+    asyncio.run(enter_and_exit())
+
+    assert ctx.orders[0] == (
+        "BUY", 65, "NSE:NIFTY26N2424200PE", Product.DELIVERY,
+    )
+    entry_legs = ctx.baskets[0][0]
+    assert [(leg["side"], leg["symbol"]) for leg in entry_legs] == [
+        ("BUY", "NSE:NIFTY26N2425000CE"),
+        ("SELL", "NSE:NIFTY26N2425000PE"),
+    ]
+    exit_legs = ctx.baskets[1][0]
+    assert [(leg["side"], leg["symbol"]) for leg in exit_legs] == [
+        ("BUY", "NSE:NIFTY26N2425000PE"),
+        ("SELL", "NSE:NIFTY26N2424200PE"),
+        ("SELL", "NSE:NIFTY26N2425000CE"),
+    ]
+    assert ctx.positions == {}
 
 
 def test_13l_synthetic_reversal_closes_old_pair_and_hedge_before_new_atm_pair():
@@ -154,8 +207,8 @@ def test_13l_synthetic_reversal_closes_old_pair_and_hedge_before_new_atm_pair():
         ("SELL", 65, "NSE:NIFTY26N2425000CE", Product.DELIVERY),
     ]
     assert ctx.orders[-3:] == [
-        ("BUY", 65, "NSE:NIFTY26N2425000PE", Product.DELIVERY),
         ("BUY", 65, "NSE:NIFTY26N2425800CE", Product.DELIVERY),
+        ("BUY", 65, "NSE:NIFTY26N2425000PE", Product.DELIVERY),
         ("SELL", 65, "NSE:NIFTY26N2425000CE", Product.DELIVERY),
     ]
     assert legs.position == -65

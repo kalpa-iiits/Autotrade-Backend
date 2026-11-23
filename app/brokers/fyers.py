@@ -612,6 +612,70 @@ class FyersBroker(Broker):
         # reply: then the socket's state is newer and is what we return.
         return await self._record(order)
 
+    async def place_orders(self, requests: list[PlaceOrder]) -> list[Order]:
+        """Use FYERS Multi Order so related legs share one API round trip.
+
+        FYERS still validates every leg independently, so the returned orders deliberately keep
+        each leg's accepted/rejected state instead of treating the basket as atomic.
+        """
+        if not requests:
+            return []
+        payloads = []
+        for req in requests:
+            payload = {
+                "symbol": req.symbol,
+                "qty": req.quantity,
+                "type": FYERS_ORDER_TYPE[req.order_type],
+                "side": FYERS_SIDE[req.side],
+                "productType": _product_type(req, self.product_type),
+                "limitPrice": req.limit_price or 0,
+                "stopPrice": req.trigger_price or 0,
+                "validity": "DAY",
+                "disclosedQty": 0,
+                "offlineOrder": False,
+            }
+            if req.client_order_id:
+                payload["orderTag"] = req.client_order_id
+            payloads.append(payload)
+        response = await asyncio.to_thread(self._model.place_basket_orders, payloads)
+        results = response.get("data") if isinstance(response, dict) else None
+        if not isinstance(results, list) or len(results) != len(requests):
+            message = (response.get("message") if isinstance(response, dict) else None)
+            raise OrderError(message or "FYERS Multi Order returned an invalid response")
+        if any(
+            isinstance(result, dict)
+            and isinstance(result.get("body"), dict)
+            and result["body"].get("code") == 201
+            and not result["body"].get("id")
+            for result in results
+        ):
+            # FYERS documents code 201 as submitted without acknowledgement. Treat the entire
+            # request as unknown so BrokerService checks every orderTag before any retry.
+            raise ConnectionError("FYERS Multi Order acknowledgement unavailable")
+
+        orders = []
+        for req, result in zip(requests, results, strict=True):
+            body = result.get("body") if isinstance(result, dict) else None
+            body = body if isinstance(body, dict) else {}
+            description = result.get("statusDescription") if isinstance(result, dict) else None
+            order = Order(
+                client_order_id=req.client_order_id,
+                symbol=req.symbol,
+                side=req.side,
+                quantity=req.quantity,
+                order_type=req.order_type,
+                limit_price=req.limit_price,
+                trigger_price=req.trigger_price,
+                product=req.product,
+            )
+            if body.get("s") == "ok" and body.get("id"):
+                order.id = str(body["id"])
+            else:
+                order.status = OrderStatus.REJECTED
+                order.reason = body.get("message") or description or "Order rejected by Fyers"
+            orders.append(await self._record(order))
+        return orders
+
     async def cancel_order(self, order_id: str) -> Order:
         resp = await asyncio.to_thread(self._model.cancel_order, {"id": order_id})
         if resp.get("s") != "ok":

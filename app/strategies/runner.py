@@ -191,7 +191,7 @@ class StrategyContext:
     @property
     def order_pending(self) -> bool:
         """Whether this strategy instance currently has a non-terminal broker order."""
-        return self._inst.pending_order_id is not None
+        return bool(self._inst.pending_order_ids)
 
     @property
     def entry_orders_available(self) -> bool:
@@ -236,6 +236,10 @@ class StrategyContext:
             self._inst, Side.SELL, quantity or self._sized(reason), reason, symbol, product,
             option_price_guard,
         )
+
+    async def basket(self, legs: list[dict], reason: str | None = None) -> list[StrategySignal]:
+        """Place related strategy legs in one broker request when that broker supports it."""
+        return await self._runner.request_basket(self._inst, legs, reason)
 
     async def option_contracts(self) -> list[OptionContract]:
         """Options listed on the instance's symbol, from its broker."""
@@ -335,7 +339,7 @@ class RunningInstance:
         self.last_fill_price: float | None = None
         self.held_symbol: str | None = None  # another instrument it bought (an option), if any
         self.strategy_state: dict = dict(config.strategy_state or {})
-        self.pending_order_id: str | None = None
+        self.pending_order_ids: set[str] = set()
         self.filled: dict[str, int] = {}  # order id -> filled qty already counted
         self._orders_day = _today_ist()
         self._orders_count = 0
@@ -344,6 +348,15 @@ class RunningInstance:
         self.worker: asyncio.Task | None = None
         self.clock: asyncio.Task | None = None
         self.dropped_ticks = 0
+
+    @property
+    def pending_order_id(self) -> str | None:
+        """Compatibility view for code and tests that expect at most one pending order."""
+        return next(iter(self.pending_order_ids), None)
+
+    @pending_order_id.setter
+    def pending_order_id(self, value: str | None) -> None:
+        self.pending_order_ids = {value} if value is not None else set()
 
     def enqueue(self, tick: Tick | Clock) -> None:
         if self.ticks.full():
@@ -486,7 +499,7 @@ class StrategyRunner:
             inst.tick_size = await service.broker.get_tick_size(config.symbol)
             if config.size_mode == "capital":
                 inst.lot_size = await service.broker.get_lot_size(config.symbol) or 1
-        (inst.position, inst.positions, inst.filled, inst.pending_order_id,
+        (inst.position, inst.positions, inst.filled, inst.pending_order_ids,
          inst.last_fill_price) = await self._load_position(
             config, primary_symbol_only=dep.strategy.primary_symbol_only,
         )
@@ -783,10 +796,8 @@ class StrategyRunner:
             self._apply_order(self.running[owner], order)
 
     def _apply_order(self, inst: RunningInstance, order: Order) -> None:
-        pending_finished = order.status in TERMINAL and inst.pending_order_id == order.id
+        pending_finished = order.status in TERMINAL and order.id in inst.pending_order_ids
         symbol_position = inst.positions.get(order.symbol, 0)
-        was_closing = ((order.side == Side.SELL and symbol_position > 0)
-                       or (order.side == Side.BUY and symbol_position < 0))
         filled = order.filled_quantity or (order.quantity if order.status == OrderStatus.FILLED else 0)
         new = filled - inst.filled.get(order.id, 0)
         if new > 0:
@@ -803,10 +814,10 @@ class StrategyRunner:
             if order.filled_price is not None and (tracks_primary or order.symbol == inst.symbol):
                 inst.last_fill_price = float(order.filled_price)
         if pending_finished:
-            inst.pending_order_id = None
+            inst.pending_order_ids.discard(order.id)
             # Keep strategy callbacks single-threaded: enqueue the wake-up instead of calling
             # the strategy concurrently from the broker's order-update callback.
-            if was_closing and inst.worker is not None and not inst.worker.done():
+            if not inst.pending_order_ids and inst.worker is not None and not inst.worker.done():
                 inst.enqueue(Clock(utcnow()))
 
     # ---------- trade requests ----------
@@ -821,8 +832,8 @@ class StrategyRunner:
             return f"Broker not connected: {service.not_connected_reason}"
         if not service.records_reliable():
             return "Trade ledger has unsaved order updates (see /health); orders paused"
-        if inst.pending_order_id:
-            return f"Order {inst.pending_order_id} is still open"
+        if inst.pending_order_ids:
+            return f"Orders {sorted(inst.pending_order_ids)} are still open"
         auxiliary = bool(
             inst.strategy and inst.strategy.primary_symbol_only and symbol != inst.symbol
         )
@@ -877,6 +888,119 @@ class StrategyRunner:
                 inst.held_symbol = symbol
             await self._record(signal, inst.account_id)
             return signal
+
+    async def request_basket(
+        self, inst: RunningInstance, legs: list[dict], reason: str | None = None,
+    ) -> list[StrategySignal]:
+        """Validate, price and place related legs through the broker's basket capability."""
+        if not legs:
+            return []
+        async with inst.lock:
+            prepared: list[tuple[StrategySignal, PlaceOrder, bool, float | None]] = []
+            signals: list[StrategySignal] = []
+            for leg in legs:
+                side = leg["side"] if isinstance(leg["side"], Side) else Side(leg["side"])
+                quantity = int(leg["quantity"])
+                symbol = str(leg["symbol"])
+                signal = StrategySignal(
+                    instance_id=inst.id, symbol=symbol, side=side.value, quantity=quantity,
+                    price=None, reason=(reason or "")[:512] or None,
+                )
+                signals.append(signal)
+                if quantity <= 0:
+                    signal.outcome, signal.message = "blocked", "Quantity must be positive"
+                    continue
+                if blocked := self._check(inst, side, quantity, symbol):
+                    signal.outcome, signal.message = "blocked", blocked
+                    continue
+                closing = self._is_closing_order(inst, symbol, side)
+                guard = leg.get("option_price_guard")
+                order_type, limit_price = OrderType.MARKET, None
+                if OPTION_SYMBOL.search(symbol):
+                    buffer_pct = (
+                        self.settings.option_exit_limit_buffer_pct if closing
+                        else self.settings.option_limit_buffer_pct
+                    )
+                    priced = await self._option_price(
+                        inst.account_id, symbol, side, buffer_pct,
+                    )
+                    if priced is None:
+                        signal.outcome = "rejected"
+                        signal.message = "No executable ask/bid depth or LTP; basket not sent"
+                        continue
+                    order_type = OrderType.LIMIT
+                    limit_price, basis = priced
+                    if guard is not None and not closing:
+                        protected = option_guard_price(guard, side)
+                        limit_price = (
+                            min(limit_price, protected) if side == Side.BUY
+                            else max(limit_price, protected)
+                        )
+                        basis += f"; protected at {protected:g}"
+                    signal.message = f"Limit {limit_price:.2f} ({basis})"
+                prepared.append((signal, PlaceOrder(
+                    action="place_order", symbol=symbol, side=side, quantity=quantity,
+                    order_type=order_type, limit_price=limit_price,
+                    product=leg.get("product"),
+                ), closing, guard))
+
+            if len(prepared) != len(legs):
+                for signal in signals:
+                    if not signal.outcome:
+                        signal.outcome, signal.message = "blocked", "Another basket leg was invalid"
+                for signal in signals:
+                    await self._record(signal, inst.account_id)
+                return signals
+
+            risk_increasing = 0
+            for _, request, _, _ in prepared:
+                current = inst.positions.get(request.symbol, 0)
+                updated = current + (
+                    request.quantity if request.side == Side.BUY else -request.quantity
+                )
+                reduces_only = (
+                    abs(updated) < abs(current) and updated * current >= 0
+                )
+                risk_increasing += not reduces_only
+            if inst.orders_today + risk_increasing > inst.config.max_orders_per_day:
+                message = f"Basket would exceed max_orders_per_day ({inst.config.max_orders_per_day})"
+                for signal in signals:
+                    signal.outcome, signal.message = "blocked", message
+                    await self._record(signal, inst.account_id)
+                return signals
+
+            service = self.service(inst.account_id)
+            try:
+                orders = await service.place_orders([request for _, request, _, _ in prepared])
+            except Exception as exc:
+                for signal in signals:
+                    signal.outcome, signal.message = "rejected", f"Broker basket error: {exc}"
+                    await self._record(signal, inst.account_id)
+                return signals
+
+            for (signal, request, closing, guard), order in zip(prepared, orders, strict=True):
+                inst.orders_today += 1
+                signal.broker = service.name
+                signal.order_id = order.id
+                if order.status == OrderStatus.REJECTED:
+                    signal.outcome, signal.message = "rejected", order.reason
+                else:
+                    signal.outcome = "placed"
+                    self._order_owner[(inst.account_id, order.id)] = inst.id
+                    if order.status not in TERMINAL:
+                        inst.pending_order_ids.add(order.id)
+                        if request.order_type == OrderType.LIMIT:
+                            task = asyncio.create_task(self._chase(
+                                inst, order.id, signal.symbol, request.side,
+                                request.limit_price, closing, guard,
+                            ))
+                            self._chases.add(task)
+                            task.add_done_callback(self._chases.discard)
+                    self._apply_order(inst, order)
+                    if early := self._recent_orders.get((inst.account_id, order.id)):
+                        self._apply_order(inst, early)
+                await self._record(signal, inst.account_id)
+            return signals
 
     async def _quote(self, account_id: int, symbol: str) -> float | None:
         """Last price of an instrument the instance doesn't stream (e.g. the option it trades)."""
@@ -967,7 +1091,7 @@ class StrategyRunner:
         signal.outcome = "placed"
         self._order_owner[(inst.account_id, order.id)] = inst.id
         if order.status not in TERMINAL:
-            inst.pending_order_id = order.id
+            inst.pending_order_ids.add(order.id)
             if order_type == OrderType.LIMIT:
                 task = asyncio.create_task(self._chase(
                     inst, order.id, signal.symbol, side, limit_price, closing,
@@ -1002,7 +1126,7 @@ class StrategyRunner:
                 await asyncio.sleep(
                     cfg.option_exit_reprice_interval if closing else cfg.option_reprice_interval)
             first_check = False
-            if inst.pending_order_id != order_id or self.running.get(inst.id) is not inst:
+            if order_id not in inst.pending_order_ids or self.running.get(inst.id) is not inst:
                 return  # filled, cancelled or rejected; or the strategy stopped
             service = self.service(inst.account_id)
             if service is None or not service.connected:
@@ -1031,7 +1155,7 @@ class StrategyRunner:
                 try:
                     order = await service.modify_order(order_id, target)
                 except Exception as e:  # e.g. the broker's limit on modifications per order
-                    if inst.pending_order_id == order_id:
+                    if order_id in inst.pending_order_ids:
                         await self._cancel_unfilled(inst, order_id, f"could not reprice ({e})")
                     return  # an exit is sent again, fresh, by the strategy's own retry
                 log.info("Strategy %s: repriced %s order %s from %.2f to %.2f (%s)", inst.id,
@@ -1053,21 +1177,25 @@ class StrategyRunner:
 
     async def _resume_pending_option_chase(self, inst: RunningInstance) -> None:
         """A deployment restart must not leave an open option limit order unmanaged."""
-        if not inst.pending_order_id:
+        if not inst.pending_order_ids:
             return
         async with db.session() as s:
-            row = await s.get(OrderRecord, (inst.account_id, inst.pending_order_id))
-        if (row is None or row.order_type != OrderType.LIMIT.value or
-                not OPTION_SYMBOL.search(row.symbol) or row.limit_price is None):
-            return
-        side = Side(row.side)
-        closing = self._is_closing_order(inst, row.symbol, side)
-        task = asyncio.create_task(self._chase(
-            inst, row.id, row.symbol, side, float(row.limit_price), closing,
-        ))
-        self._chases.add(task)
-        task.add_done_callback(self._chases.discard)
-        log.info("Strategy %s: resumed repricing pending option order %s", inst.id, row.id)
+            rows = list(await s.scalars(select(OrderRecord).where(
+                OrderRecord.account_id == inst.account_id,
+                OrderRecord.id.in_(inst.pending_order_ids),
+            )))
+        for row in rows:
+            if (row.order_type != OrderType.LIMIT.value
+                    or not OPTION_SYMBOL.search(row.symbol) or row.limit_price is None):
+                continue
+            side = Side(row.side)
+            closing = self._is_closing_order(inst, row.symbol, side)
+            task = asyncio.create_task(self._chase(
+                inst, row.id, row.symbol, side, float(row.limit_price), closing,
+            ))
+            self._chases.add(task)
+            task.add_done_callback(self._chases.discard)
+            log.info("Strategy %s: resumed repricing pending option order %s", inst.id, row.id)
 
     # ---------- persistence ----------
 
@@ -1206,8 +1334,8 @@ class StrategyRunner:
 
     async def _load_position(
         self, config: StrategyInstance, primary_symbol_only: bool = False,
-    ) -> tuple[int, dict[str, int], dict[str, int], str | None, float | None]:
-        """Rebuild position, pending order and latest actual fill after a restart."""
+    ) -> tuple[int, dict[str, int], dict[str, int], set[str], float | None]:
+        """Rebuild positions, pending orders and latest actual fill after a restart."""
         async with db.session() as s:
             rows = (await s.execute(
                 select(OrderRecord.id, OrderRecord.symbol, OrderRecord.side, OrderRecord.filled_quantity,
@@ -1217,7 +1345,7 @@ class StrategyRunner:
                 .where(StrategySignal.instance_id == config.id, StrategySignal.outcome == "placed")
                 .order_by(StrategySignal.id)
             )).all()
-        position, positions, filled, pending, last_fill = 0, {}, {}, None, None
+        position, positions, filled, pending, last_fill = 0, {}, {}, set(), None
         for order_id, symbol, side, qty, status, fill_price in rows:
             filled[order_id] = qty or 0
             delta = (qty or 0) if side == Side.BUY.value else -(qty or 0)
@@ -1228,7 +1356,7 @@ class StrategyRunner:
                 last_fill = float(fill_price)
             if status not in {s.value for s in TERMINAL}:
                 self._order_owner[(config.account_id, order_id)] = config.id
-                pending = order_id
+                pending.add(order_id)
         positions = {symbol: quantity for symbol, quantity in positions.items() if quantity}
         return position, positions, filled, pending, last_fill
 

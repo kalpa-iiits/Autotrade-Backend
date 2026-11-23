@@ -167,6 +167,10 @@ class Broker(ABC):
     @abstractmethod
     async def place_order(self, req: PlaceOrder) -> Order: ...
 
+    async def place_orders(self, requests: list[PlaceOrder]) -> list[Order]:
+        """Place related orders together when supported, otherwise preserve their sequence."""
+        return [await self.place_order(request) for request in requests]
+
     @abstractmethod
     async def cancel_order(self, order_id: str) -> Order: ...
 

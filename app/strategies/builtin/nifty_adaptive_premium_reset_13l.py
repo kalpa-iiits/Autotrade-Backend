@@ -307,6 +307,21 @@ class SyntheticWeeklyOptionLegs(ShortWeeklyOptionLegs):
 
     async def _close_one(self, reason: str) -> bool:
         positions = self._option_positions()
+        basket = getattr(self._ctx, "basket", None)
+        if basket is not None and len(positions) > 1:
+            legs = [
+                {
+                    "side": "BUY" if quantity < 0 else "SELL",
+                    "quantity": abs(quantity),
+                    "symbol": symbol,
+                    "product": self.order_product,
+                }
+                for symbol, quantity in sorted(
+                    positions.items(), key=lambda item: (item[1] > 0, item[0]),
+                )
+            ]
+            await basket(legs, reason)
+            return True
         # Remove short exposure first, then dispose of the long leg.
         item = next(((s, q) for s, q in sorted(positions.items()) if q < 0), None)
         if item is not None:
@@ -317,6 +332,26 @@ class SyntheticWeeklyOptionLegs(ShortWeeklyOptionLegs):
             await self._sell_overnight(item[1], reason, item[0])
             return True
         return False
+
+    async def _handle_margin_rejection(self, result) -> None:
+        if not self._margin_rejection(result):
+            return
+        closer = next(
+            (distance for distance in HEDGE_RETRY_DISTANCES
+             if MIN_HEDGE_POINTS <= distance < self.hedge_points),
+            None,
+        )
+        if closer is None:
+            self.margin_retry_exhausted = True
+            self._ctx.log("synthetic short margin retry stopped at the hedge safety limit")
+        else:
+            self.obsolete_hedge_symbol = self.pair_hedge.symbol
+            self.hedge_points = closer
+            self.pair_hedge = None
+            self._ctx.log(
+                f"synthetic short margin rejected; retrying with {closer:g}-point OTM hedge"
+            )
+        await self._save_leg_state()
 
     async def advance(self, now, reason="synthetic transition") -> None:
         if not self._session_open(now) or self._ctx.order_pending:
@@ -443,7 +478,55 @@ class SyntheticWeeklyOptionLegs(ShortWeeklyOptionLegs):
             if held > target and held > 0:
                 await self._sell_overnight(min(held - target, held), reason, symbol)
                 return
+
+        # Margin protection is established independently. Once it is fully held, FYERS can
+        # submit the two ATM synthetic legs through one Multi Order request; other brokers use
+        # the runner's ordered fallback with the same per-leg reconciliation.
+        hedge_held = current.get(self.pair_hedge.symbol, 0)
+        if hedge_held < quantity:
+            quote = await self._quote(self.pair_hedge.symbol, "BUY", now)
+            if quote is None:
+                return
+            guard, problem = self._pair_guard(quote, "BUY")
+            if problem:
+                return
+            await self._buy_overnight(
+                quantity - hedge_held, reason, self.pair_hedge.symbol, guard,
+            )
+            return
+
+        bought = self.pair_ce if self.desired_direction > 0 else self.pair_pe
+        short = self.pair_pe if self.desired_direction > 0 else self.pair_ce
+        basket = getattr(self._ctx, "basket", None)
+        if (basket is not None and current.get(bought.symbol, 0) == 0
+                and current.get(short.symbol, 0) == 0):
+            for contract, side in ((bought, "BUY"), (short, "SELL")):
+                quote = await self._quote(contract.symbol, side, now)
+                if quote is None:
+                    return
+                guard, problem = self._pair_guard(quote, side)
+                if problem:
+                    return
+                guards[contract.symbol] = guard
+            results = await basket([
+                {
+                    "side": "BUY", "quantity": quantity, "symbol": bought.symbol,
+                    "product": self.order_product,
+                    "option_price_guard": guards.get(bought.symbol),
+                },
+                {
+                    "side": "SELL", "quantity": quantity, "symbol": short.symbol,
+                    "product": self.order_product,
+                    "option_price_guard": guards.get(short.symbol),
+                },
+            ], reason)
+            if len(results) == 2:
+                await self._handle_margin_rejection(results[1])
+            return
+
         for symbol, target in targets.items():
+            if symbol == self.pair_hedge.symbol:
+                continue
             held = current.get(symbol, 0)
             if target > held and target > 0:
                 guard = guards.get(symbol)
@@ -470,23 +553,7 @@ class SyntheticWeeklyOptionLegs(ShortWeeklyOptionLegs):
                     if problem:
                         return
                 result = await self._sell_overnight(held - target, reason, symbol, guard)
-                if self._margin_rejection(result):
-                    closer = next(
-                        (distance for distance in HEDGE_RETRY_DISTANCES
-                         if MIN_HEDGE_POINTS <= distance < self.hedge_points),
-                        None,
-                    )
-                    if closer is None:
-                        self.margin_retry_exhausted = True
-                        self._ctx.log("synthetic short margin retry stopped at the hedge safety limit")
-                    else:
-                        self.obsolete_hedge_symbol = self.pair_hedge.symbol
-                        self.hedge_points = closer
-                        self.pair_hedge = None
-                        self._ctx.log(
-                            f"synthetic short margin rejected; retrying with {closer:g}-point OTM hedge"
-                        )
-                    await self._save_leg_state()
+                await self._handle_margin_rejection(result)
                 return
 
     async def monitor_reset(self, now) -> None:
@@ -508,7 +575,8 @@ class NiftyAdaptivePremiumReset13LStrategy(NiftyTrailingReversalOptimizedITMOpti
         "13 L strategy: current-week NIFTY synthetic futures at the nearest listed 100-point "
         "ATM strike. Long buys the ATM call and sells the ATM put; short buys the ATM put and "
         "sells the ATM call. The sold leg retains the existing bought 800-OTM margin hedge "
-        "and 600-point fallback. Signals use a 0.10% initial and 0.40% trailing index stop."
+        "and 600-point fallback. After the hedge fills, ATM entry and complete exits use broker "
+        "baskets when available. Signals use a 0.10% initial and 0.40% trailing index stop."
     )
     tags = ("Experimental", "NIFTY", "Weekly options", "Synthetic futures", "ATM")
     initial_stop_pct = 0.1
@@ -529,16 +597,17 @@ class NiftyAdaptivePremiumReset13LStrategy(NiftyTrailingReversalOptimizedITMOpti
                     "Buy the same-expiry option 800 points OTM on the sold-leg side as a margin hedge",
                     "If margin rejects the short, replace the hedge at 600 points OTM and retry",
                     "Validate fresh two-sided ATM and hedge quotes before starting an entry",
+                    "After the hedge is held, submit both ATM legs as one broker basket",
                 ]
             elif rule["kind"] == "entry_long":
                 rule["title"] = "LONG signal: buy ATM CE + sell ATM PE"
                 rule["conditions"].append(
-                    "Buy the ATM call and PE margin hedge before selling the same-strike ATM put"
+                    "Buy the PE margin hedge first, then basket the ATM call buy and ATM put sale"
                 )
             elif rule["kind"] == "entry_short":
                 rule["title"] = "SHORT signal: buy ATM PE + sell ATM CE"
                 rule["conditions"].append(
-                    "Buy the ATM put and CE margin hedge before selling the same-strike ATM call"
+                    "Buy the CE margin hedge first, then basket the ATM put buy and ATM call sale"
                 )
             elif rule["kind"] == "risk":
                 rule["conditions"] = [
@@ -553,6 +622,7 @@ class NiftyAdaptivePremiumReset13LStrategy(NiftyTrailingReversalOptimizedITMOpti
             elif rule["kind"] == "exit":
                 rule["conditions"] += [
                     "On reversal, cover the sold leg before closing bought legs, then select a fresh ATM pair",
+                    "Submit all available closing legs as one basket and reconcile every leg result",
                     "At 15:10 on expiry day, or the previous NSE session for a holiday expiry, close and roll into the next weekly pair in the same session",
                 ]
         return rules
