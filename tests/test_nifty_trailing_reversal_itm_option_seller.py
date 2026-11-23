@@ -748,7 +748,6 @@ def test_13l_overnight_gap_below_700_resets_from_first_0915_clock_check():
     old = "NSE:NIFTY26N2425900PE"
     old_hedge = "NSE:NIFTY26N2424200PE"
     replacement = "NSE:NIFTY26N2426400PE"
-    replacement_hedge = "NSE:NIFTY26N2424700PE"
     ctx = OptionSellerContext({old: -65, old_hedge: 65})
     legs = StrictHundredStrikeWeeklyOptionLegs(ctx, 900)
     legs.hedge_symbol = old_hedge
@@ -764,7 +763,6 @@ def test_13l_overnight_gap_below_700_resets_from_first_0915_clock_check():
         ctx.last_price = 25_500
         ctx.quotes[old] = 699
         ctx.quotes[replacement] = 950
-        ctx.quotes[replacement_hedge] = 50
         await legs.monitor_reset(next_open)
         await legs.advance(next_open)
         await legs.advance(next_open)
@@ -773,11 +771,11 @@ def test_13l_overnight_gap_below_700_resets_from_first_0915_clock_check():
 
     assert ctx.orders == [
         ("BUY", 65, old, Product.DELIVERY),
-        ("BUY", 65, replacement_hedge, Product.DELIVERY),
         ("SELL", 65, replacement, Product.DELIVERY),
-        ("SELL", 65, old_hedge, Product.DELIVERY),
     ]
-    assert ctx.positions == {replacement: -65, replacement_hedge: 65}
+    assert ctx.positions == {replacement: -65, old_hedge: 65}
+    assert legs.hedge_symbol == old_hedge
+    assert any("reusing existing margin hedge" in message for message in ctx.logs)
     assert not legs.reset_pending
 
 
@@ -809,7 +807,9 @@ def test_13l_gap_reset_keeps_old_short_when_required_hedge_price_is_invalid():
                 bid if side == "SELL" else ask, at, "depth", bid=bid, ask=ask,
             )
 
-    ctx = GapDepthContext({old: -130, old_hedge: 130}, quantity=130)
+    # The held hedge is undersized, so the reset genuinely requires buying the newly selected
+    # hedge and must remain pending when that ask is invalid.
+    ctx = GapDepthContext({old: -130, old_hedge: 65}, quantity=130)
     ctx.last_price = 25_500
     legs = StrictHundredStrikeWeeklyOptionLegs(ctx, 900)
     legs.hedge_symbol = old_hedge
@@ -822,7 +822,7 @@ def test_13l_gap_reset_keeps_old_short_when_required_hedge_price_is_invalid():
     assert legs.reset_pending
     assert legs.replace_symbol is None
     assert not ctx.orders
-    assert ctx.positions == {old: -130, old_hedge: 130}
+    assert ctx.positions == {old: -130, old_hedge: 65}
     assert any("reset deferred: invalid hedge price" in message for message in ctx.logs)
 
 

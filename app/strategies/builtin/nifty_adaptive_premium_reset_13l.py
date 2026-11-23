@@ -178,4 +178,8 @@ class NiftyAdaptivePremiumReset13LStrategy(NiftyTrailingReversalOptimizedITMOpti
                     "Reject an overpriced hedge ask; protected limits never cross the validated "
                     "buy ceiling or short-sale floor"
                 )
+                rule["conditions"].append(
+                    "Premium resets reuse a fully sized same-type, same-expiry hedge; replace it "
+                    "only for reversal, expiry, quantity shortfall or a margin-rejection fallback"
+                )
         return rules

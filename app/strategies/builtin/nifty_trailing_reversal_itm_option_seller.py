@@ -587,6 +587,22 @@ class ShortWeeklyOptionLegs:
         self.pending_audit = None
         await self._save_leg_state()
 
+    async def _held_hedge(self, kind: str, expiry: date) -> OptionContract | None:
+        """A fully sized same-kind, same-expiry hedge that can survive a premium reset."""
+        longs = self._long_options()
+        candidates = sorted(
+            longs,
+            key=lambda symbol: (symbol != self.hedge_symbol, symbol),
+        )
+        if any(symbol not in self.contracts_by_symbol for symbol in candidates):
+            await self._contracts()
+        for symbol in candidates:
+            contract = self.contracts_by_symbol.get(symbol)
+            if (longs[symbol] >= self.option_quantity and contract is not None
+                    and contract.kind == kind and contract.expiry == expiry):
+                return contract
+        return None
+
     async def _prepare(self, kind: str, now: datetime, reason: str,
                        earliest_expiry: date | None = None,
                        exact_expiry: date | None = None) -> bool:
@@ -602,7 +618,17 @@ class ShortWeeklyOptionLegs:
         if problem:
             self._ctx.log(f"{reason} deferred: invalid replacement price: {problem}")
             return False
-        hedge = await self._select_hedge(kind, contract.expiry)
+        # A premium reset changes only the short strike. Reuse an already-paid, fully sized
+        # hedge for the same option type and expiry; if the broker later rejects the new short
+        # for margin, the existing 800 -> 600 fallback will deliberately replace it.
+        hedge = (await self._held_hedge(kind, contract.expiry)
+                 if reason == "reset" else None)
+        if hedge is not None:
+            self._ctx.log(
+                f"reset reusing existing margin hedge {hedge.symbol}; no hedge trade required"
+            )
+        else:
+            hedge = await self._select_hedge(kind, contract.expiry)
         if hedge is None:
             self._ctx.log(
                 f"{reason} deferred: {self.hedge_points:g}-point OTM {kind} hedge unavailable"
