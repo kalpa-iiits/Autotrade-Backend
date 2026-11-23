@@ -334,10 +334,36 @@ def test_13l_scans_1000_900_800_itm_and_submits_full_quantity_at_valid_prices():
         "BUY", "NSE:NIFTY26N2424200PE", pytest.approx(55),
     )
     assert ctx.price_guards[1][:2] == ("SELL", "NSE:NIFTY26N2425800PE")
-    assert 750 < ctx.price_guards[1][2] < 770  # intrinsic less four days' carry and tolerance
+    assert ctx.price_guards[1][2] == pytest.approx(795.76)
     assert any("1000-ITM" in message and "skipped" in message for message in ctx.logs)
     assert any("900-ITM" in message and "skipped" in message for message in ctx.logs)
     assert any("800-ITM" in message and "selected" in message for message in ctx.logs)
+
+
+@pytest.mark.parametrize(
+    ("dte", "expected_floor"),
+    [
+        (0, 931.00), (1, 931.00), (2, 931.00), (3, 931.00),
+        (4, 933.94), (5, 936.88), (6, 939.82), (7, 942.76), (8, 945.70),
+    ],
+)
+def test_13l_fair_short_floor_adds_three_rupees_per_dte(dte, expected_floor):
+    from app.strategies.builtin.nifty_adaptive_premium_reset_13l import (
+        StrictHundredStrikeWeeklyOptionLegs,
+    )
+
+    ctx = OptionSellerContext()
+    ctx.last_price = 25_859
+    legs = StrictHundredStrikeWeeklyOptionLegs(ctx, 900)
+    contract = OptionContract(
+        "NSE:NIFTY26800PE", "PE", 26_800, AT.date() + timedelta(days=dte), 65,
+    )
+    quote = QuoteSnapshot(2_000, AT, "test")
+
+    floor, problem = legs._entry_price_guard(contract, quote, "SELL")
+
+    assert problem is None
+    assert floor == pytest.approx(expected_floor)
 
 
 def test_13l_rejects_overpriced_hedge_before_opening_short():

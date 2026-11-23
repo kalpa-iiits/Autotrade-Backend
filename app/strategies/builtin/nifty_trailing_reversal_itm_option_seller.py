@@ -113,9 +113,9 @@ class ShortWeeklyOptionLegs:
     entry_spread_floor = 10.0
     intrinsic_tolerance_pct = 0.5
     intrinsic_tolerance_floor = 10.0
-    # Conservative financing/dividend allowance for European index options. Without this,
-    # spot intrinsic alone can reject a legitimate quote several days before expiry.
-    annual_carry_allowance = 0.10
+    time_value_per_dte = 3.0
+    fair_value_tolerance_pct = 2.0
+    fair_value_tolerance_floor = 15.0
 
     def __init__(self, ctx, itm_points: float, hedge_points: float | None = None) -> None:
         self._ctx = ctx
@@ -356,18 +356,25 @@ class ShortWeeklyOptionLegs:
         if side == "SELL":
             intrinsic = (max(contract.strike - spot, 0.0) if contract.kind == "PE"
                          else max(spot - contract.strike, 0.0))
-            expiry_at = datetime.combine(contract.expiry, EXPIRY_TIME, tzinfo=IST)
-            years = max(
-                (expiry_at - quote.observed_at.astimezone(IST)).total_seconds(), 0.0,
-            ) / SECONDS_PER_YEAR
-            carry = contract.strike * self.annual_carry_allowance * years
-            tolerance = max(self.intrinsic_tolerance_floor,
-                            intrinsic * self.intrinsic_tolerance_pct / 100)
-            floor = max(intrinsic - carry - tolerance, 0.05)
+            dte = max(
+                (contract.expiry - quote.observed_at.astimezone(IST).date()).days, 0,
+            )
+            intrinsic_tolerance = max(
+                self.intrinsic_tolerance_floor,
+                intrinsic * self.intrinsic_tolerance_pct / 100,
+            )
+            intrinsic_floor = intrinsic - intrinsic_tolerance
+            fair_value = intrinsic + self.time_value_per_dte * dte
+            fair_tolerance = max(
+                self.fair_value_tolerance_floor,
+                fair_value * self.fair_value_tolerance_pct / 100,
+            )
+            fair_floor = fair_value - fair_tolerance
+            floor = max(intrinsic_floor, fair_floor, 0.05)
             if quote.price < floor:
                 return None, (
                     f"bid {quote.price:.2f} is below protected floor {floor:.2f} "
-                    f"(intrinsic {intrinsic:.2f}, carry allowance {carry:.2f})"
+                    f"(intrinsic {intrinsic:.2f}, DTE {dte}, fair value {fair_value:.2f})"
                 )
             return floor, None
 

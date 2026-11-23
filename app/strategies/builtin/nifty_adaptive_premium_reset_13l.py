@@ -172,7 +172,12 @@ class NiftyAdaptivePremiumReset13LStrategy(NiftyTrailingReversalOptimizedITMOpti
             if rule["kind"] == "filter":
                 rule["conditions"].append(
                     "Before entry, check 1000-, 900- and 800-ITM quotes in that order; use "
-                    "the deepest contract with a valid two-sided price and intrinsic-value floor"
+                    "the deepest contract with a valid two-sided price and fair-value floor"
+                )
+                rule["conditions"].append(
+                    "Fair value adds ₹3 per DTE to actual intrinsic value; the minimum short "
+                    "bid is the greater of intrinsic less its tolerance and fair value less "
+                    "max(₹15, 2%)"
                 )
                 rule["conditions"].append(
                     "Reject an overpriced hedge ask; protected limits never cross the validated "
