@@ -41,8 +41,10 @@ class StrictHundredStrikeWeeklyOptionLegs(ShortWeeklyOptionLegs):
 
     same_session_expiry_roll = True
     require_fresh_hedge_quote = True
-    reset_23_low = 850.0
-    reset_47_high = 850.0
+    reset_01 = 800.0
+    reset_23_low = 800.0
+    reset_47_low = 800.0
+    reset_47_high = 800.0
     # A Tuesday holiday moves the expiry exit to Monday. Rolling that session into the following
     # Tuesday is eight calendar days, while an ordinary Tuesday-to-Tuesday roll is seven.
     max_reset_dte = 8
@@ -101,7 +103,7 @@ class NiftyAdaptivePremiumReset13LStrategy(NiftyTrailingReversalOptimizedITMOpti
             "Buy the same quantity of the same-expiry option 1000 points OTM as a margin hedge":
                 "Buy the same quantity of the same-expiry option 800 points OTM as a margin hedge",
             "Reset: 0–1 DTE ₹850; 2–3 LOW ₹900/HIGH ₹700; 4–6 LOW ₹850/HIGH ₹900":
-                "Reset: 0–1 DTE ₹850; 2–3 LOW ₹850/HIGH ₹700; 4–8 LOW/HIGH ₹850",
+                "Reset: 0–1 DTE ₹800; 2–3 LOW ₹800/HIGH ₹700; 4–8 LOW/HIGH ₹800",
             "Start expiry rollover at 15:10 IST and reopen next executable session":
                 "At 15:10 on expiry day, or the previous NSE session for a holiday expiry, cover and roll into the next weekly contract in the same session",
         }

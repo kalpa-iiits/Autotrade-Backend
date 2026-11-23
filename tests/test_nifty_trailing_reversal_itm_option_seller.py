@@ -609,7 +609,7 @@ def test_premium_gap_below_reset_stays_pending_until_replacement_quote_appears()
     assert not legs.reset_pending
 
 
-def test_13l_overnight_gap_below_850_resets_from_first_0915_clock_check():
+def test_13l_overnight_gap_below_800_resets_from_first_0915_clock_check():
     from app.strategies.builtin.nifty_adaptive_premium_reset_13l import (
         StrictHundredStrikeWeeklyOptionLegs,
     )
@@ -624,14 +624,14 @@ def test_13l_overnight_gap_below_850_resets_from_first_0915_clock_check():
     legs = StrictHundredStrikeWeeklyOptionLegs(ctx, 900)
     legs.hedge_symbol = old_hedge
     legs.desired_direction = 1
-    # The entry sold above the frozen ₹850 level, so the reset carries overnight armed.
+    # The entry sold above the frozen ₹800 level, so the reset carries overnight armed.
     legs.frozen = legs._classify_reset("PE", 25_900, 25_000, 900, EXPIRY, opened)
-    assert legs.frozen.reset_level == 850
+    assert legs.frozen.reset_level == 800
     legs.last_premium = 900
     legs.reset_armed = True
 
     async def gap_and_reset():
-        # NIFTY gaps up 500 points. The current ask of the held PE gaps below ₹850.
+        # NIFTY gaps up 500 points. The current ask of the held PE gaps below ₹800.
         ctx.last_price = 25_500
         ctx.quotes[old] = 700
         ctx.quotes[replacement] = 950
@@ -955,22 +955,30 @@ def test_dte_and_iv_grid_selects_every_published_reset_bucket():
     assert (result(4, 1_200).iv_regime, result(4, 1_200).reset_level) == ("HIGH", 900)
 
 
-def test_13l_replaces_both_900_reset_cells_with_850_only_for_its_variant():
+def test_13l_replaces_every_850_reset_cell_with_800_only_for_its_variant():
     from app.strategies.builtin.nifty_adaptive_premium_reset_13l import (
         StrictHundredStrikeWeeklyOptionLegs,
     )
 
     legs = StrictHundredStrikeWeeklyOptionLegs(OptionSellerContext(), 900)
 
+    zero_dte = legs._classify_reset(
+        "PE", 25_900, 25_000, 900, AT.date(), AT,
+    )
     low_2dte = legs._classify_reset(
         "PE", 25_900, 25_000, 900, AT.date() + timedelta(days=2), AT,
+    )
+    low_4dte = legs._classify_reset(
+        "PE", 25_900, 25_000, 900, AT.date() + timedelta(days=4), AT,
     )
     high_4dte = legs._classify_reset(
         "PE", 25_900, 25_000, 1_200, AT.date() + timedelta(days=4), AT,
     )
 
-    assert (low_2dte.iv_regime, low_2dte.reset_level) == ("LOW", 850)
-    assert (high_4dte.iv_regime, high_4dte.reset_level) == ("HIGH", 850)
+    assert zero_dte.reset_level == 800
+    assert (low_2dte.iv_regime, low_2dte.reset_level) == ("LOW", 800)
+    assert (low_4dte.iv_regime, low_4dte.reset_level) == ("LOW", 800)
+    assert (high_4dte.iv_regime, high_4dte.reset_level) == ("HIGH", 800)
 
 
 def test_frozen_reset_state_survives_adapter_restart():
