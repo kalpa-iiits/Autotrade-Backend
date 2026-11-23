@@ -9,6 +9,7 @@ from app.strategies.backtest import Simulation
 from app.strategies.builtin.nifty_adaptive_premium_reset_13l import (
     NiftyAdaptivePremiumReset13LStrategy,
     StrictHundredStrikeWeeklyOptionLegs,
+    SyntheticWeeklyOptionLegs,
 )
 from app.strategies.builtin.nifty_trailing_reversal_itm_option_seller import (
     NiftyTrailingReversalOptimizedITMOptionSeller,
@@ -32,7 +33,7 @@ class ExperimentalSignalReference(NiftyTrailingReversalOptimized):
     initial_stop_pct = 0.1
 
 
-def test_13l_strategy_changes_only_rule_metadata_and_initial_stop():
+def test_13l_strategy_keeps_signal_math_and_uses_synthetic_option_execution():
     old = NiftyTrailingReversalOptimizedITMOptionSeller
     new = NiftyAdaptivePremiumReset13LStrategy
 
@@ -45,8 +46,8 @@ def test_13l_strategy_changes_only_rule_metadata_and_initial_stop():
     assert new.trailing_stop_pct == old.trailing_stop_pct == 0.4
     assert new.cadence_minutes == old.cadence_minutes == 10
     assert new.timeframes == old.timeframes == ("5m",)
-    assert new.option_legs_class is StrictHundredStrikeWeeklyOptionLegs
-    assert old.option_legs_class is not StrictHundredStrikeWeeklyOptionLegs
+    assert new.option_legs_class is SyntheticWeeklyOptionLegs
+    assert old.option_legs_class is not SyntheticWeeklyOptionLegs
 
     # The complete lifecycle stays inherited from the older strategy. These are the methods that
     # drive option selection, resets, reversal sequencing, expiry rolls and clock retries.
@@ -126,7 +127,7 @@ def test_13l_backtest_trades_exactly_match_point_one_signal_reference():
     assert strategy != previous
 
 
-def test_13l_rules_match_the_attached_candidate_and_keep_reset_grid():
+def test_13l_rules_describe_synthetic_pair_no_premium_reset_and_existing_hedge():
     strategy = NiftyAdaptivePremiumReset13LStrategy
     rules = strategy.rules(strategy.Params(itm_points=900))
     filters = next(rule for rule in rules if rule["kind"] == "filter")["conditions"]
@@ -135,16 +136,15 @@ def test_13l_rules_match_the_attached_candidate_and_keep_reset_grid():
 
     assert any("0.10% from the fill" in condition for condition in risk)
     assert any("0.40% behind the completed close" in condition for condition in risk)
-    assert any("configured quantity" in condition for condition in filters)
-    assert any("nearest listed strike divisible by 100" in condition for condition in filters)
+    assert any("100-point ATM strike" in condition for condition in filters)
     assert any("800 points OTM" in condition for condition in filters)
-    assert any("down to 600 points OTM" in condition for condition in filters)
-    assert not any("fall back" in condition for condition in filters)
+    assert any("600 points OTM" in condition for condition in filters)
+    assert any("fresh two-sided ATM and hedge quotes" in condition for condition in filters)
     assert any("previous NSE session" in condition and "same session" in condition
                for condition in exits)
-    assert any("current ask" in condition and "current bid" in condition for condition in exits)
-    assert not any("fixed at 65 units" in condition for condition in risk)
-    assert any("all DTE and IV regimes at ₹700" in condition for condition in risk)
+    assert any("no option-premium reset" in condition for condition in risk)
+    assert any("strike and expiry until reversal or weekly rollover" in condition
+               for condition in risk)
 
 
 def test_13l_deployment_is_separate_editable_quantity_and_old_seller_is_unchanged():

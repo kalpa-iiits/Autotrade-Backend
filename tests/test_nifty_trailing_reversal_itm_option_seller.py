@@ -12,6 +12,9 @@ from app.strategies.deployment import Deployment
 from app.strategies.builtin.nifty_trailing_reversal_hedged_futures import (
     NiftyTrailingReversalOptimizedHedgedFutures,
 )
+from app.strategies.builtin.nifty_adaptive_premium_reset_13l import (
+    SyntheticWeeklyOptionLegs,
+)
 from app.strategies.builtin.nifty_trailing_reversal_itm_option_seller import (
     FrozenReset,
     NiftyTrailingReversalOptimizedITMOptionSeller,
@@ -74,6 +77,131 @@ class OptionSellerContext:
 
     def log(self, message):
         self.logs.append(message)
+
+
+@pytest.mark.parametrize(
+    ("direction", "quotes", "expected"),
+    [
+        (
+            1,
+            {
+                "NSE:NIFTY26N2425000CE": 210,
+                "NSE:NIFTY26N2425000PE": 205,
+                "NSE:NIFTY26N2424200PE": 20,
+            },
+            [
+                ("BUY", 65, "NSE:NIFTY26N2425000CE", Product.DELIVERY),
+                ("BUY", 65, "NSE:NIFTY26N2424200PE", Product.DELIVERY),
+                ("SELL", 65, "NSE:NIFTY26N2425000PE", Product.DELIVERY),
+            ],
+        ),
+        (
+            -1,
+            {
+                "NSE:NIFTY26N2425000CE": 210,
+                "NSE:NIFTY26N2425000PE": 205,
+                "NSE:NIFTY26N2425800CE": 20,
+            },
+            [
+                ("BUY", 65, "NSE:NIFTY26N2425000PE", Product.DELIVERY),
+                ("BUY", 65, "NSE:NIFTY26N2425800CE", Product.DELIVERY),
+                ("SELL", 65, "NSE:NIFTY26N2425000CE", Product.DELIVERY),
+            ],
+        ),
+    ],
+)
+def test_13l_synthetic_pair_keeps_the_existing_otm_margin_hedge(direction, quotes, expected):
+    ctx = OptionSellerContext()
+    ctx.quotes.update(quotes)
+    legs = SyntheticWeeklyOptionLegs(ctx)
+    legs.set_desired(direction)
+
+    async def enter():
+        await legs.advance(AT, "initial synthetic")
+        await legs.advance(AT, "initial synthetic")
+        await legs.advance(AT, "initial synthetic")
+
+    asyncio.run(enter())
+
+    assert ctx.orders == expected
+    assert legs.position == direction * 65
+    assert legs.hedge_points == 800
+
+
+def test_13l_synthetic_reversal_closes_old_pair_and_hedge_before_new_atm_pair():
+    ctx = OptionSellerContext()
+    ctx.quotes.update({
+        "NSE:NIFTY26N2425000CE": 210,
+        "NSE:NIFTY26N2425000PE": 205,
+        "NSE:NIFTY26N2424200PE": 20,
+        "NSE:NIFTY26N2425800CE": 20,
+    })
+    legs = SyntheticWeeklyOptionLegs(ctx)
+    legs.set_desired(1)
+
+    async def reverse():
+        for _ in range(3):
+            await legs.advance(AT, "initial LONG")
+        legs.set_desired(-1)
+        for _ in range(6):
+            await legs.advance(AT, "reverse SHORT")
+
+    asyncio.run(reverse())
+
+    assert ctx.orders[3:6] == [
+        ("BUY", 65, "NSE:NIFTY26N2425000PE", Product.DELIVERY),
+        ("SELL", 65, "NSE:NIFTY26N2424200PE", Product.DELIVERY),
+        ("SELL", 65, "NSE:NIFTY26N2425000CE", Product.DELIVERY),
+    ]
+    assert ctx.orders[-3:] == [
+        ("BUY", 65, "NSE:NIFTY26N2425000PE", Product.DELIVERY),
+        ("BUY", 65, "NSE:NIFTY26N2425800CE", Product.DELIVERY),
+        ("SELL", 65, "NSE:NIFTY26N2425000CE", Product.DELIVERY),
+    ]
+    assert legs.position == -65
+
+
+def test_13l_synthetic_margin_rejection_replaces_800_with_600_point_hedge():
+    atm_put = "NSE:NIFTY26N2425000PE"
+
+    class MarginRetryContext(OptionSellerContext):
+        def __init__(self):
+            super().__init__()
+            self.rejected_once = False
+
+        async def sell(self, quantity=None, reason=None, symbol=None, product=None,
+                       option_price_guard=None):
+            if symbol == atm_put and not self.rejected_once:
+                self.rejected_once = True
+                self.orders.append(("SELL", quantity, symbol, product))
+                return SimpleNamespace(
+                    outcome="rejected", message="insufficient margin shortfall",
+                )
+            return await super().sell(
+                quantity, reason, symbol, product, option_price_guard,
+            )
+
+    ctx = MarginRetryContext()
+    ctx.quotes.update({
+        "NSE:NIFTY26N2425000CE": 210,
+        atm_put: 205,
+        "NSE:NIFTY26N2424200PE": 20,
+        "NSE:NIFTY26N2424400PE": 30,
+    })
+    legs = SyntheticWeeklyOptionLegs(ctx)
+    legs.set_desired(1)
+
+    async def enter_with_retry():
+        for _ in range(7):
+            await legs.advance(AT, "initial LONG")
+
+    asyncio.run(enter_with_retry())
+
+    assert ("SELL", 65, "NSE:NIFTY26N2424200PE", Product.DELIVERY) in ctx.orders
+    assert ("BUY", 65, "NSE:NIFTY26N2424400PE", Product.DELIVERY) in ctx.orders
+    assert ctx.orders[-1] == ("SELL", 65, atm_put, Product.DELIVERY)
+    assert legs.hedge_points == 600
+    assert legs.position == 65
 
 
 def test_long_signal_shorts_exactly_one_current_week_900_itm_put():
