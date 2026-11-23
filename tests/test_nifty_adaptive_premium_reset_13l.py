@@ -160,12 +160,14 @@ def test_13l_deployment_is_separate_editable_quantity_and_old_seller_is_unchange
     assert new.params.itm_points == old.params.itm_points == 900
     assert new.quantity == new.backtest_fixed_quantity == 65
     assert new.max_order_qty == new.max_position == 1_800
+    assert new.max_orders_per_day == 200
     assert not new.strategy.capital_sizing
 
     assert old.label == "NIFTY Adaptive Premium Reset Seller"
     assert old.strategy is NiftyTrailingReversalOptimizedITMOptionSeller
     assert old.quantity == old.backtest_fixed_quantity == 65
     assert old.max_order_qty == old.max_position == 1_800
+    assert old.max_orders_per_day == 100
     assert old.strategy.initial_stop_pct == 0.4
 
 
