@@ -137,14 +137,16 @@ def test_13l_rules_match_the_attached_candidate_and_keep_reset_grid():
     assert any("0.40% behind the completed close" in condition for condition in risk)
     assert any("configured quantity" in condition for condition in filters)
     assert any("nearest listed strike divisible by 100" in condition for condition in filters)
+    assert any("800 points OTM" in condition for condition in filters)
+    assert any("down to 600 points OTM" in condition for condition in filters)
     assert not any("fall back" in condition for condition in filters)
     assert any("previous NSE session" in condition and "same session" in condition
                for condition in exits)
     assert any("current ask" in condition and "current bid" in condition for condition in exits)
     assert not any("fixed at 65 units" in condition for condition in risk)
-    assert any("0–1 DTE ₹850" in condition for condition in risk)
-    assert any("2–3 LOW ₹850/HIGH ₹700" in condition for condition in risk)
-    assert any("4–8 LOW/HIGH ₹850" in condition for condition in risk)
+    assert any("0–1 DTE ₹800" in condition for condition in risk)
+    assert any("2–3 LOW ₹800/HIGH ₹700" in condition for condition in risk)
+    assert any("4–8 LOW/HIGH ₹800" in condition for condition in risk)
 
 
 def test_13l_deployment_is_separate_editable_quantity_and_old_seller_is_unchanged():

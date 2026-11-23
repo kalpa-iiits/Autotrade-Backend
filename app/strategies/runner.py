@@ -208,15 +208,17 @@ class StrategyContext:
         return self._inst.held_symbol if self._inst.position else None
 
     async def buy(self, quantity: int | None = None, reason: str | None = None,
-                  symbol: str | None = None, product: Product | None = None) -> None:
+                  symbol: str | None = None,
+                  product: Product | None = None) -> StrategySignal | None:
         """Buy `symbol` (default: the instance's own symbol, whose ticks it receives)."""
-        await self._runner.request(
+        return await self._runner.request(
             self._inst, Side.BUY, quantity or self._sized(reason), reason, symbol, product,
         )
 
     async def sell(self, quantity: int | None = None, reason: str | None = None,
-                   symbol: str | None = None, product: Product | None = None) -> None:
-        await self._runner.request(
+                   symbol: str | None = None,
+                   product: Product | None = None) -> StrategySignal | None:
+        return await self._runner.request(
             self._inst, Side.SELL, quantity or self._sized(reason), reason, symbol, product,
         )
 
@@ -826,14 +828,15 @@ class StrategyRunner:
         return None
 
     async def request(self, inst: RunningInstance, side: Side, quantity: int, reason: str | None,
-                      symbol: str | None = None, product: Product | None = None) -> None:
+                      symbol: str | None = None,
+                      product: Product | None = None) -> StrategySignal | None:
         """Place an order on `symbol` (default the configured instrument) and record it.
 
         Ordinary strategies keep one aggregate position. Multi-leg strategies can mark their
         configured instrument as primary so auxiliary hedge fills are tracked separately.
         """
         if quantity <= 0:
-            return
+            return None
         symbol = symbol or inst.symbol
         async with inst.lock:
             cfg = inst.config
@@ -853,6 +856,7 @@ class StrategyRunner:
             if symbol != inst.symbol and side == Side.BUY and signal.outcome == "placed":
                 inst.held_symbol = symbol
             await self._record(signal, inst.account_id)
+            return signal
 
     async def _quote(self, account_id: int, symbol: str) -> float | None:
         """Last price of an instrument the instance doesn't stream (e.g. the option it trades)."""

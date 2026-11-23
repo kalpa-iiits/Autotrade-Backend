@@ -1,5 +1,6 @@
 import asyncio
 from datetime import date, datetime, timedelta
+from types import SimpleNamespace
 
 import pytest
 
@@ -526,6 +527,60 @@ def test_short_entry_waits_when_same_expiry_1000_otm_hedge_is_unavailable():
 
     assert not ctx.orders
     assert any("margin hedge" in message for message in ctx.logs)
+
+
+@pytest.mark.parametrize("margin_rejections", [2, 3])
+def test_margin_rejection_retries_1000_then_800_then_600_otm_and_stops(margin_rejections):
+    short = "NSE:NIFTY26N2425900PE"
+
+    class MarginRetryContext(OptionSellerContext):
+        short_attempts = 0
+
+        async def sell(self, quantity=None, reason=None, symbol=None, product=None):
+            if symbol == short:
+                self.short_attempts += 1
+                if self.short_attempts <= margin_rejections:
+                    self.orders.append(("SELL", quantity, symbol, product))
+                    return SimpleNamespace(
+                        outcome="rejected",
+                        message="RED:Margin Shortfall:INR 3,208.27&#x20;",
+                    )
+            return await super().sell(quantity, reason, symbol, product)
+
+    ctx = MarginRetryContext()
+    ctx.quotes[short] = 950
+    legs = ShortWeeklyOptionLegs(ctx, 900)
+    legs.set_desired(1)
+
+    asyncio.run(legs.advance(AT, "option transition"))
+    assert legs.hedge_points == 800
+    legs = ShortWeeklyOptionLegs(ctx, 900)  # fallback survives a process/adapter restart
+    legs.set_desired(1)
+    assert legs.hedge_points == 800
+    asyncio.run(legs.advance(AT, "option transition"))
+    assert legs.hedge_points == 600
+    asyncio.run(legs.advance(AT, "option transition"))
+
+    hedge_buys = [symbol for side, _, symbol, _ in ctx.orders if side == "BUY"]
+    assert hedge_buys == [
+        "NSE:NIFTY26N2424000PE",
+        "NSE:NIFTY26N2424200PE",
+        "NSE:NIFTY26N2424400PE",
+    ]
+    assert legs.hedge_points == 600
+
+    if margin_rejections == 2:
+        assert ctx.positions[short] == -65
+        assert not legs.margin_retry_exhausted
+    else:
+        assert short not in ctx.positions
+        assert legs.margin_retry_exhausted
+        order_count = len(ctx.orders)
+        legs = ShortWeeklyOptionLegs(ctx, 900)
+        legs.set_desired(1)
+        asyncio.run(legs.advance(AT, "option transition"))
+        assert len(ctx.orders) == order_count
+        assert any("600-point safety limit" in message for message in ctx.logs)
 
 
 def test_reversal_covers_put_before_shorting_one_900_itm_call():

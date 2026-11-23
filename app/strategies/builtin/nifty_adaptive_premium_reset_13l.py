@@ -48,9 +48,7 @@ class StrictHundredStrikeWeeklyOptionLegs(ShortWeeklyOptionLegs):
     # A Tuesday holiday moves the expiry exit to Monday. Rolling that session into the following
     # Tuesday is eight calendar days, while an ordinary Tuesday-to-Tuesday roll is seven.
     max_reset_dte = 8
-
-    def __init__(self, ctx, itm_points: float, hedge_points: float = 800.0) -> None:
-        super().__init__(ctx, itm_points, hedge_points)
+    default_hedge_points = 800.0
 
     async def _select(self, kind, now, earliest_expiry=None, exact_expiry=None):
         contract = await super()._select(kind, now, earliest_expiry, exact_expiry)
@@ -100,8 +98,6 @@ class NiftyAdaptivePremiumReset13LStrategy(NiftyTrailingReversalOptimizedITMOpti
                 "Every 10 minutes from 09:15 IST, ratchet to 0.40% behind the completed close",
             "Prefer strikes divisible by 100; fall back only if unavailable":
                 "Use the nearest listed strike divisible by 100; never use a non-100 strike",
-            "Buy the same quantity of the same-expiry option 1000 points OTM as a margin hedge":
-                "Buy the same quantity of the same-expiry option 800 points OTM as a margin hedge",
             "Reset: 0–1 DTE ₹850; 2–3 LOW ₹900/HIGH ₹700; 4–6 LOW ₹850/HIGH ₹900":
                 "Reset: 0–1 DTE ₹800; 2–3 LOW ₹800/HIGH ₹700; 4–8 LOW/HIGH ₹800",
             "Start expiry rollover at 15:10 IST and reopen next executable session":

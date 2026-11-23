@@ -21,6 +21,8 @@ from app.strategies.builtin.nifty_trailing_reversal_optimized import IST, NiftyT
 EXPIRY_TIME = time(15, 30)
 EXPIRY_EXIT_TIME = time(15, 10)
 HEDGE_POINTS = 1_000.0
+HEDGE_RETRY_DISTANCES = (1_000.0, 800.0, 600.0)
+MIN_HEDGE_POINTS = 600.0
 SECONDS_PER_YEAR = 365.25 * 24 * 60 * 60
 
 
@@ -103,11 +105,15 @@ class ShortWeeklyOptionLegs:
     reset_47_low = 850.0
     reset_47_high = 900.0
     max_reset_dte = 7
+    default_hedge_points = HEDGE_POINTS
 
-    def __init__(self, ctx, itm_points: float, hedge_points: float = HEDGE_POINTS) -> None:
+    def __init__(self, ctx, itm_points: float, hedge_points: float | None = None) -> None:
         self._ctx = ctx
         self.itm_points = itm_points
-        self.hedge_points = hedge_points
+        configured = self.default_hedge_points if hedge_points is None else float(hedge_points)
+        self.configured_hedge_points = max(configured, MIN_HEDGE_POINTS)
+        self.hedge_points = self.configured_hedge_points
+        self.margin_retry_exhausted = False
         self.desired_direction = self._actual_direction()
         self.replace_symbol: str | None = None
         self.pending_contract: OptionContract | None = None
@@ -217,8 +223,16 @@ class ShortWeeklyOptionLegs:
         except (TypeError, ValueError):
             self.roll_expiry_after = None
         self.pending_audit = state.get("pending_audit") if isinstance(state.get("pending_audit"), dict) else None
+        value = state.get("desired_direction")
+        if value in (-1, 0, 1):
+            self.desired_direction = int(value)
         value = state.get("hedge_symbol")
         self.hedge_symbol = value if isinstance(value, str) else None
+        value = state.get("hedge_distance")
+        if (isinstance(value, (int, float))
+                and MIN_HEDGE_POINTS <= float(value) <= self.configured_hedge_points):
+            self.hedge_points = float(value)
+        self.margin_retry_exhausted = bool(state.get("margin_retry_exhausted"))
 
     def _leg_state(self) -> dict:
         return {
@@ -230,7 +244,10 @@ class ShortWeeklyOptionLegs:
             "roll_expiry_after": (self.roll_expiry_after.isoformat()
                                   if self.roll_expiry_after else None),
             "pending_audit": self.pending_audit,
+            "desired_direction": self.desired_direction,
             "hedge_symbol": self.hedge_symbol,
+            "hedge_distance": self.hedge_points,
+            "margin_retry_exhausted": self.margin_retry_exhausted,
         }
 
     async def _save_leg_state(self) -> None:
@@ -248,6 +265,8 @@ class ShortWeeklyOptionLegs:
             self.pending_reason = None
             self.frozen = self.last_premium = self.roll_after = self.roll_expiry_after = None
             self.reset_armed = self.reset_pending = False
+            self.hedge_points = self.configured_hedge_points
+            self.margin_retry_exhausted = False
             # A spot reversal after the expiry close changes the option type while preserving the
             # pending roll's execution date and minimum eligible weekly expiry.
             self.roll_after = pending_roll
@@ -264,15 +283,15 @@ class ShortWeeklyOptionLegs:
         self.set_desired(-1)
         await self.advance(datetime.now(IST), reason or "reversal")
 
-    async def _buy_overnight(self, quantity: int, reason: str, symbol: str) -> None:
+    async def _buy_overnight(self, quantity: int, reason: str, symbol: str):
         """Place a carry-forward option order, independent of the account default."""
-        await self._ctx.buy(
+        return await self._ctx.buy(
             quantity, reason, symbol=symbol, product=self.order_product,
         )
 
-    async def _sell_overnight(self, quantity: int, reason: str, symbol: str) -> None:
+    async def _sell_overnight(self, quantity: int, reason: str, symbol: str):
         """Place a carry-forward option order, independent of the account default."""
-        await self._ctx.sell(
+        return await self._ctx.sell(
             quantity, reason, symbol=symbol, product=self.order_product,
         )
 
@@ -420,9 +439,42 @@ class ShortWeeklyOptionLegs:
             return
         symbol, quantity = obsolete
         await self._sell_overnight(
-            quantity, "remove obsolete 1000-point OTM margin hedge",
+            quantity, "remove obsolete farther OTM margin hedge",
             symbol,
         )
+
+    @staticmethod
+    def _margin_rejection(result) -> bool:
+        if result is None or getattr(result, "outcome", None) != "rejected":
+            return False
+        message = str(getattr(result, "message", "") or "").casefold()
+        return "margin" in message and ("shortfall" in message or "insufficient" in message)
+
+    async def _retry_with_closer_hedge(self, contract: OptionContract, event: str) -> None:
+        closer = next(
+            (distance for distance in HEDGE_RETRY_DISTANCES
+             if MIN_HEDGE_POINTS <= distance < self.hedge_points),
+            None,
+        )
+        self.pending_audit = None
+        self.pending_contract = contract
+        self.pending_hedge_contract = None
+        self.pending_reason = event
+        self.hedge_symbol = None
+        if closer is None:
+            self.margin_retry_exhausted = True
+            self._ctx.log(
+                f"margin rejection persisted with {self.hedge_points:g}-point OTM hedge; "
+                f"automatic retry stopped at the {MIN_HEDGE_POINTS:g}-point safety limit"
+            )
+        else:
+            previous = self.hedge_points
+            self.hedge_points = closer
+            self._ctx.log(
+                f"margin rejection with {previous:g}-point OTM hedge; retrying with "
+                f"{closer:g}-point OTM hedge"
+            )
+        await self._save_leg_state()
 
     def _audit_record(self, now: datetime, contract: OptionContract, quote: QuoteSnapshot,
                       frozen: FrozenReset, reason: str) -> dict:
@@ -597,6 +649,8 @@ class ShortWeeklyOptionLegs:
             self.pending_reason = None
             self.last_premium = None
             self.reset_armed = self.reset_pending = False
+            self.hedge_points = self.configured_hedge_points
+            self.margin_retry_exhausted = False
             # The old hedge becomes obsolete after the short is covered. Keep ``frozen`` until
             # the short disappears so its expiry remains a restart fallback if the contract is
             # no longer returned by the broker's option chain.
@@ -684,6 +738,9 @@ class ShortWeeklyOptionLegs:
             await self._remove_obsolete_hedge()
             return
 
+        if self.margin_retry_exhausted:
+            return
+
         contract = self.pending_contract or await self._select(
             wanted, now,
             earliest_expiry=self.roll_expiry_after if self.roll_after else None,
@@ -724,12 +781,14 @@ class ShortWeeklyOptionLegs:
             "record": record,
         }
         await self._save_leg_state()
-        await self._sell_overnight(
+        result = await self._sell_overnight(
             self.option_quantity,
             f"{event}; short {wanted} {contract.strike:g} {contract.expiry:%d %b}; "
             f"reset ₹{self.frozen.reset_level:g}; {self.option_quantity} units",
             contract.symbol,
         )
+        if self._margin_rejection(result):
+            await self._retry_with_closer_hedge(contract, event)
 
 
 class NiftyTrailingReversalOptimizedITMOptionSeller(NiftyTrailingReversalOptimized):
@@ -757,12 +816,18 @@ class NiftyTrailingReversalOptimizedITMOptionSeller(NiftyTrailingReversalOptimiz
     @classmethod
     def rules(cls, p: "NiftyTrailingReversalOptimizedITMOptionSeller.Params") -> list[dict]:
         rules = super().rules(p)
+        hedge_points = cls.option_legs_class.default_hedge_points
         for rule in rules:
             if rule["kind"] == "filter":
-                rule["conditions"] += ["Signals/stops use NIFTY index prices only",
-                                       "The configured quantity of one nearest-expiry option is short",
-                                       "Buy the same quantity of the same-expiry option 1000 points OTM as a margin hedge",
-                                       "Prefer strikes divisible by 100; fall back only if unavailable"]
+                rule["conditions"] += [
+                    "Signals/stops use NIFTY index prices only",
+                    "The configured quantity of one nearest-expiry option is short",
+                    f"Buy the same quantity of the same-expiry option {hedge_points:g} "
+                    "points OTM as a margin hedge",
+                    "If margin rejects the short, retry with progressively closer hedges "
+                    f"down to {MIN_HEDGE_POINTS:g} points OTM; never closer",
+                    "Prefer strikes divisible by 100; fall back only if unavailable",
+                ]
             elif rule["kind"] == "entry_long":
                 rule["title"] = "LONG signal: short 900-ITM put"
             elif rule["kind"] == "entry_short":
