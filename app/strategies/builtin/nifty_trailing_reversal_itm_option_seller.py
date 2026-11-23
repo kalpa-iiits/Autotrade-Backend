@@ -108,6 +108,7 @@ class ShortWeeklyOptionLegs:
     reset_47_high = 900.0
     max_reset_dte = 7
     default_hedge_points = HEDGE_POINTS
+    max_quote_age_seconds = 15.0
     validate_entry_prices = False
     entry_spread_pct = 1.5
     entry_spread_floor = 10.0
@@ -323,7 +324,7 @@ class ShortWeeklyOptionLegs:
         if raw.price <= 0 or raw.observed_at.tzinfo is None:
             return None
         age = abs((now.astimezone(IST) - raw.observed_at.astimezone(IST)).total_seconds())
-        return raw if age <= 15 else None
+        return raw if age <= self.max_quote_age_seconds else None
 
     def _entry_price_guard(self, contract: OptionContract, quote: QuoteSnapshot,
                            side: str) -> tuple[float | None, str | None]:

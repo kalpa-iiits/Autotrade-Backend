@@ -55,6 +55,7 @@ class StrictHundredStrikeWeeklyOptionLegs(ShortWeeklyOptionLegs):
     # economically executable. All candidates are checked before any order is submitted.
     entry_itm_candidates = (1_000.0, 900.0, 800.0)
     validate_entry_prices = True
+    max_quote_age_seconds = 2.0
 
     def _restore(self) -> None:
         super()._restore()
@@ -186,5 +187,8 @@ class NiftyAdaptivePremiumReset13LStrategy(NiftyTrailingReversalOptimizedITMOpti
                 rule["conditions"].append(
                     "Premium resets reuse a fully sized same-type, same-expiry hedge; replace it "
                     "only for reversal, expiry, quantity shortfall or a margin-rejection fallback"
+                )
+                rule["conditions"].append(
+                    "Entry, reset and hedge API depth snapshots must be no more than 2 seconds old"
                 )
         return rules

@@ -587,7 +587,7 @@ def test_13l_same_session_roll_requires_current_quote_at_1510():
     hedge = "NSE:NIFTY26N2424000PE"
 
     class CurrentQuoteContext(OptionSellerContext):
-        observed_at = at - timedelta(seconds=16)
+        observed_at = at - timedelta(seconds=3)
 
         async def executable_quote(self, symbol, side):
             return QuoteSnapshot(950, self.observed_at, "current-roll-depth")
