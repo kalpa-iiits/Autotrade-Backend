@@ -260,7 +260,7 @@ def test_13l_uses_next_deeper_itm_100_strike_when_target_is_between_strikes():
         "NSE:NIFTY26N2425950PE", "PE", 25_950, EXPIRY, 65,
     ))
     pe_ctx.quotes["NSE:NIFTY26N2426000PE"] = 950
-    pe_ctx.quotes["NSE:NIFTY26N2424000PE"] = 50
+    pe_ctx.quotes["NSE:NIFTY26N2424200PE"] = 50
     pe_legs = StrictHundredStrikeWeeklyOptionLegs(pe_ctx, 900)
     pe_legs.set_desired(1)
 
@@ -270,13 +270,20 @@ def test_13l_uses_next_deeper_itm_100_strike_when_target_is_between_strikes():
         "NSE:NIFTY26N2424150CE", "CE", 24_150, EXPIRY, 65,
     ))
     ce_ctx.quotes["NSE:NIFTY26N2424100CE"] = 950
-    ce_ctx.quotes["NSE:NIFTY26N2426000CE"] = 50
+    ce_ctx.quotes["NSE:NIFTY26N2425800CE"] = 50
     ce_legs = StrictHundredStrikeWeeklyOptionLegs(ce_ctx, 900)
     ce_legs.set_desired(-1)
 
     asyncio.run(pe_legs.advance(AT, "initial LONG"))
     asyncio.run(ce_legs.advance(AT, "initial SHORT"))
 
+    assert pe_legs.hedge_points == ce_legs.hedge_points == 800
+    assert pe_ctx.orders[0] == (
+        "BUY", 65, "NSE:NIFTY26N2424200PE", Product.DELIVERY,
+    )
+    assert ce_ctx.orders[0] == (
+        "BUY", 65, "NSE:NIFTY26N2425800CE", Product.DELIVERY,
+    )
     assert pe_ctx.orders[-1] == (
         "SELL", 65, "NSE:NIFTY26N2426000PE", Product.DELIVERY,
     )
@@ -291,10 +298,10 @@ def test_13l_exits_holiday_expiry_on_previous_nse_session_at_1510():
     )
 
     short = "NSE:NIFTY26N2425900PE"  # Nominal 24 Nov 2026 expiry is an NSE holiday.
-    hedge = "NSE:NIFTY26N2424000PE"
+    hedge = "NSE:NIFTY26N2424200PE"
     next_expiry = date(2026, 12, 1)
     replacement = "NSE:NIFTY26D0125900PE"
-    replacement_hedge = "NSE:NIFTY26D0124000PE"
+    replacement_hedge = "NSE:NIFTY26D0124200PE"
     ctx = OptionSellerContext({short: -65, hedge: 65})
     ctx.contracts += [
         OptionContract(f"NSE:NIFTY26D01{strike}PE", "PE", float(strike), next_expiry, 65)
@@ -344,7 +351,7 @@ def test_13l_new_entry_after_holiday_expiry_cutoff_skips_expiring_contract():
     next_expiry = date(2026, 12, 1)
     expiring = "NSE:NIFTY26N2425900PE"
     replacement = "NSE:NIFTY26D0125900PE"
-    replacement_hedge = "NSE:NIFTY26D0124000PE"
+    replacement_hedge = "NSE:NIFTY26D0124200PE"
     ctx = OptionSellerContext()
     ctx.contracts += [
         OptionContract(f"NSE:NIFTY26D01{strike}PE", "PE", float(strike), next_expiry, 65)
@@ -610,9 +617,9 @@ def test_13l_overnight_gap_below_850_resets_from_first_0915_clock_check():
     opened = datetime(2026, 11, 19, 15, 20, tzinfo=IST)
     next_open = datetime(2026, 11, 20, 9, 15, tzinfo=IST)
     old = "NSE:NIFTY26N2425900PE"
-    old_hedge = "NSE:NIFTY26N2424000PE"
+    old_hedge = "NSE:NIFTY26N2424200PE"
     replacement = "NSE:NIFTY26N2426400PE"
-    replacement_hedge = "NSE:NIFTY26N2424500PE"
+    replacement_hedge = "NSE:NIFTY26N2424700PE"
     ctx = OptionSellerContext({old: -65, old_hedge: 65})
     legs = StrictHundredStrikeWeeklyOptionLegs(ctx, 900)
     legs.hedge_symbol = old_hedge

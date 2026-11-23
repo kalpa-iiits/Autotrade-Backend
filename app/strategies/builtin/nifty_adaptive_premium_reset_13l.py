@@ -47,6 +47,9 @@ class StrictHundredStrikeWeeklyOptionLegs(ShortWeeklyOptionLegs):
     # Tuesday is eight calendar days, while an ordinary Tuesday-to-Tuesday roll is seven.
     max_reset_dte = 8
 
+    def __init__(self, ctx, itm_points: float, hedge_points: float = 800.0) -> None:
+        super().__init__(ctx, itm_points, hedge_points)
+
     async def _select(self, kind, now, earliest_expiry=None, exact_expiry=None):
         contract = await super()._select(kind, now, earliest_expiry, exact_expiry)
         return contract if contract is not None and _hundred_strike(contract.strike) else None
@@ -75,7 +78,7 @@ class NiftyAdaptivePremiumReset13LStrategy(NiftyTrailingReversalOptimizedITMOpti
     description = (
         "13 L strategy: a current-week 900-ITM NIFTY option short, using a 0.10% initial "
         "index stop, 0.40% trailing stop and frozen DTE/IV premium resets. The existing "
-        "editable fixed-quantity sizing and bought 1000-OTM margin-hedge execution are retained."
+        "editable fixed-quantity sizing and bought 800-OTM margin-hedge execution are retained."
     )
     tags = ("Experimental", "NIFTY", "Weekly options", "900 ITM")
     initial_stop_pct = 0.1
@@ -95,6 +98,8 @@ class NiftyAdaptivePremiumReset13LStrategy(NiftyTrailingReversalOptimizedITMOpti
                 "Every 10 minutes from 09:15 IST, ratchet to 0.40% behind the completed close",
             "Prefer strikes divisible by 100; fall back only if unavailable":
                 "Use the nearest listed strike divisible by 100; never use a non-100 strike",
+            "Buy the same quantity of the same-expiry option 1000 points OTM as a margin hedge":
+                "Buy the same quantity of the same-expiry option 800 points OTM as a margin hedge",
             "Reset: 0–1 DTE ₹850; 2–3 LOW ₹900/HIGH ₹700; 4–6 LOW ₹850/HIGH ₹900":
                 "Reset: 0–1 DTE ₹850; 2–3 LOW ₹850/HIGH ₹700; 4–8 LOW/HIGH ₹850",
             "Start expiry rollover at 15:10 IST and reopen next executable session":
