@@ -664,7 +664,7 @@ def test_premium_gap_below_reset_stays_pending_until_replacement_quote_appears()
     assert not legs.reset_pending
 
 
-def test_13l_overnight_gap_below_800_resets_from_first_0915_clock_check():
+def test_13l_overnight_gap_below_700_resets_from_first_0915_clock_check():
     from app.strategies.builtin.nifty_adaptive_premium_reset_13l import (
         StrictHundredStrikeWeeklyOptionLegs,
     )
@@ -679,16 +679,16 @@ def test_13l_overnight_gap_below_800_resets_from_first_0915_clock_check():
     legs = StrictHundredStrikeWeeklyOptionLegs(ctx, 900)
     legs.hedge_symbol = old_hedge
     legs.desired_direction = 1
-    # The entry sold above the frozen ₹800 level, so the reset carries overnight armed.
+    # The entry sold above the frozen ₹700 level, so the reset carries overnight armed.
     legs.frozen = legs._classify_reset("PE", 25_900, 25_000, 900, EXPIRY, opened)
-    assert legs.frozen.reset_level == 800
+    assert legs.frozen.reset_level == 700
     legs.last_premium = 900
     legs.reset_armed = True
 
     async def gap_and_reset():
-        # NIFTY gaps up 500 points. The current ask of the held PE gaps below ₹800.
+        # NIFTY gaps up 500 points. The current ask of the held PE gaps below ₹700.
         ctx.last_price = 25_500
-        ctx.quotes[old] = 700
+        ctx.quotes[old] = 699
         ctx.quotes[replacement] = 950
         ctx.quotes[replacement_hedge] = 50
         await legs.monitor_reset(next_open)
@@ -1010,7 +1010,7 @@ def test_dte_and_iv_grid_selects_every_published_reset_bucket():
     assert (result(4, 1_200).iv_regime, result(4, 1_200).reset_level) == ("HIGH", 900)
 
 
-def test_13l_replaces_every_850_reset_cell_with_800_only_for_its_variant():
+def test_13l_uses_flat_700_reset_for_every_dte_and_iv_regime():
     from app.strategies.builtin.nifty_adaptive_premium_reset_13l import (
         StrictHundredStrikeWeeklyOptionLegs,
     )
@@ -1030,10 +1030,29 @@ def test_13l_replaces_every_850_reset_cell_with_800_only_for_its_variant():
         "PE", 25_900, 25_000, 1_200, AT.date() + timedelta(days=4), AT,
     )
 
-    assert zero_dte.reset_level == 800
-    assert (low_2dte.iv_regime, low_2dte.reset_level) == ("LOW", 800)
-    assert (low_4dte.iv_regime, low_4dte.reset_level) == ("LOW", 800)
-    assert (high_4dte.iv_regime, high_4dte.reset_level) == ("HIGH", 800)
+    assert zero_dte.reset_level == 700
+    assert (low_2dte.iv_regime, low_2dte.reset_level) == ("LOW", 700)
+    assert (low_4dte.iv_regime, low_4dte.reset_level) == ("LOW", 700)
+    assert (high_4dte.iv_regime, high_4dte.reset_level) == ("HIGH", 700)
+
+
+def test_13l_migrates_an_open_legacy_reset_checkpoint_to_700():
+    from app.strategies.builtin.nifty_adaptive_premium_reset_13l import (
+        StrictHundredStrikeWeeklyOptionLegs,
+    )
+
+    ctx = OptionSellerContext()
+    legacy = classify_reset("PE", 25_900, 25_000, 900, EXPIRY, AT)
+    ctx.strategy_state = {
+        ShortWeeklyOptionLegs.state_key: {
+            "frozen": {**legacy.as_dict(), "reset_level": 800},
+        },
+    }
+
+    legs = StrictHundredStrikeWeeklyOptionLegs(ctx, 900)
+
+    assert legs.frozen is not None
+    assert legs.frozen.reset_level == 700
 
 
 def test_frozen_reset_state_survives_adapter_restart():

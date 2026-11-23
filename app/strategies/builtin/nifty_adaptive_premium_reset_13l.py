@@ -5,6 +5,7 @@ seller's execution path. Candidate-specific overrides enforce 100-point strikes,
 expiry exits and same-session weekly rollover.
 """
 
+from dataclasses import replace
 from datetime import date, timedelta
 
 from app.strategies.builtin.nifty_trailing_reversal_itm_option_seller import (
@@ -41,14 +42,22 @@ class StrictHundredStrikeWeeklyOptionLegs(ShortWeeklyOptionLegs):
 
     same_session_expiry_roll = True
     require_fresh_hedge_quote = True
-    reset_01 = 800.0
-    reset_23_low = 800.0
-    reset_47_low = 800.0
-    reset_47_high = 800.0
+    reset_01 = 700.0
+    reset_23_low = 700.0
+    reset_23_high = 700.0
+    reset_47_low = 700.0
+    reset_47_high = 700.0
     # A Tuesday holiday moves the expiry exit to Monday. Rolling that session into the following
     # Tuesday is eight calendar days, while an ordinary Tuesday-to-Tuesday roll is seven.
     max_reset_dte = 8
     default_hedge_points = 800.0
+
+    def _restore(self) -> None:
+        super()._restore()
+        # Migrate a live checkpoint frozen under the former DTE/IV grid so an already-open leg
+        # also follows the new flat ₹700 reset rule after restart.
+        if self.frozen is not None and self.frozen.reset_level != self.reset_01:
+            self.frozen = replace(self.frozen, reset_level=self.reset_01)
 
     async def _select(self, kind, now, earliest_expiry=None, exact_expiry=None):
         contract = await super()._select(kind, now, earliest_expiry, exact_expiry)
@@ -99,7 +108,7 @@ class NiftyAdaptivePremiumReset13LStrategy(NiftyTrailingReversalOptimizedITMOpti
             "Prefer strikes divisible by 100; fall back only if unavailable":
                 "Use the nearest listed strike divisible by 100; never use a non-100 strike",
             "Reset: 0–1 DTE ₹850; 2–3 LOW ₹900/HIGH ₹700; 4–6 LOW ₹850/HIGH ₹900":
-                "Reset: 0–1 DTE ₹800; 2–3 LOW ₹800/HIGH ₹700; 4–8 LOW/HIGH ₹800",
+                "Reset all DTE and IV regimes at ₹700",
             "Start expiry rollover at 15:10 IST and reopen next executable session":
                 "At 15:10 on expiry day, or the previous NSE session for a holiday expiry, cover and roll into the next weekly contract in the same session",
         }
