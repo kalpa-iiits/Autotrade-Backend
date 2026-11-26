@@ -184,16 +184,18 @@ async def _database_ok() -> bool:
 @app.get("/health")
 async def health(response: Response):
     """For monitoring. Public, so counts only: nothing about any user or account.
-    status "ok"; "degraded" when a connected account's stream or resync reports a problem;
+    status "ok"; "degraded" when a connected account's stream or resync reports a problem, or
+    when a strategy has dropped ticks because its worker could not keep up;
     "failing" with HTTP 503 when the database is unreachable or an account's trade ledger has
     updates it couldn't save. Per-account detail: GET /api/accounts/{id} (owner only)."""
     accounts = app.state.accounts.summary()
+    strategies = app.state.strategy_runner.health()
     database = await _database_ok()
     resync_errors = sum(bool(r.service.last_resync_error) for r in app.state.accounts if r.service.connected)
     if not database or accounts["ledger_unhealthy"]:
         status_ = "failing"
         response.status_code = 503
-    elif accounts["stream_errors"] or resync_errors:
+    elif accounts["stream_errors"] or resync_errors or strategies["dropped_ticks"]:
         status_ = "degraded"
     else:
         status_ = "ok"
@@ -201,7 +203,7 @@ async def health(response: Response):
         "status": status_,
         "database": database,
         "accounts": accounts | {"resync_errors": resync_errors},
-        "strategies": app.state.strategy_runner.health(),
+        "strategies": strategies,
     }
 
 

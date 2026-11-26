@@ -458,7 +458,9 @@ def test_slow_strategy_does_not_stall_the_feed(deploy, monkeypatch):
         return runner.running[inst["id"]].dropped_ticks
 
     assert run(c, feed) == 2  # queue holds 2: ticks 2 and 3 were dropped for 4 and 5
-    assert c.get("/health").json()["strategies"]["dropped_ticks"] == 2
+    health = c.get("/health")
+    assert health.json()["strategies"]["dropped_ticks"] == 2
+    assert health.json()["status"] == "degraded"
     # Stopping a stuck strategy still works.
     assert c.post(f"/api/strategies/{inst['id']}/stop", headers=AUTH).json()["status"] == "stopped"
 

@@ -6,7 +6,7 @@ The pair is replaced only on a direction change or weekly-expiry rollover.
 """
 
 from dataclasses import replace
-from datetime import date, timedelta
+from datetime import date, datetime, timedelta
 
 from app.brokers.base import OptionContract
 from app.strategies.builtin.nifty_trailing_reversal_itm_option_seller import (
@@ -139,6 +139,11 @@ class SyntheticWeeklyOptionLegs(ShortWeeklyOptionLegs):
     same_session_expiry_roll = True
     max_quote_age_seconds = 2.0
     default_hedge_points = 800.0
+    # A failed three-leg validation performs several synchronous broker depth requests.  Do not
+    # repeat that work for every index tick: FYERS can publish multiple ticks per second, which
+    # otherwise makes the strategy worker slower than its input queue.  Direction changes clear
+    # this gate, so protective stops and reversals are never delayed by an earlier quote failure.
+    transition_retry_seconds = 5.0
 
     def __init__(self, ctx, _legacy_itm_points: float = 0) -> None:
         # Keep the constructor compatible with the parent strategy while intentionally ignoring
@@ -152,7 +157,17 @@ class SyntheticWeeklyOptionLegs(ShortWeeklyOptionLegs):
         self.obsolete_hedge_symbol: str | None = None
         self.replace_pair = False
         self._restored_pair_symbols: dict[str, str] = {}
+        self._transition_retry_after: datetime | None = None
         self._restore_synthetic()
+
+    def _transition_retry_ready(self, now: datetime) -> bool:
+        return self._transition_retry_after is None or now >= self._transition_retry_after
+
+    def _defer_transition(self, now: datetime) -> None:
+        self._transition_retry_after = now + timedelta(seconds=self.transition_retry_seconds)
+
+    def _clear_transition_retry(self) -> None:
+        self._transition_retry_after = None
 
     def _option_positions(self) -> dict[str, int]:
         return {
@@ -235,6 +250,9 @@ class SyntheticWeeklyOptionLegs(ShortWeeklyOptionLegs):
     def set_desired(self, direction: int) -> None:
         changed = direction != self.desired_direction
         super().set_desired(direction)
+        if changed:
+            # A new stop/reversal signal takes priority over quote backoff for the old direction.
+            self._clear_transition_retry()
         if changed and self._option_positions():
             self.replace_pair = True
 
@@ -389,6 +407,8 @@ class SyntheticWeeklyOptionLegs(ShortWeeklyOptionLegs):
         if not self.desired_direction:
             return
         if not positions:
+            if not self._transition_retry_ready(now):
+                return
             rolling = self.roll_after is not None
             if self.replace_pair:
                 self.pair_ce = self.pair_pe = self.pair_hedge = None
@@ -405,7 +425,9 @@ class SyntheticWeeklyOptionLegs(ShortWeeklyOptionLegs):
                 earliest_expiry=self.roll_expiry_after if self.roll_after else None,
             )
             if selected is None:
+                self._defer_transition(now)
                 return
+            self._clear_transition_retry()
             self.pair_ce, self.pair_pe, self.pair_hedge, guards = selected
             self.active_strike = self.pair_ce.strike
             self.active_expiry = self.pair_ce.expiry
@@ -479,6 +501,11 @@ class SyntheticWeeklyOptionLegs(ShortWeeklyOptionLegs):
                 await self._sell_overnight(min(held - target, held), reason, symbol)
                 return
 
+        # Everything below can add exposure and may request live depth.  Risk-reducing closes
+        # above always run immediately; only repeated entry/repair attempts are rate-limited.
+        if not self._transition_retry_ready(now):
+            return
+
         # Margin protection is established independently. Once it is fully held, FYERS can
         # submit the two ATM synthetic legs through one Multi Order request; other brokers use
         # the runner's ordered fallback with the same per-leg reconciliation.
@@ -486,10 +513,13 @@ class SyntheticWeeklyOptionLegs(ShortWeeklyOptionLegs):
         if hedge_held < quantity:
             quote = await self._quote(self.pair_hedge.symbol, "BUY", now)
             if quote is None:
+                self._defer_transition(now)
                 return
             guard, problem = self._pair_guard(quote, "BUY")
             if problem:
+                self._defer_transition(now)
                 return
+            self._clear_transition_retry()
             await self._buy_overnight(
                 quantity - hedge_held, reason, self.pair_hedge.symbol, guard,
             )
@@ -503,11 +533,14 @@ class SyntheticWeeklyOptionLegs(ShortWeeklyOptionLegs):
             for contract, side in ((bought, "BUY"), (short, "SELL")):
                 quote = await self._quote(contract.symbol, side, now)
                 if quote is None:
+                    self._defer_transition(now)
                     return
                 guard, problem = self._pair_guard(quote, side)
                 if problem:
+                    self._defer_transition(now)
                     return
                 guards[contract.symbol] = guard
+            self._clear_transition_retry()
             results = await basket([
                 {
                     "side": "BUY", "quantity": quantity, "symbol": bought.symbol,
@@ -533,10 +566,13 @@ class SyntheticWeeklyOptionLegs(ShortWeeklyOptionLegs):
                 if guard is None:
                     quote = await self._quote(symbol, "BUY", now)
                     if quote is None:
+                        self._defer_transition(now)
                         return
                     guard, problem = self._pair_guard(quote, "BUY")
                     if problem:
+                        self._defer_transition(now)
                         return
+                self._clear_transition_retry()
                 await self._buy_overnight(target - held, reason, symbol, guard)
                 return
         for symbol, target in targets.items():
@@ -548,10 +584,13 @@ class SyntheticWeeklyOptionLegs(ShortWeeklyOptionLegs):
                 if guard is None:
                     quote = await self._quote(symbol, "SELL", now)
                     if quote is None:
+                        self._defer_transition(now)
                         return
                     guard, problem = self._pair_guard(quote, "SELL")
                     if problem:
+                        self._defer_transition(now)
                         return
+                self._clear_transition_retry()
                 result = await self._sell_overnight(held - target, reason, symbol, guard)
                 await self._handle_margin_rejection(result)
                 return

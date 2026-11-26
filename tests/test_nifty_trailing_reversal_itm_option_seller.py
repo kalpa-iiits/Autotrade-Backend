@@ -22,6 +22,7 @@ from app.strategies.builtin.nifty_trailing_reversal_itm_option_seller import (
     ShortWeeklyOptionLegs,
     classify_reset,
 )
+from app.strategies.builtin import nifty_trailing_reversal_itm_option_seller as seller_module
 from app.strategies.builtin.nifty_trailing_reversal_optimized import IST
 
 
@@ -181,6 +182,49 @@ def test_13l_uses_baskets_for_atm_entry_and_complete_exit_after_hedge_fill():
     assert ctx.positions == {}
 
 
+def test_13l_quote_failures_back_off_instead_of_blocking_the_tick_worker():
+    class DepthContext(OptionSellerContext):
+        def __init__(self):
+            super().__init__()
+            self.depth_calls = 0
+            self.observed_at = AT
+
+        async def executable_quote(self, symbol, side):
+            self.depth_calls += 1
+            price = 200.0
+            # Either direction's OTM hedge has an invalidly wide spread, so entry must defer.
+            if "25000" not in symbol:
+                return QuoteSnapshot(price, self.observed_at, "depth", bid=1.0, ask=200.0)
+            return QuoteSnapshot(price, self.observed_at, "depth", bid=199.0, ask=201.0)
+
+    ctx = DepthContext()
+    legs = SyntheticWeeklyOptionLegs(ctx)
+    legs.set_desired(1)
+
+    async def retry_storm():
+        await legs.advance(AT, "initial LONG")
+        first_attempt_calls = ctx.depth_calls
+        # Hundreds of ticks inside the retry window must remain cheap and make no broker calls.
+        for offset_ms in range(1, 5_000, 10):
+            await legs.advance(AT + timedelta(milliseconds=offset_ms), "initial LONG")
+        assert ctx.depth_calls == first_attempt_calls
+
+        # The next attempt is allowed at the boundary, and a new direction bypasses backoff.
+        ctx.observed_at = AT + timedelta(seconds=5)
+        await legs.advance(AT + timedelta(seconds=5), "initial LONG")
+        second_attempt_calls = ctx.depth_calls
+        assert second_attempt_calls > first_attempt_calls
+        legs.set_desired(-1)
+        ctx.observed_at = AT + timedelta(seconds=5, milliseconds=1)
+        await legs.advance(AT + timedelta(seconds=5, milliseconds=1), "reverse SHORT")
+        assert ctx.depth_calls > second_attempt_calls
+
+    asyncio.run(retry_storm())
+
+    assert ctx.orders == []
+    assert ctx.depth_calls == 6  # two depth calls per bounded attempt, not per incoming tick
+
+
 def test_13l_synthetic_reversal_closes_old_pair_and_hedge_before_new_atm_pair():
     ctx = OptionSellerContext()
     ctx.quotes.update({
@@ -272,7 +316,13 @@ def test_long_signal_shorts_exactly_one_current_week_900_itm_put():
     assert legs.position == 65
 
 
-def test_strategy_forces_overnight_product_even_when_caller_requests_intraday():
+def test_strategy_forces_overnight_product_even_when_caller_requests_intraday(monkeypatch):
+    class FixedDatetime(datetime):
+        @classmethod
+        def now(cls, tz=None):
+            return AT
+
+    monkeypatch.setattr(seller_module, "datetime", FixedDatetime)
     ctx = OptionSellerContext()
     ctx.quotes["NSE:NIFTY26N2425900PE"] = 950
     legs = ShortWeeklyOptionLegs(ctx, 900)

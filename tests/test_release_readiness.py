@@ -83,6 +83,26 @@ def test_external_health_check(monkeypatch):
     assert check_health.check("https://trade.example.com/health")["status"] == "ok"
 
 
+def test_external_health_check_rejects_strategy_degradation(monkeypatch):
+    class Response:
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *_args):
+            pass
+
+        def read(self):
+            return json.dumps({
+                "status": "degraded",
+                "database": True,
+                "strategies": {"dropped_ticks": 1},
+            }).encode()
+
+    monkeypatch.setattr(check_health.urllib.request, "urlopen", lambda *_args, **_kwargs: Response())
+    with pytest.raises(RuntimeError, match="status=degraded"):
+        check_health.check("https://trade.example.com/health")
+
+
 def test_restore_skips_schema_level_entries():
     from scripts.restore_database import _is_schema_entry
 
