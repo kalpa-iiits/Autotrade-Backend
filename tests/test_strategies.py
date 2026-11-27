@@ -9,7 +9,7 @@ from sqlalchemy import select
 
 from app.core.config import settings
 from app.main import app
-from app.orders.schemas import Product, Side
+from app.orders.schemas import Order, OrderStatus, OrderType, Product, Side
 from app.strategies import deployments
 from app.strategies.base import Bar, BarBuilder, Strategy, Tick
 from app.strategies.builtin.sma_crossover import SmaCrossover
@@ -473,6 +473,49 @@ def test_option_entry_reprices_immediately_before_first_interval(options, monkey
 
     assert option_orders(quiet) == [("BUY", 200.0, "FILLED")]
     assert instance(quiet, inst["id"])["position"] == 1
+
+
+def test_terminal_order_update_cancels_its_option_repricing_task(options, monkeypatch):
+    monkeypatch.setattr(settings, "option_reprice_interval", 0.2)
+    quiet, inst = options()
+    BOOK["ask"] = 190.0
+    SCRIPT.append(("buy", None, "entry", OPT))
+    tick(quiet)
+
+    history = quiet.get("/api/accounts/1/orders/history", headers=AUTH).json()
+    order_id = history[0]["id"]
+    runner = quiet.app.state.strategy_runner
+    running = runner.running[inst["id"]]
+    chase = runner._chase_by_order[(ACCOUNT, order_id)]
+    modify_calls = 0
+    service = runtime(quiet).service
+
+    async def unexpected_modify(*args, **kwargs):
+        nonlocal modify_calls
+        modify_calls += 1
+        return await original_modify(*args, **kwargs)
+
+    original_modify = service.modify_order
+    monkeypatch.setattr(service, "modify_order", unexpected_modify)
+    BOOK["ask"] = 199.0
+    terminal = Order(
+        id=order_id,
+        symbol=OPT,
+        side=Side.BUY,
+        quantity=1,
+        order_type=OrderType.LIMIT,
+        limit_price=190.95,
+        status=OrderStatus.FILLED,
+        filled_quantity=1,
+        filled_price=190.0,
+    )
+    run(quiet, runner.on_order, ACCOUNT, terminal)
+    wait(quiet, 0.25)
+
+    assert chase.cancelled()
+    assert (ACCOUNT, order_id) not in runner._chase_by_order
+    assert order_id not in running.pending_order_ids
+    assert modify_calls == 0
 
 
 def test_entry_is_cancelled_rather_than_chase_too_far(options):

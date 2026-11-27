@@ -129,7 +129,7 @@ def test_13l_synthetic_pair_keeps_the_existing_otm_margin_hedge(direction, quote
     assert legs.hedge_points == 800
 
 
-def test_13l_uses_baskets_for_atm_entry_and_complete_exit_after_hedge_fill():
+def test_13l_uses_basket_for_atm_entry_but_closes_short_then_atm_long_then_hedge():
     class BasketContext(OptionSellerContext):
         def __init__(self):
             super().__init__()
@@ -161,7 +161,9 @@ def test_13l_uses_baskets_for_atm_entry_and_complete_exit_after_hedge_fill():
         assert not ctx.baskets
         await legs.advance(AT, "initial LONG")  # two ATM legs in one basket
         legs.set_desired(0)
-        await legs.advance(AT, "exit synthetic")
+        await legs.advance(AT, "exit synthetic")  # cover short ATM leg
+        await legs.advance(AT, "exit synthetic")  # close long ATM leg
+        await legs.advance(AT, "exit synthetic")  # release margin hedge last
 
     asyncio.run(enter_and_exit())
 
@@ -173,11 +175,11 @@ def test_13l_uses_baskets_for_atm_entry_and_complete_exit_after_hedge_fill():
         ("BUY", "NSE:NIFTY26N2425000CE"),
         ("SELL", "NSE:NIFTY26N2425000PE"),
     ]
-    exit_legs = ctx.baskets[1][0]
-    assert [(leg["side"], leg["symbol"]) for leg in exit_legs] == [
-        ("BUY", "NSE:NIFTY26N2425000PE"),
-        ("SELL", "NSE:NIFTY26N2424200PE"),
-        ("SELL", "NSE:NIFTY26N2425000CE"),
+    assert len(ctx.baskets) == 1
+    assert ctx.orders[3:] == [
+        ("BUY", 65, "NSE:NIFTY26N2425000PE", Product.DELIVERY),
+        ("SELL", 65, "NSE:NIFTY26N2425000CE", Product.DELIVERY),
+        ("SELL", 65, "NSE:NIFTY26N2424200PE", Product.DELIVERY),
     ]
     assert ctx.positions == {}
 
@@ -247,8 +249,8 @@ def test_13l_synthetic_reversal_closes_old_pair_and_hedge_before_new_atm_pair():
 
     assert ctx.orders[3:6] == [
         ("BUY", 65, "NSE:NIFTY26N2425000PE", Product.DELIVERY),
-        ("SELL", 65, "NSE:NIFTY26N2424200PE", Product.DELIVERY),
         ("SELL", 65, "NSE:NIFTY26N2425000CE", Product.DELIVERY),
+        ("SELL", 65, "NSE:NIFTY26N2424200PE", Product.DELIVERY),
     ]
     assert ctx.orders[-3:] == [
         ("BUY", 65, "NSE:NIFTY26N2425800CE", Product.DELIVERY),

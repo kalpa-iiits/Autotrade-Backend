@@ -325,27 +325,23 @@ class SyntheticWeeklyOptionLegs(ShortWeeklyOptionLegs):
 
     async def _close_one(self, reason: str) -> bool:
         positions = self._option_positions()
-        basket = getattr(self._ctx, "basket", None)
-        if basket is not None and len(positions) > 1:
-            legs = [
-                {
-                    "side": "BUY" if quantity < 0 else "SELL",
-                    "quantity": abs(quantity),
-                    "symbol": symbol,
-                    "product": self.order_product,
-                }
-                for symbol, quantity in sorted(
-                    positions.items(), key=lambda item: (item[1] > 0, item[0]),
-                )
-            ]
-            await basket(legs, reason)
-            return True
-        # Remove short exposure first, then dispose of the long leg.
+        # FYERS can margin-reject a simultaneous three-leg close because it evaluates the hedge
+        # sale before the short cover.  Close sequentially: remove the short, dispose of the ATM
+        # long, and release the margin hedge only after no short exposure remains.
         item = next(((s, q) for s, q in sorted(positions.items()) if q < 0), None)
         if item is not None:
             await self._buy_overnight(abs(item[1]), reason, item[0])
             return True
-        item = next(iter(sorted(positions.items())), None)
+        hedge_symbol = (
+            self.pair_hedge.symbol if self.pair_hedge is not None
+            else self._restored_pair_symbols.get("HEDGE")
+        )
+        item = next(
+            ((s, q) for s, q in sorted(positions.items()) if s != hedge_symbol),
+            None,
+        )
+        if item is None:
+            item = next(iter(sorted(positions.items())), None)
         if item is not None:
             await self._sell_overnight(item[1], reason, item[0])
             return True
@@ -614,8 +610,9 @@ class NiftyAdaptivePremiumReset13LStrategy(NiftyTrailingReversalOptimizedITMOpti
         "13 L strategy: current-week NIFTY synthetic futures at the nearest listed 100-point "
         "ATM strike. Long buys the ATM call and sells the ATM put; short buys the ATM put and "
         "sells the ATM call. The sold leg retains the existing bought 800-OTM margin hedge "
-        "and 600-point fallback. After the hedge fills, ATM entry and complete exits use broker "
-        "baskets when available. Signals use a 0.10% initial and 0.40% trailing index stop."
+        "and 600-point fallback. After the hedge fills, ATM entry uses a broker basket when "
+        "available; exits cover the short first and release the hedge last. Signals use a 0.10% "
+        "initial and 0.40% trailing index stop."
     )
     tags = ("Experimental", "NIFTY", "Weekly options", "Synthetic futures", "ATM")
     initial_stop_pct = 0.1
@@ -661,7 +658,7 @@ class NiftyAdaptivePremiumReset13LStrategy(NiftyTrailingReversalOptimizedITMOpti
             elif rule["kind"] == "exit":
                 rule["conditions"] += [
                     "On reversal, cover the sold leg before closing bought legs, then select a fresh ATM pair",
-                    "Submit all available closing legs as one basket and reconcile every leg result",
+                    "Close the ATM long next and release the OTM margin hedge last",
                     "At 15:10 on expiry day, or the previous NSE session for a holiday expiry, close and roll into the next weekly pair in the same session",
                 ]
         return rules

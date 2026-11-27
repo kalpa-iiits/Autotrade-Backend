@@ -393,6 +393,7 @@ class StrategyRunner:
         # Order updates can arrive before place_order returns (and we learn the id).
         self._recent_orders: OrderedDict[tuple[int, str], Order] = OrderedDict()
         self._chases: set[asyncio.Task] = set()  # repricing of unfilled option orders
+        self._chase_by_order: dict[tuple[int, str], asyncio.Task] = {}
         self._reconcile_task: asyncio.Task | None = None
         self._start_locks: dict[int, asyncio.Lock] = {}  # a retry and a manual start never overlap
         self._retries: dict[int, tuple[float, float]] = {}  # instance id -> (next try, delay)
@@ -796,6 +797,12 @@ class StrategyRunner:
             self._apply_order(self.running[owner], order)
 
     def _apply_order(self, inst: RunningInstance, order: Order) -> None:
+        if order.status in TERMINAL:
+            chase = self._chase_by_order.pop((inst.account_id, order.id), None)
+            # When _chase itself learns that modify_order filled the order, it applies that
+            # terminal result synchronously.  Do not cancel the currently executing task.
+            if chase is not None and chase is not asyncio.current_task() and not chase.done():
+                chase.cancel()
         pending_finished = order.status in TERMINAL and order.id in inst.pending_order_ids
         symbol_position = inst.positions.get(order.symbol, 0)
         filled = order.filled_quantity or (order.quantity if order.status == OrderStatus.FILLED else 0)
@@ -819,6 +826,23 @@ class StrategyRunner:
             # the strategy concurrently from the broker's order-update callback.
             if not inst.pending_order_ids and inst.worker is not None and not inst.worker.done():
                 inst.enqueue(Clock(utcnow()))
+
+    def _start_chase(self, inst: RunningInstance, *args) -> None:
+        """Start exactly one repricer for an order and bind it to terminal broker updates."""
+        key = (inst.account_id, args[0])
+        previous = self._chase_by_order.pop(key, None)
+        if previous is not None and not previous.done():
+            previous.cancel()
+        task = asyncio.create_task(self._chase(inst, *args))
+        self._chases.add(task)
+        self._chase_by_order[key] = task
+
+        def finished(done: asyncio.Task) -> None:
+            self._chases.discard(done)
+            if self._chase_by_order.get(key) is done:
+                self._chase_by_order.pop(key, None)
+
+        task.add_done_callback(finished)
 
     # ---------- trade requests ----------
 
@@ -990,12 +1014,10 @@ class StrategyRunner:
                     if order.status not in TERMINAL:
                         inst.pending_order_ids.add(order.id)
                         if request.order_type == OrderType.LIMIT:
-                            task = asyncio.create_task(self._chase(
+                            self._start_chase(
                                 inst, order.id, signal.symbol, request.side,
                                 request.limit_price, closing, guard,
-                            ))
-                            self._chases.add(task)
-                            task.add_done_callback(self._chases.discard)
+                            )
                     self._apply_order(inst, order)
                     if early := self._recent_orders.get((inst.account_id, order.id)):
                         self._apply_order(inst, early)
@@ -1093,12 +1115,10 @@ class StrategyRunner:
         if order.status not in TERMINAL:
             inst.pending_order_ids.add(order.id)
             if order_type == OrderType.LIMIT:
-                task = asyncio.create_task(self._chase(
+                self._start_chase(
                     inst, order.id, signal.symbol, side, limit_price, closing,
                     option_price_guard,
-                ))
-                self._chases.add(task)
-                task.add_done_callback(self._chases.discard)
+                )
         # Apply what we know now, plus any update that raced ahead of place_order returning.
         self._apply_order(inst, order)
         if early := self._recent_orders.get((inst.account_id, order.id)):
@@ -1155,6 +1175,9 @@ class StrategyRunner:
                 try:
                     order = await service.modify_order(order_id, target)
                 except Exception as e:  # e.g. the broker's limit on modifications per order
+                    # A fill can win the race while the modify request is in flight. Pull the
+                    # terminal broker state before attempting a redundant cancel.
+                    await service.resync()
                     if order_id in inst.pending_order_ids:
                         await self._cancel_unfilled(inst, order_id, f"could not reprice ({e})")
                     return  # an exit is sent again, fresh, by the strategy's own retry
@@ -1167,6 +1190,8 @@ class StrategyRunner:
 
     async def _cancel_unfilled(self, inst: RunningInstance, order_id: str, why: str) -> None:
         """Cancel an order the instance gave up on. What filled before stays counted."""
+        if order_id not in inst.pending_order_ids:
+            return
         try:
             order = await self.service(inst.account_id).cancel_order(order_id)
         except Exception as e:  # e.g. it filled just now: its update clears pending_order_id
@@ -1190,11 +1215,9 @@ class StrategyRunner:
                 continue
             side = Side(row.side)
             closing = self._is_closing_order(inst, row.symbol, side)
-            task = asyncio.create_task(self._chase(
+            self._start_chase(
                 inst, row.id, row.symbol, side, float(row.limit_price), closing,
-            ))
-            self._chases.add(task)
-            task.add_done_callback(self._chases.discard)
+            )
             log.info("Strategy %s: resumed repricing pending option order %s", inst.id, row.id)
 
     # ---------- persistence ----------
